@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// pack.curlee — pure, verifiable glyph-layout helpers for the VGA text
+// framebuffer. This module is freestanding-compatible (Int/Bool only, no
+// Phys, no String/Vec/print), so it type-checks, verifies, and can be run
+// under the VM for tests — but the kernel calls these directly, so the
+// "packer" is a deterministic function of (char, attr, column) -> cell value
+// and (column) -> buffer address.
+//
+// Curlee constraints (verified against the compiler):
+//   - Operators: + - * /, comparisons, && || !. NO shifts, NO modulo,
+//     NO bitwise ops.
+//   - Hex literals like 0xB8000 are ONLY valid inside phys<U32>(...); normal
+//     Int expressions use decimal.
+//   - NO `else if` chain — use nested if/else blocks.
+//
+// Design: the kernel renders "Hello world from JOE" to the 80x25 VGA text
+// buffer (base 0xB8000, 2 bytes/cell: char, attribute). This module provides
+// the pure mappings used by the kernel:
+//
+//   1. vga_cell(ch, attr)     -> the packed 2-byte cell value.
+//   2. vga_addr(col)          -> the physical byte address of a column in row 0.
+//
+// These are Int -> Int, total, and verified.
+
+// Pack (char, attribute) into the 2-byte VGA cell value:
+//   low byte  = ASCII character
+//   high byte = attribute (foreground | background << 4)
+fn vga_cell(ch: Int, attr: Int) -> Int {
+  return ch + attr * 256;
+}
+
+// Byte address of column `col` in text row 0 (VGA base 0xB8000, 2 bytes/cell).
+// 0xB8000 = 753664 decimal.
+fn vga_addr(col: Int) -> Int {
+  return 753664 + col * 2;
+}
+
+// True when a column is within the 80-column text width.
+fn valid_col(col: Int) -> Bool {
+  return col >= 0 && col < 80;
+}
+
+// The ASCII codes for "Hello world from JOE".
+fn hello_char_at(i: Int) -> Int {
+  if (i == 0) {
+    return 72;
+  } else {
+    if (i == 1) {
+      return 101;
+    } else {
+      if (i == 2) {
+        return 108;
+      } else {
+        if (i == 3) {
+          return 108;
+        } else {
+          if (i == 4) {
+            return 111;
+          } else {
+            if (i == 5) {
+              return 32;
+            } else {
+              if (i == 6) {
+                return 87;
+              } else {
+                if (i == 7) {
+                  return 111;
+                } else {
+                  if (i == 8) {
+                    return 114;
+                  } else {
+                    if (i == 9) {
+                      return 108;
+                    } else {
+                      if (i == 10) {
+                        return 100;
+                      } else {
+                        if (i == 11) {
+                          return 32;
+                        } else {
+                          if (i == 12) {
+                            return 102;
+                          } else {
+                            if (i == 13) {
+                              return 114;
+                            } else {
+                              if (i == 14) {
+                                return 111;
+                              } else {
+                                if (i == 15) {
+                                  return 109;
+                                } else {
+                                  if (i == 16) {
+                                    return 32;
+                                  } else {
+                                    if (i == 17) {
+                                      return 67;
+                                    } else {
+                                      if (i == 18) {
+                                        return 117;
+                                      } else {
+                                        if (i == 19) {
+                                          return 114;
+                                        } else {
+                                          if (i == 20) {
+                                            return 108;
+                                          } else {
+                                            if (i == 21) {
+                                              return 101;
+                                            } else {
+                                              if (i == 22) {
+                                                return 101;
+                                              } else {
+                                                return 0;
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// The message length ("Hello World from JOE" = 23 characters).
+fn hello_len() -> Int {
+  return 23;
+}
+
+// Test entry (not part of the kernel build; `curlee run pack.curlee`).
+// vga_cell('H'=72, attr=0x0F) == 0x0F48 = 3912; vga_addr(0) == 753664.
+fn main() -> Int {
+  if (vga_cell(72, 15) == 3912) {
+    return 0;
+  } else {
+    return 1;
+  }
+}

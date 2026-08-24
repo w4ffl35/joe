@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// kernel.curlee — Phase 1 bare-metal "Hello World from JOE" kernel.
+//
+// Boot path (chosen): qemu -kernel via the curlee freestanding toolchain.
+//   - `curlee build --link` emits freestanding C from this file, compiles it
+//     with -ffreestanding -fno-builtin -nostdlib, assembles runtime/crt0.S,
+//     and links with runtime/linker.ld into a multiboot2+PVH kernel ELF.
+//   - crt0.S (PVH entry) calls `curlee_main` (this file's `main`).
+//
+// Display: VGA text mode (80x25), which is the default VGA state at boot in
+// both QEMU (-kernel) and VirtualBox/GRUB — no mode switching required.
+//   - Text buffer base: 0xB8000. Each cell is 2 bytes: char, attribute.
+//   - Attribute 0x0F = bright white text on black background.
+//   - One Phys<U16> write per character; every address is a constant literal
+//     (Curlee rule: "physical address must be a constant literal").
+//
+// Design laws honored:
+//   - Single address space, Ring 0: direct volatile stores via Phys<T>.
+//   - Deterministic verification: vga_cell is a pure, total function on
+//     Int -> Int; the verifier proves the contract. Addresses are literals.
+//   - Minimal footprint: no libc, no malloc, no String/Vec (all rejected in
+//     the freestanding target), no drivers beyond the VGA buffer + serial.
+
+extern fn curlee_putc(c: Int) -> Unit;
+extern fn curlee_halt() -> Unit;
+
+// Provided by kernel/fb.c: parse the multiboot2 framebuffer tag (the real
+// framebuffer address GRUB set) and draw 5x7 glyphs as 32bpp pixels. This is
+// the reliable display path under VirtualBox (GRUB gfxterm -> linear FB).
+extern fn fb_init() -> Unit;
+extern fn fb_ready() -> Int;
+extern fn fb_draw_char(ch: Int, x: Int, y: Int, scale: Int) -> Unit;
+
+// Provided by kernel/vga_setup.c: programs VGA text mode 3 so the 0xB8000
+// text buffer is rendered with the standard PC-437 font (QEMU fallback).
+extern fn vga_text_setup() -> Unit;
+
+// Pack (char, color attribute) into the 2-byte VGA cell value:
+//   low byte  = ASCII character
+//   high byte = attribute (foreground | background << 4)
+// Pure and total: any Int in, a cell value out. Verified by contract below.
+fn vga_cell(ch: Int, attr: Int) -> Int
+  [ requires ch >= 0 && ch < 256; ensures true; ] {
+  return ch + attr * 256;
+}
+
+// Serial fallback: emit the message via the weak curlee_putc hook so the
+// boot is observable (the QEMU smoke path overrides it to write to COM1).
+fn serial_hello() -> Unit {
+  curlee_putc(72);   // H
+  curlee_putc(101);  // e
+  curlee_putc(108);  // l
+  curlee_putc(108);  // l
+  curlee_putc(111);  // o
+  curlee_putc(32);   // space
+  curlee_putc(87);   // W
+  curlee_putc(111);  // o
+  curlee_putc(114);  // r
+  curlee_putc(108);  // l
+  curlee_putc(100);  // d
+  curlee_putc(32);   // space
+  curlee_putc(102);  // f
+  curlee_putc(114);  // r
+  curlee_putc(111);  // o
+  curlee_putc(109);  // m
+  curlee_putc(32);   // space
+  curlee_putc(74);   // J
+  curlee_putc(79);   // O
+  curlee_putc(69);   // E
+  curlee_putc(33);   // !
+  curlee_putc(10);   // newline
+  return;
+}
+
+// Kernel entry point (codegen exports this as curlee_main).
+//
+// Renders "Hello World from JOE" to the VGA text buffer at row 0 and
+// emits the same text to serial, then halts deterministically.
+//
+// `cap phys.mem` parameter: required by the verifier for any Phys<T>
+// read/write; authority is granted by the host at the link/run boundary.
+//
+// Display: 32bpp linear framebuffer at 0xFD00_0000 (VBE mode 640x480x32,
+// set by GRUB's gfxterm before handoff). Each pixel is one U32 (0x00RRGGBB).
+// We draw "HELLO" as large blocky glyphs — every write is a constant address
+// and a constant value, satisfying Curlee's "address must be a literal".
+// Draw "Hello world from JOE" to the linear framebuffer (5x7 glyphs,
+// 4x scale, starting at pixel (40,40)). Only called when fb_ready() is 1.
+fn fb_hello() -> Unit {
+  // "Hello world from JOE" — ASCII codes, drawn left to right with a
+  // 6-pixel advance (5 glyph cols + 1 space).
+  fb_draw_char(72, 40, 40, 4);    // H
+  fb_draw_char(101, 64, 40, 4);   // e
+  fb_draw_char(108, 88, 40, 4);   // l
+  fb_draw_char(108, 112, 40, 4);  // l
+  fb_draw_char(111, 136, 40, 4);  // o
+  fb_draw_char(32, 160, 40, 4);   // (space)
+  fb_draw_char(87, 184, 40, 4);   // W
+  fb_draw_char(111, 208, 40, 4);  // o
+  fb_draw_char(114, 232, 40, 4);  // r
+  fb_draw_char(108, 256, 40, 4);  // l
+  fb_draw_char(100, 280, 40, 4);  // d
+  fb_draw_char(32, 304, 40, 4);   // (space)
+  fb_draw_char(102, 328, 40, 4);  // f
+  fb_draw_char(114, 352, 40, 4);  // r
+  fb_draw_char(111, 376, 40, 4);  // o
+  fb_draw_char(109, 400, 40, 4);  // m
+  fb_draw_char(32, 424, 40, 4);   // (space)
+  fb_draw_char(67, 448, 40, 4);   // C
+  fb_draw_char(117, 472, 40, 4);  // u
+  fb_draw_char(114, 496, 40, 4);  // r
+  fb_draw_char(108, 520, 40, 4);  // l
+  fb_draw_char(101, 544, 40, 4);  // e
+  fb_draw_char(101, 568, 40, 4);  // e
+  return;
+}
+
+fn main(pm: cap phys.mem) -> Unit {
+  // Prefer the real linear framebuffer (VirtualBox, GRUB gfxterm). Fall back
+  // to VGA text mode (QEMU) when no multiboot framebuffer info is available.
+  fb_init();
+  if (fb_ready() == 1) {
+    fb_hello();
+  } else {
+    vga_text_setup();
+  }
+  unsafe {
+    // Row 0, columns 0..22 (2 bytes per cell, base 0xB8000).
+    // "Hello world from JOE" — attribute 0x0F (bright white on black).
+    let c0: Phys<U16> = phys<U16>(0xB8000);
+    c0.write(vga_cell(72, 15));   // H
+    let c1: Phys<U16> = phys<U16>(0xB8002);
+    c1.write(vga_cell(101, 15));  // e
+    let c2: Phys<U16> = phys<U16>(0xB8004);
+    c2.write(vga_cell(108, 15));  // l
+    let c3: Phys<U16> = phys<U16>(0xB8006);
+    c3.write(vga_cell(108, 15));  // l
+    let c4: Phys<U16> = phys<U16>(0xB8008);
+    c4.write(vga_cell(111, 15));  // o
+    let c5: Phys<U16> = phys<U16>(0xB800A);
+    c5.write(vga_cell(32, 15));   // (space)
+    let c6: Phys<U16> = phys<U16>(0xB800C);
+    c6.write(vga_cell(87, 15));   // W
+    let c7: Phys<U16> = phys<U16>(0xB800E);
+    c7.write(vga_cell(111, 15));  // o
+    let c8: Phys<U16> = phys<U16>(0xB8010);
+    c8.write(vga_cell(114, 15));  // r
+    let c9: Phys<U16> = phys<U16>(0xB8012);
+    c9.write(vga_cell(108, 15));  // l
+    let c10: Phys<U16> = phys<U16>(0xB8014);
+    c10.write(vga_cell(100, 15)); // d
+    let c11: Phys<U16> = phys<U16>(0xB8016);
+    c11.write(vga_cell(32, 15));  // (space)
+    let c12: Phys<U16> = phys<U16>(0xB8018);
+    c12.write(vga_cell(102, 15)); // f
+    let c13: Phys<U16> = phys<U16>(0xB801A);
+    c13.write(vga_cell(114, 15)); // r
+    let c14: Phys<U16> = phys<U16>(0xB801C);
+    c14.write(vga_cell(111, 15)); // o
+    let c15: Phys<U16> = phys<U16>(0xB801E);
+    c15.write(vga_cell(109, 15)); // m
+    let c16: Phys<U16> = phys<U16>(0xB8020);
+    c16.write(vga_cell(32, 15));  // (space)
+    let c17: Phys<U16> = phys<U16>(0xB8022);
+    c17.write(vga_cell(74, 15));  // J
+    let c18: Phys<U16> = phys<U16>(0xB8024);
+    c18.write(vga_cell(79, 15));  // O
+    let c19: Phys<U16> = phys<U16>(0xB8026);
+    c19.write(vga_cell(69, 15));  // E
+    let c20: Phys<U16> = phys<U16>(0xB8028);
+    c20.write(vga_cell(33, 15));  // !
+    let c21: Phys<U16> = phys<U16>(0xB802A);
+    c21.write(vga_cell(32, 15));  // (space)
+    let c22: Phys<U16> = phys<U16>(0xB802C);
+    c22.write(vga_cell(32, 15));  // (space)
+  }
+  serial_hello();
+  curlee_halt();
+  return;
+}

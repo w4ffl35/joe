@@ -1,0 +1,29 @@
+# --- Build artifacts ---
+/build/
+*.o
+*.elf
+*.iso
+*.c.bak
+out.c
+
+# --- QEMU / VirtualBox runtime output ---
+/serial.log
+/vbox-serial.log
+/serial-iso.log
+
+# --- External / large artifacts (user-specific paths) ---
+/media/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Stray artifact (screenshot export, not project source) ---
+/info:
+
+# --- Curlee compiler generated C (build intermediates live in build/) ---
+*.curlee.c
