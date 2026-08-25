@@ -53,5 +53,9 @@ long long net_tx_stage_byte(long long i, long long b);
 long long net_tx_send(long long len);
 long long net_mac_byte(long long i);
 long long net_poll_tick(void);
-
-#endif /* JOE_NET_H */
+// Deterministic smoke helpers (declared here per the net.h contract; used by
+// the 2d-2 stack): bounded RX wait + the gateway ARP request.
+long long net_rx_wait(void);
+long long net_arp_request_gateway(void);
+ 
+ #endif /* JOE_NET_H */

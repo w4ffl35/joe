@@ -101,6 +101,18 @@ extern fn net_poll_tick() -> Int;
 extern fn net_rx_wait() -> Int;
 extern fn net_arp_request_gateway() -> Int;
 
+// Phase 2d-2 — TCP/IP stack (kernel/net_stack.c). The LOCKED 2d-2 extern
+// surface (docs/phase2d-wire.md §6): ARP + IPv4 + one-shot TCP to the host
+// LLM server. All return 0 with no NIC present / on the PVH stub path.
+extern fn net_connect(port: Int) -> Int;      // 1 = TCP connected to gw:port
+extern fn net_send(buf_len: Int) -> Int;      // 1 = request queued (buffer pre-staged)
+extern fn net_stack_poll() -> Int;            // advance stack; 0 = still reading,
+                                              // 1 = response ready, 2 = fuel
+                                              // exhausted / protocol error,
+                                              // 3 = truncated (body > 256 B)
+extern fn net_response_len() -> Int;          // bytes of the HTTP response body
+extern fn net_response_byte(i: Int) -> Int;   // byte at index i (0..len-1)
+
 // ===========================================================================
 // Phase 2 declarative render scene (called per-frame by fb_run_loop's C loop)
 // ===========================================================================
@@ -206,6 +218,62 @@ fn serial_rx_marker(len: Int) -> Unit {
   return;
 }
 
+// Phase 2d-2 markers (docs/phase2d-wire.md §5): the TCP/IP stack hop markers.
+//   ARP: 1  net_connect() resolved the gateway 10.0.2.2 -> MAC
+//   TCP: 1  the same call completed the handshake (SYN -> SYN-ACK -> ACK)
+//   SND: 36 net_send() queued the fixed 36-byte HTTP request
+//   RCV: 36 net_stack_poll() finished receiving the response body
+// `n` is a single digit (0..9) and `len` up to two digits (36 max).
+fn serial_arp_marker(n: Int) -> Unit {
+  curlee_putc(65);   // A
+  curlee_putc(82);   // R
+  curlee_putc(80);   // P
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  curlee_putc(48 + n);
+  curlee_putc(10);   // newline
+  return;
+}
+
+fn serial_tcp_marker(n: Int) -> Unit {
+  curlee_putc(84);   // T
+  curlee_putc(67);   // C
+  curlee_putc(80);   // P
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  curlee_putc(48 + n);
+  curlee_putc(10);   // newline
+  return;
+}
+
+fn serial_snd_marker(len: Int) -> Unit {
+  curlee_putc(83);   // S
+  curlee_putc(78);   // N
+  curlee_putc(68);   // D
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  let tens: Int = len / 10;
+  let ones: Int = len - tens * 10;
+  curlee_putc(48 + tens);
+  curlee_putc(48 + ones);
+  curlee_putc(10);   // newline
+  return;
+}
+
+fn serial_rcv_marker(len: Int) -> Unit {
+  curlee_putc(82);   // R
+  curlee_putc(67);   // C
+  curlee_putc(86);   // V
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  let tens: Int = len / 10;
+  let ones: Int = len - tens * 10;
+  curlee_putc(48 + tens);
+  curlee_putc(48 + ones);
+  curlee_putc(10);   // newline
+  return;
+}
+
 // Phase 2d-1: VirtIO-net bring-up — probe, init, link, then the deterministic
 // RX smoke path (the guest ARPs the slirp gateway 10.0.2.2; slirp auto-answers,
 // delivering the first RX frame). Every step is gated on the previous step's
@@ -228,6 +296,52 @@ fn net_bringup() -> Unit {
         if (rlen > 0) {
           serial_rx_marker(rlen);
           net_rx_done();
+        }
+      }
+    }
+  }
+  return;
+}
+
+// Phase 2d-2: the TCP/IP stack round-trip (docs/phase2d-wire.md §5). Gated on
+// the NIC bring-up succeeding (NET: 1..3), so the no-NIC-safe baseline stays
+// green — with no virtio-net device every net_* extern returns 0 and this
+// whole sequence is a safe no-op.
+//
+// Marker sequence emitted here (asserted by the 2d-4 qemu-llm-smoke gate):
+//   ARP: 1  net_connect() resolved 10.0.2.2 -> MAC
+//   TCP: 1  the same call completed the TCP handshake
+//   SND: 36 net_send() queued the fixed 36-byte request
+//   RCV: 36 net_stack_poll() received the response body (<= 256 B)
+//
+// Fuel discipline: net_connect() and the response poll are bounded by the
+// C-side stack (net_rx_wait from 2d-1 + the net_stack_poll fuel counter) —
+// Curlee has no assignment statements (immutable `let` bindings), so the
+// poll loop uses the extern call in the CONDITION, exactly like the Phase 2b
+// `while (fb_loop_frame() < 4)` loop: each iteration re-evaluates
+// net_stack_poll(), which fails closed (returns 2 — not 0) once its C-owned
+// fuel counter is exhausted, so the loop provably terminates.
+fn net_llm_roundtrip() -> Unit {
+  let up: Int = net_link_up();
+  if (up == 1) {
+    let conn: Int = net_connect(8080);
+    if (conn == 1) {
+      serial_arp_marker(1);
+      serial_tcp_marker(1);
+      let sent: Int = net_send(36);
+      if (sent == 1) {
+        serial_snd_marker(36);
+        // Poll until the response body is ready or the stack fails closed.
+        // net_stack_poll(): 0 = still reading, 1 = response ready, 2 = fuel
+        // exhausted / protocol error, 3 = truncated (Content-Length > 256).
+        // Result 3 is also != 0, so the loop terminates for the same reason;
+        // net_response_len() reports 0 after truncation, so no marker is
+        // emitted for a corrupt body (the 2d-3 parser would see len 0).
+        while (net_stack_poll() == 0) {
+        }
+        let rlen: Int = net_response_len();
+        if (rlen > 0) {
+          serial_rcv_marker(rlen);
         }
       }
     }
@@ -320,6 +434,12 @@ fn main(pm: cap phys.mem) -> Unit {
   // nothing and the whole sequence is a safe no-op (existing gates stay
   // green — acceptance criterion 6).
   net_bringup();
+  // Phase 2d-2: the TCP/IP stack round-trip (ARP -> TCP -> send -> receive).
+  // Gated on link-up, so with no NIC (or on the PVH stub path) every extern
+  // returns 0 and the whole sequence is a safe no-op — existing gates stay
+  // green. The marker sequence (ARP: 1, TCP: 1, SND: 36, RCV: <len>) is
+  // asserted by the 2d-4 qemu-llm-smoke gate against a host stub server.
+  net_llm_roundtrip();
   fb_init();
   if (fb_ready() == 1) {
     // The linear framebuffer is active. Two sub-paths, distinguished by

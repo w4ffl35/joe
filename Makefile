@@ -41,6 +41,8 @@ MB2_C         := kernel/mb2.c
 VBE_C         := kernel/vbe.c
 NET_C         := kernel/virtio_net.c
 NET_H         := kernel/net.h
+NET_STACK_C   := kernel/net_stack.c
+NET_STACK_H   := kernel/net_stack.h
 LIBGCC32_C    := kernel/libgcc32.c
 LINKER_GRUB   := scripts/linker-grub.ld
 MERGE_SCRIPT  := scripts/build-kernel.sh
@@ -73,7 +75,7 @@ $(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(MERGE_S
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
-$(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $(NET_H)
+$(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel.o
@@ -95,12 +97,17 @@ $(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C
 	# net_probe() is a safe no-op (the PVH machine has no legacy PCI config
 	# space — see the file header). The GRUB/ISO path compiles WITHOUT the
 	# macro and gets the full option-2 rings (see kernel-grub.elf below).
-	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
+	# Phase 2d-2: TCP/IP stack (kernel/net_stack.c) — same PVH discipline: the
+	# GRUB/ISO path (below) gets the full ARP/IPv4/TCP stack; the PVH path
+	# compiles the 1-byte stubs (every extern returns 0) so the PVH LOAD budget
+	# is untouched and the no-NIC-safe baseline stays green.
+	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_STACK_C) -o $(BUILD_DIR)/net_stack.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
 	  $(BUILD_DIR)/kernel.o $(BUILD_DIR)/putc_driver.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
+	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 	@echo "Built $@"
 	@echo "Entry:"; objdump -f $@ | grep 'start address'
@@ -146,7 +153,7 @@ iso: $(ISO)
 # Int math is implemented by libgcc32.o's __muldi3/__divdi3/... helpers).
 #
 # The 64-bit PVH/QEMU path (kernel.elf via crt0.S) is completely unchanged.
-$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(LIBGCC32_C) $(NET_C) $(NET_H) $(LINKER_GRUB)
+$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(LIBGCC32_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H) $(LINKER_GRUB)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel-grub.o
@@ -158,6 +165,10 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(DRIVER_C) $(VGA_SETUP_
 	# so option 2 is ACTIVE: full rings (2 RX x 2048 + 2 TX x 2048, depth 256)
 	# and the NIC runs (this is where qemu-net-smoke boots; see the target).
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
+	# Phase 2d-2: TCP/IP stack — GRUB path compiles WITHOUT JOE_PVH_BOOT, so the
+	# full ARP/IPv4/TCP one-shot runs here (this is where qemu-net-smoke and
+	# the future qemu-llm-smoke boot; the NIC is unreachable on the PVH path).
+	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_STACK_C) -o $(BUILD_DIR)/net_stack.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(LIBGCC32_C) -o $(BUILD_DIR)/libgcc32.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	# boot.S: ELFCLASS32 object with the multiboot2 header + 32-bit protected-mode
@@ -166,7 +177,8 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(DRIVER_C) $(VGA_SETUP_
 	$(AS) --32 $(BOOT_ASM) -o $(BUILD_DIR)/boot.o
 	$(LD) -m elf_i386 -nostdlib -static -T $(LINKER_GRUB) \
 	  $(BUILD_DIR)/kernel-grub.o $(BUILD_DIR)/driver.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/libgcc32.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/boot.o \
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
+	  $(BUILD_DIR)/libgcc32.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/boot.o \
 	  -o $@
 	@echo "Built $@ (GRUB multiboot2, 32-bit entry)"
 
@@ -231,11 +243,16 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	# NIC is compiled IN so the no-NIC-safe path is exercised on the existing
 	# smoke gates (net_probe finds nothing, all externs return 0).
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
+	# Phase 2d-2: TCP/IP stack, PVH option-1 stubs (JOE_PVH_BOOT) — compiled IN
+	# so the extern surface is exercised on the no-NIC-safe smoke gates (every
+	# extern returns 0, boot continues to VGA + serial + halt).
+	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_STACK_C) -o $(BUILD_DIR)/net_stack.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
 	  $(BUILD_DIR)/kernel-smoke.o $(BUILD_DIR)/putc_driver.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
+	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 
 # Boot the PVH kernel (qemu -kernel) and assert the serial log contains the
@@ -360,6 +377,12 @@ qemu-net-smoke: $(BUILD_DIR)/joeos-net.iso
 	  && echo "PASS: RX frame received (socket netdev delivery) -> serial: $$(cat $(BUILD_DIR)/serial-net.log)" \
 	  || (echo "FAIL: RX: marker not in serial log (no frame received)"; \
 	      echo "serial log: $$(cat $(BUILD_DIR)/serial-net.log)"; exit 1)
+	# Phase 2d-2: the full ARP -> TCP -> HTTP round-trip needs slirp user-net
+	# (the gateway 10.0.2.2 ARP answer + a real TCP peer), which this two-QEMU
+	# socket gate does not provide — the full marker sequence (ARP: 1, TCP: 1,
+	# SND: 36, RCV: 36) is asserted by the 2d-4 qemu-llm-smoke gate
+	# (scripts/run-llm-smoke.sh, -netdev user against the host stub server).
+	# This 2d-1 gate stays exactly as-is: NET: 1..3 + RX: <len>.
 
 # Boot the GRUB ISO under qemu (sanity check for the VirtualBox path).
 qemu-iso: $(ISO)
@@ -379,6 +402,14 @@ verify: check pack-run canvas-run kernel
 	@nm $(KERNEL_ELF) | grep -q ' _start$$' && echo "PASS: _start present"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_main$$' && echo "PASS: curlee_main present"
 	@readelf -S $(KERNEL_ELF) | grep -q '\.note\.Xen' && echo "PASS: PVH note (qemu -kernel)"
+	# Phase 2d-2: the stack's extern surface must be linked into the kernel
+	# (the Curlee codegen references them 1:1; a missing symbol fails at link
+	# time, but this gate makes the wiring explicit).
+	@nm $(KERNEL_ELF) | grep -q ' net_connect$$' && echo "PASS: net_connect linked"
+	@nm $(KERNEL_ELF) | grep -q ' net_send$$' && echo "PASS: net_send linked"
+	@nm $(KERNEL_ELF) | grep -q ' net_stack_poll$$' && echo "PASS: net_stack_poll linked"
+	@nm $(KERNEL_ELF) | grep -q ' net_response_len$$' && echo "PASS: net_response_len linked"
+	@nm $(KERNEL_ELF) | grep -q ' net_response_byte$$' && echo "PASS: net_response_byte linked"
 	@echo "All verification gates passed."
 
 clean:
