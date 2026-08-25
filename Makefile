@@ -32,7 +32,9 @@ PACK_SRC      := kernel/pack.curlee
 CANVAS_SRC    := kernel/canvas.curlee
 GLYPHS_SRC    := kernel/glyphs.curlee
 ASSETS_SRC    := kernel/assets.curlee
+JSON_SRC      := kernel/json.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
+JSON_TEST     := kernel/json_test.curlee
 BOOT_ASM      := kernel/boot.S
 DRIVER_C      := kernel/putc_driver.c
 VGA_SETUP_C   := kernel/vga_setup.c
@@ -59,7 +61,7 @@ CC := cc
 AS := as
 LD := ld
 
-.PHONY: all kernel check pack-run canvas-run iso iso-fb qemu run verify clean \
+.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run iso iso-fb qemu run verify clean \
         qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke
 
 all: kernel
@@ -71,7 +73,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
@@ -117,11 +119,12 @@ $(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
 	$(CURLEE) check $(ASSETS_SRC)
+	$(CURLEE) check $(JSON_SRC)
 	$(CURLEE) check $(MERGED_SRC)
 	@echo "curlee check: OK (all modules + merged kernel verified)"
 
@@ -132,6 +135,19 @@ pack-run: $(PACK_SRC)
 # Pure renderer math is VM-runnable; assert color/geometry/glyph/asset math.
 canvas-run: $(CANVAS_TEST) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC)
 	$(CURLEE) run $(CANVAS_TEST)
+
+# Phase 2d-3: pure JSON/tool-call parser is VM-runnable; assert the scanner
+# phases the VM emitter can execute (see kernel/json_test.curlee's scope note).
+json-run: $(JSON_TEST) $(JSON_SRC)
+	$(CURLEE) run $(JSON_TEST)
+
+# Phase 2d-3: the FULL locked 36-byte envelope (and the [12,34] / [0,-1,2]
+# regression payloads) through the freestanding codegen path — the VM cannot
+# feed 36 bytes (emitter size limit), but `curlee build` codegens to host-
+# runnable C with no such limit. This is the authoritative happy-path gate
+# (acceptance criterion 1): asserts err=0, tool="frame_tick", args=[0,1,2].
+json-codegen-run:
+	bash scripts/run-json-codegen.sh
 
 # ---------------------------------------------------------------------------
 # GRUB ISO (VirtualBox path)
@@ -395,7 +411,7 @@ run: qemu
 # ---------------------------------------------------------------------------
 # Verify (all acceptance gates)
 # ---------------------------------------------------------------------------
-verify: check pack-run canvas-run kernel
+verify: check pack-run canvas-run json-run json-codegen-run kernel
 	@echo "=== Verification gates ==="
 	@test -s $(KERNEL_ELF) || (echo "FAIL: kernel.elf missing"; exit 1)
 	@objdump -f $(KERNEL_ELF) | grep -q 'start address 0x' && echo "PASS: ELF entry set"

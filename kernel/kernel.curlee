@@ -321,6 +321,94 @@ fn net_bringup() -> Unit {
 // `while (fb_loop_frame() < 4)` loop: each iteration re-evaluates
 // net_stack_poll(), which fails closed (returns 2 — not 0) once its C-owned
 // fuel counter is exhausted, so the loop provably terminates.
+// Phase 2d-3: the pure JSON/tool-call parser bridge (kernel/json.curlee, merged
+// in). Reads the received response body byte-by-byte through the 2d-2 externs
+// (net_response_len / net_response_byte), drives the pure state machine
+// (json_step), then:
+//   - on parse_error == 0: emits "JSON: 1" and enqueues the tool call
+//     (fb_tool_enqueue(2, arg) — kind 2 = "LLM tool call", the 2d-3 contract),
+//   - on parse_error != 0: emits "JSON: E<code>" and NEVER enqueues.
+//
+// This is the only place the externs meet the parser — json.curlee itself is
+// extern-free (VM-testable). The full 36-byte LOCKED envelope
+// (docs/phase2d-wire.md §3) is asserted by `make json-codegen-run`
+// (scripts/run-json-codegen.sh): it codegens json.curlee and drives the
+// envelope through the SAME json_step/json_end functions this bridge calls,
+// on the host with a real body (no NIC needed). The VM test
+// (kernel/json_test.curlee) asserts the phases the VM emitter can run. This
+// bridge has no live NIC gate until 2d-4's stub server lands (net_response_len
+// is 0 on the current PVH stubs), so the codegen harness is the CI-visible
+// full-happy-path proof.
+//
+// The feed loop is a bounded recursion over an immutable index (Curlee has no
+// assignment — the established extern-loop pattern, e.g. the `while
+// (net_stack_poll() == 0)` poll). json_step ignores bytes once the state
+// freezes in the error phase, so the loop provably terminates at len.
+fn json_feed(i: Int, rlen: Int, st: Int) -> Int {
+  if (i >= rlen) {
+    return st;
+  } else {
+    let c: Int = net_response_byte(i);
+    let ns: Int = json_step(c, st);
+    return json_feed(i + 1, rlen, ns);
+  }
+}
+
+// Serial marker "JSON: E<code>" — a single digit 0..9.
+fn serial_json_err(code: Int) -> Unit {
+  curlee_putc(74);   // J
+  curlee_putc(83);   // S
+  curlee_putc(79);   // O
+  curlee_putc(78);   // N
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  curlee_putc(69);   // E
+  curlee_putc(48 + code);
+  curlee_putc(10);   // newline
+  return;
+}
+
+// Serial marker "JSON: 1" — parser OK.
+fn serial_json_ok() -> Unit {
+  curlee_putc(74);   // J
+  curlee_putc(83);   // S
+  curlee_putc(79);   // O
+  curlee_putc(78);   // N
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  curlee_putc(49);   // 1
+  curlee_putc(10);   // newline
+  return;
+}
+
+// The 2d-3 bridge: parse the received body and feed the tool-call queue.
+// Gated on a response being ready (net_response_len > 0), so the no-NIC /
+// no-response baseline emits nothing and existing gates stay green.
+fn json_llm_bridge() -> Unit {
+  let rlen: Int = net_response_len();
+  if (rlen > 0) {
+    let over: Int = json_check_len(rlen);
+    if (over == 1) {
+      serial_json_err(1);         // response > 256 bytes
+    } else {
+      let st0: Int = json_start();
+      let st: Int = json_feed(0, rlen, st0);
+      let err: Int = json_end(st);
+      if (err == 0) {
+        serial_json_ok();
+        // Enqueue the parsed tool call (kind 2 = "LLM tool call", arg = the
+        // parsed value). 2d-4's smoke gate asserts the "JSON: 1" marker; the
+        // enqueue proves the LLM bridge reaches the 2b tool-call queue.
+        let arg: Int = json_arg_value(st);
+        let enq: Int = fb_tool_enqueue(2, arg);
+      } else {
+        serial_json_err(err);
+      }
+    }
+  }
+  return;
+}
+
 fn net_llm_roundtrip() -> Unit {
   let up: Int = net_link_up();
   if (up == 1) {
@@ -440,6 +528,9 @@ fn main(pm: cap phys.mem) -> Unit {
   // green. The marker sequence (ARP: 1, TCP: 1, SND: 36, RCV: <len>) is
   // asserted by the 2d-4 qemu-llm-smoke gate against a host stub server.
   net_llm_roundtrip();
+  // Phase 2d-3: parse the received response (if any) and feed the tool-call
+  // queue. Gated on net_response_len > 0, so the no-NIC baseline emits nothing.
+  json_llm_bridge();
   fb_init();
   if (fb_ready() == 1) {
     // The linear framebuffer is active. Two sub-paths, distinguished by

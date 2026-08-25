@@ -71,7 +71,9 @@ joeos/
 │   ├── canvas.curlee               # NEW: pure renderer math (flat-Int color/geometry)
 │   ├── glyphs.curlee               # NEW: pure 5x7 glyph math + text layout
 │   ├── assets.curlee               # NEW: pure asset/frame-ring math
+│   ├── json.curlee                 # NEW (2d-3): pure JSON/tool-call state machine
 │   ├── canvas_test.curlee          # NEW: VM test — imports the 3 modules, asserts math
+│   ├── json_test.curlee            # NEW (2d-3): VM test — imports json, asserts phases
 │   ├── pack.curlee                 # (existing, kept)
 │   ├── fb.c                        # EXTENDED: pixel/fill_rect/line/text/blit primitives
 │   ├── putc_driver.c               # (existing)
@@ -339,13 +341,16 @@ New/changed Makefile targets:
 |--------|--------|
 | `make kernel` | run `build-kernel.sh`, `check` merged file, codegen, compile, link → `build/kernel.elf` |
 | `make canvas-run` | `curlee run kernel/canvas_test.curlee` (imports canvas/glyphs/assets + asserts pure math) |
-| `make check` | `curlee check` each pure module (pack, canvas, glyphs, assets) + `curlee check` merged kernel |
-| `make verify` | `check` + `pack-run` + `canvas-run` + `kernel` + ELF/`_start`/`curlee_main`/PVH gates |
+| `make json-run` | `curlee run kernel/json_test.curlee` (imports json + asserts the parser phases the VM can run) |
+| `make json-codegen-run` | codegen json.curlee + drive the full 36-byte locked envelope (and [12,34]/[0,-1,2]) through json_step/json_end on the host — asserts tool="frame_tick", args=[0,1,2] (acceptance criterion 1's happy path) |
+| `make check` | `curlee check` each pure module (pack, canvas, glyphs, assets, json) + `curlee check` merged kernel |
+| `make verify` | `check` + `pack-run` + `canvas-run` + `json-run` + `json-codegen-run` + `kernel` + ELF/`_start`/`curlee_main`/PVH gates |
 | `make qemu-smoke` | unchanged acceptance gate (serial contains "Hello World from JOE") |
 
 `scripts/build-kernel.sh` responsibilities (deterministic, ~40 lines):
-1. Concatenate `canvas.curlee` + `glyphs.curlee` + `assets.curlee` + `kernel.curlee`
-   in dependency order into `build/kernel-merged.curlee` (single SPDX header kept).
+1. Concatenate `canvas.curlee` + `glyphs.curlee` + `assets.curlee` + `json.curlee`
+   + `kernel.curlee` in dependency order into `build/kernel-merged.curlee`
+   (single SPDX header kept).
 2. Strip nothing else — pure modules contain **no `main`** (their tests live in
    `kernel/canvas_test.curlee`), so there is exactly one `main` in the merged file.
 3. Fail loudly if any fragment contains `import` (protects against constraint #1).
@@ -374,7 +379,7 @@ from the modules. This eliminates the drift risk entirely:
 | 2a | Software renderer: blitter primitives, text, bitmap/frame blit (THIS SESSION) | ✅ DONE — canvas/glyphs/assets modules (VM-verified), fb.c blitter extensions, merge pipeline, demo scene; all gates pass |
 | 2b | Kernel tool API & 60 FPS event loop | ✅ DONE — Curlee `main` drives the deterministic, fuel-bounded while-loop (4 frames); `fb.c` owns the frame counter + fixed-slot tool ring (no malloc); per-frame `FR:<n>` serial markers; `make qemu-loop-smoke` asserts frames 0..2+ |
 | 2c | Memory & asset management contracts | ✅ DONE — static asset region (128x128) + 2-slot 640x480 frame ring (fb.c, no malloc); every blit/fill/line/text path gated by verified pure gates (rect_fits_gate/line_fits_gate/char_fits_gate/asset_blit_fits) reading runtime FB size from extern accessors; `fb_present()` performs a REAL flip on the GRUB framebuffer path (`RING: 1` in serial, asserted by qemu-fb-smoke/qemu-loop-smoke); PVH path compiles the ring out (`JOE_PVH_BOOT`) because QEMU's PVH loader rejects ELFs with a large BSS (verified empirically — see fb.c header); all gates green |
-| 2d | LLM bridge (VirtIO-net / TCP + JSON) | ⏳ SCOPED — sub-issues filed with detailed specs: 2d-1 VirtIO-net driver (#5), 2d-2 minimal TCP/IP stack (#6), 2d-3 pure Curlee JSON/tool-call parser + VM tests (#7), 2d-4 host harness + end-to-end smoke gate (#8); specs in `plans/phase2d-*.md`. Implementation not started — needs a NIC driver first |
+| 2d | LLM bridge (VirtIO-net / TCP + JSON) | ⏳ IN PROGRESS — 2d-1 VirtIO-net driver (#5) and 2d-2 TCP/IP stack (#6) shipped (NET/TCP markers + qemu-net-smoke gate); **2d-3 pure Curlee JSON/tool-call parser + VM tests (#7) DONE** — `kernel/json.curlee` (per-byte state machine `json_step`, split into small per-phase functions for the VM emitter; each new arg resets its magnitude), `kernel/json_test.curlee` (`make json-run` asserts the scanner phases + error codes 2/3/4/9 + check_len + neg/arg-digits paths + the args-array open), the kernel bridge (`json_llm_bridge` in kernel.curlee emits `JSON: 1` / `JSON: E<code>` and enqueues `fb_tool_enqueue(2, ...)` — no live NIC gate until 2d-4), merged by build-kernel.sh, gated by make check/verify. **The full 36-byte locked envelope — tool="frame_tick", args=[0,1,2] — is asserted by `make json-codegen-run`** (`scripts/run-json-codegen.sh`: codegens json.curlee, drives the envelope through the same json_step/json_end on the host with a real body, and asserts err==0/tool_len==10/arg_count==3/arg_value==2, plus the [12,34] and [0,-1,2] regression payloads). Note: the Curlee VM bytecode emitter has limits (total program size; the phase-19 first-digit transition aborts with "div expects Int") — the VM test asserts the phases the VM runs, the codegen harness proves the full happy path. 2d-4 host harness (#8) still pending |
 | 2e | Framebuffer address plumbing | ✅ DONE — Phase 2e groundwork (mb2.c parser, fb.c blitter, qemu-fb-smoke gate) + **Phase 2e-2** (32-bit multiboot2 entry + framebuffer request tag): `make qemu-fb-smoke` PASSES, serial `FB: 1` proves `fb_ready()==1` under QEMU/VirtualBox |
 | 2f | PVH/VBE framebuffer fallback | ⏸️ PARKED — the compile-time guard bug (draw target set only under `#ifndef JOE_PVH_BOOT`) was found and FIXED (shipped; `fb_init()` now sets the draw target whenever `fb_addr != 0`), and `kernel/vbe.c` (Bochs VBE probe) + the PVH single-frame path + `make qemu-pvh-fb-smoke` are in place. **Acceptance NOT achievable on the QEMU `-kernel` PVH path**: the PVH machine (`xenpvh`) exposes NO VGA device and NO legacy PCI config space (verified: PCI + VBE port reads all return 0 under every `-kernel` machine combo; QEMU docs list only RAM/GPEX/virtio-pci on that machine). NOT a "read-only RAM" issue — `.bss`/`.stack` are provably writable on the PVH path. Phase documented and parked; revisit via a QEMU `hvm_start_info` framebuffer handoff (upstream), SeaBIOS-booted `-kernel`, or accept GRUB-path-only (current). See `docs/phase2f-report.md` |
 

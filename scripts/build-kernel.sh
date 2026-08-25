@@ -12,9 +12,9 @@
 # the codegen accepts.
 #
 # Order matters (dependencies first): canvas.curlee -> glyphs.curlee ->
-# assets.curlee -> kernel.curlee. Each pure module contains NO `main`, so the
-# merged file has exactly one `main` (from kernel.curlee). All modules are
-# already individually verified by `make check`.
+# assets.curlee -> json.curlee -> kernel.curlee. Each pure module contains NO
+# `main`, so the merged file has exactly one `main` (from kernel.curlee). All
+# modules are already individually verified by `make check`.
 #
 # When the Curlee codegen import fix lands, this script is deleted and
 # kernel.curlee imports the modules natively.
@@ -32,6 +32,7 @@ MODULES=(
   "$ROOT/kernel/canvas.curlee"
   "$ROOT/kernel/glyphs.curlee"
   "$ROOT/kernel/assets.curlee"
+  "$ROOT/kernel/json.curlee"
   "$ROOT/kernel/kernel.curlee"
 )
 
@@ -54,7 +55,7 @@ done
   echo "// and re-run the merge. When the Curlee codegen import bug is fixed,"
   echo "// this script is deleted and kernel.curlee imports the modules."
   echo "//"
-  echo "// Modules (in dependency order): canvas, glyphs, assets, kernel."
+  echo "// Modules (in dependency order): canvas, glyphs, assets, json, kernel."
   echo
   for f in "${MODULES[@]}"; do
     echo "// ==== $(basename "$f") ===="

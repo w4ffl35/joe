@@ -1,0 +1,692 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// json.curlee — pure, contract-less, VM-asserted JSON/tool-call parser for the
+// Phase 2d LLM bridge (GitHub issue #7).
+//
+// Parses the LOCKED response envelope from docs/phase2d-wire.md (§3) —
+//   {"tool":"frame_tick","args":[0,1,2]}
+// — into flat Int fields (tool_len / tool name bytes / arg_count / arg_value)
+// consumed by the kernel bridge (kernel.curlee), which feeds the Phase 2b
+// tool-call queue (fb_tool_enqueue, kind 2). parse_error codes are the wire
+// doc §4 table (0 = OK, 1..9), returned deterministically, never a hang.
+//
+// WHY A PER-BYTE STATE MACHINE (not a window + recursive descent):
+//   - The Curlee freestanding fragment (docs/phase2-architecture.md §1) has no
+//     String/Vec, no struct params in function signatures, no first-class
+//     functions, and NO assignment. A "byte stream" therefore cannot be passed
+//     as data, and a scanner cannot hold mutable state.
+//   - Recursive descent over a flat-Int "window" was prototyped and REJECTED:
+//     the VM's default fuel (10000) is exhausted by the per-step arg copies +
+//     nested helper calls before a 100-byte scan completes.
+//   - The design that fits the fragment: `json_step(c, st)` consumes ONE byte
+//     at a time and returns the next parser state as a single packed Int. The
+//     driver (the VM test via let-chains, the kernel bridge via recursion over
+//     the net_response_* externs) feeds bytes one at a time.
+//
+// WHY SPLIT INTO SMALL PER-PHASE FUNCTIONS: a single monolithic `json_step`
+// (~30 phases, hundreds of lines) triggers a Curlee VM bytecode-emitter bug:
+// arithmetic inside deeply-nested if-branches of a large function miscompiles
+// and the VM aborts with "div expects Int" (verified empirically — the same
+// logic in a small function runs fine). Splitting the transitions into small
+// per-phase functions (each a few lines) keeps every function under the
+// emitter's comfort zone, so the state machine runs correctly on the VM AND
+// codegens cleanly for the freestanding kernel.
+//
+// WHY CONTRACT-LESS: a JSON scanner needs per-char decisions and division
+// (digit extraction) — none Z3-provable in the Curlee fragment. Correctness is
+// asserted by the VM test (kernel/json_test.curlee, `make json-run`), the
+// authoritative gate (the same pattern as the contract-less helpers in
+// canvas.curlee / assets.curlee).
+//
+// Determinism + bounded scanning: the driver feeds at most
+// min(response_len, 256) bytes (json_check_len rejects > 256 up front, wire
+// doc §3.2); every function is total (any input yields a value); a malformed
+// payload freezes the error code (phase 30) and json_end() maps a premature
+// end to code 9. No loop can spin.
+//
+// Merge-safe: no import, no main, no extern (the bridge in kernel.curlee owns
+// the externs). Merged by scripts/build-kernel.sh after assets.curlee, before
+// kernel.curlee.
+
+// ---------------------------------------------------------------------------
+// State encoding (a single packed Int — no structs, no bitwise ops)
+// ---------------------------------------------------------------------------
+//
+// The parser state is one Int with seven fields, each a fixed-width base-N
+// slice (packed with multiplication, read with division — the fragment's only
+// tools; bitwise is rejected). The phase field is 6 bits so phases up to 30
+// (frozen error) fit WITHOUT carrying into the next field.
+//
+//   field      divisor   accessor
+//   phase      64        st - (st / 64) * 64                       (0..63)
+//   err        1024      (st / 64) - (st / 1024) * 16              (0..9)
+//   tool_len   16384     (st / 1024) - (st / 16384) * 16           (0..15)
+//   tool_big   32768     (st / 16384) - (st / 32768) * 2           (0/1)
+//   arg_count  524288    (st / 32768) - (st / 524288) * 16         (0..8)
+//   neg        1048576   (st / 524288) - (st / 1048576) * 2        (0/1)
+//   arg_mag    1048576   st / 1048576                               (0..2147483648)
+//
+// arg_mag is the magnitude of the arg currently being parsed; the driver reads
+// json_arg_value() (= -arg_mag when neg, else arg_mag) each time an arg
+// completes (the ',' or ']' after its digits). The wire doc arg range
+// -2147483648..2147483647 bounds arg_mag at 2147483648, so the pack never
+// exceeds 2^31 * 2^20 = 2^51 — comfortably inside Int64.
+//
+// Phases (0..30):
+//   0  START          expect ws? '{'
+//   1  LBRACE_DONE    expect ws? '"' (start of "tool")
+//   2  KEY_T          expect 't'
+//   3  KEY_O1         expect 'o'
+//   4  KEY_O2         expect 'o'
+//   5  KEY_L          expect 'l'
+//   6  KEY_QUOTE      expect '"'
+//   7  COLON          expect ws? ':'
+//   8  VAL_OPEN       expect ws? '"' (tool value opening quote)
+//   9  VAL_CHARS      tool chars / closing '"' (accumulate tool_len)
+//   10 COMMA          expect ws? ','
+//   11 ARGS_QUOTE1    expect '"' (start of "args")
+//   12 ARGS_A         expect 'a'
+//   13 ARGS_R         expect 'r'
+//   14 ARGS_G         expect 'g'
+//   15 ARGS_S         expect 's'
+//   16 ARGS_QUOTE2    expect '"'
+//   17 ARGS_COLON     expect ws? ':'
+//   18 ARGS_OPEN      expect ws? '['
+//   19 ARG_FIRST      expect ws? '-' or digit (first digit of an arg)
+//   20 ARG_DIGITS     digits (accumulate arg_mag) / ',' / ']'
+//   22 OBJ_CLOSE      expect ws? '}'
+//   23 TRAIL          expect ws? then end (EOF)
+//   30 ERROR          frozen — err carries the wire doc code
+//
+// Error codes (wire doc §4): 0 OK, 1 too long (bridge via json_check_len),
+// 2 not an object, 3 missing/bad tool, 4 tool length, 5 missing/bad args,
+// 6 arg count, 7 bad/out-of-range arg, 8 trailing garbage, 9 structural/EOF.
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+// The initial parser state (phase 0 = START, all fields zeroed).
+fn json_start() -> Int {
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Field accessors (pure, total)
+// ---------------------------------------------------------------------------
+
+// Current phase (0..30; 30 = frozen error).
+fn json_phase(st: Int) -> Int {
+  return st - (st / 64) * 64;
+}
+
+// Frozen error code (0 when not in the error phase).
+fn json_error(st: Int) -> Int {
+  return (st / 64) - (st / 1024) * 16;
+}
+
+// Tool name length accumulated so far (1..15; 0 until parsed).
+fn json_tool_len(st: Int) -> Int {
+  return (st / 1024) - (st / 16384) * 16;
+}
+
+// True when the tool name exceeded 15 bytes (forces error code 4 at the close).
+fn json_tool_big(st: Int) -> Int {
+  return (st / 16384) - (st / 32768) * 2;
+}
+
+// Number of args parsed so far (0..8).
+fn json_arg_count(st: Int) -> Int {
+  return (st / 32768) - (st / 524288) * 16;
+}
+
+// Value of the most recently completed arg (-2147483648..2147483647; 0 before
+// any arg completes). The driver reads this after each ',' / ']' terminator.
+fn json_arg_value(st: Int) -> Int {
+  let neg: Int = (st / 524288) - (st / 1048576) * 2;
+  let mag: Int = st / 1048576;
+  if (neg == 1) {
+    return 0 - mag;
+  } else {
+    return mag;
+  }
+}
+
+// True when the parse is complete and valid (phase 23, no frozen error).
+fn json_is_ok(st: Int) -> Bool {
+  let ph: Int = json_phase(st);
+  if (ph == 23) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// State-update helpers (pure, total)
+// ---------------------------------------------------------------------------
+
+// Set the phase, preserving every other field. The phase field is 6 bits wide
+// (divisor 64), so any phase 0..63 replaces the low slice without carrying.
+fn set_phase(st: Int, p: Int) -> Int {
+  let ph: Int = json_phase(st);
+  return st - ph + p;
+}
+
+// Freeze the error: phase 30, err = e, everything else preserved.
+fn set_err(st: Int, e: Int) -> Int {
+  let ph: Int = json_phase(st);
+  let old: Int = json_error(st);
+  return st - ph + 30 - old * 64 + e * 64;
+}
+
+// Bump the tool length by one (capped at 15; a 16th char sets tool_big).
+fn bump_tool_len(st: Int) -> Int {
+  let n: Int = json_tool_len(st);
+  if (n < 15) {
+    return st + 1024;
+  } else {
+    let big: Int = json_tool_big(st);
+    if (big == 0) {
+      return st + 16384;
+    } else {
+      return st;
+    }
+  }
+}
+
+// Set the arg magnitude (0..2147483648). Resets the value for a new arg.
+fn set_arg_mag(st: Int, m: Int) -> Int {
+  let old: Int = st / 1048576;
+  return st - old * 1048576 + m * 1048576;
+}
+
+// Add a digit (0..9) to the current arg magnitude: mag' = mag*10 + d.
+// The magnitude is stored in the high field (divisor 1048576), so this reads
+// the field, computes, and rewrites it. Bound to lets (emitter-safe).
+fn add_arg_digit(st: Int, d: Int) -> Int {
+  let mag: Int = st / 1048576;
+  let nm: Int = mag * 10 + d;
+  if (nm > 2147483648) {
+    return set_err(st, 7);        // arg out of range
+  } else {
+    let old: Int = st / 1048576;
+    return st - old * 1048576 + nm * 1048576;
+  }
+}
+
+// Set the current arg's sign (neg = 0/1).
+fn set_neg(st: Int, n: Int) -> Int {
+  let old: Int = (st / 524288) - (st / 1048576) * 2;
+  return st - old * 524288 + n * 524288;
+}
+
+// Bump the arg count by one (0..8; the caller rejects > 8 via error code 6).
+fn bump_arg_count(st: Int) -> Int {
+  return st + 32768;
+}
+
+// ---------------------------------------------------------------------------
+// Per-byte recognizers (pure, total; used by the transition helpers)
+// ---------------------------------------------------------------------------
+
+// True when c is JSON whitespace (space, tab, LF, CR) — the wire doc allows
+// whitespace between tokens (docs/phase2d-wire.md §3.1).
+fn is_ws(c: Int) -> Bool {
+  if (c == 32 || c == 9 || c == 10 || c == 13) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// True when c is an ASCII digit '0'..'9'.
+fn is_digit(c: Int) -> Bool {
+  if (c >= 48 && c <= 57) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// True when c is a tool-name character: ASCII letter, digit, or underscore
+// (wire doc §3.1: tool is 1..15 bytes of letters/digits/_).
+fn is_tool_char(c: Int) -> Bool {
+  if (c >= 97 && c <= 122) {       // a-z
+    return true;
+  } else {
+    if (c >= 65 && c <= 90) {      // A-Z
+      return true;
+    } else {
+      if (c >= 48 && c <= 57) {    // 0-9
+        return true;
+      } else {
+        if (c == 95) {             // _
+          return true;
+        } else {
+          return false;
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-phase transition helpers (each SMALL — see the header note)
+// ---------------------------------------------------------------------------
+
+// Phase 0: START — ws? '{'.
+fn step_start(c: Int, st: Int) -> Int {
+  if (is_ws(c)) {
+    return st;
+  } else {
+    if (c == 123) {               // '{'
+      return set_phase(st, 1);
+    } else {
+      return set_err(st, 2);      // not a JSON object
+    }
+  }
+}
+
+// Phase 1: LBRACE_DONE — ws? '"' (start of "tool").
+fn step_lbrace(c: Int, st: Int) -> Int {
+  if (is_ws(c)) {
+    return st;
+  } else {
+    if (c == 34) {                // '"'
+      return set_phase(st, 2);
+    } else {
+      return set_err(st, 3);      // missing tool field
+    }
+  }
+}
+
+// Phases 2..6: the "tool" key bytes. Each expects one byte.
+fn step_key_t(c: Int, st: Int) -> Int {
+  if (c == 116) {                 // 't'
+    return set_phase(st, 3);
+  } else {
+    return set_err(st, 3);
+  }
+}
+
+fn step_key_o1(c: Int, st: Int) -> Int {
+  if (c == 111) {                 // 'o'
+    return set_phase(st, 4);
+  } else {
+    return set_err(st, 3);
+  }
+}
+
+fn step_key_o2(c: Int, st: Int) -> Int {
+  if (c == 111) {                 // 'o'
+    return set_phase(st, 5);
+  } else {
+    return set_err(st, 3);
+  }
+}
+
+fn step_key_l(c: Int, st: Int) -> Int {
+  if (c == 108) {                 // 'l'
+    return set_phase(st, 6);
+  } else {
+    return set_err(st, 3);
+  }
+}
+
+fn step_key_quote(c: Int, st: Int) -> Int {
+  if (c == 34) {                  // '"'
+    return set_phase(st, 7);
+  } else {
+    return set_err(st, 3);
+  }
+}
+
+// Phase 7: COLON — ws? ':'.
+fn step_colon(c: Int, st: Int) -> Int {
+  if (is_ws(c)) {
+    return st;
+  } else {
+    if (c == 58) {                // ':'
+      return set_phase(st, 8);
+    } else {
+      return set_err(st, 3);
+    }
+  }
+}
+
+// Phase 8: VAL_OPEN — ws? '"' (tool value opening quote).
+fn step_val_open(c: Int, st: Int) -> Int {
+  if (is_ws(c)) {
+    return st;
+  } else {
+    if (c == 34) {                // '"'
+      return set_phase(st, 9);
+    } else {
+      return set_err(st, 3);      // tool not a JSON string
+    }
+  }
+}
+
+// Phase 9: VAL_CHARS — tool chars / closing '"' (accumulate tool_len).
+fn step_val_chars(c: Int, st: Int) -> Int {
+  if (c == 34) {                  // closing '"'
+    let n: Int = json_tool_len(st);
+    let big: Int = json_tool_big(st);
+    if (big == 1) {
+      return set_err(st, 4);      // tool length > 15
+    } else {
+      if (n >= 1 && n <= 15) {
+        return set_phase(st, 10);
+      } else {
+        return set_err(st, 4);    // tool length 0 (or > 15)
+      }
+    }
+  } else {
+    if (is_tool_char(c)) {
+      return bump_tool_len(st);
+    } else {
+      return set_err(st, 3);      // tool value not a valid string
+    }
+  }
+}
+
+// Phase 10: COMMA — ws? ','.
+fn step_comma(c: Int, st: Int) -> Int {
+  if (is_ws(c)) {
+    return st;
+  } else {
+    if (c == 44) {                // ','
+      return set_phase(st, 11);
+    } else {
+      return set_err(st, 5);      // missing args field
+    }
+  }
+}
+
+// Phases 11..16: the "args" key bytes.
+fn step_args_q1(c: Int, st: Int) -> Int {
+  if (c == 34) {                  // '"'
+    return set_phase(st, 12);
+  } else {
+    return set_err(st, 5);
+  }
+}
+
+fn step_args_a(c: Int, st: Int) -> Int {
+  if (c == 97) {                  // 'a'
+    return set_phase(st, 13);
+  } else {
+    return set_err(st, 5);
+  }
+}
+
+fn step_args_r(c: Int, st: Int) -> Int {
+  if (c == 114) {                 // 'r'
+    return set_phase(st, 14);
+  } else {
+    return set_err(st, 5);
+  }
+}
+
+fn step_args_g(c: Int, st: Int) -> Int {
+  if (c == 103) {                 // 'g'
+    return set_phase(st, 15);
+  } else {
+    return set_err(st, 5);
+  }
+}
+
+fn step_args_s(c: Int, st: Int) -> Int {
+  if (c == 115) {                 // 's'
+    return set_phase(st, 16);
+  } else {
+    return set_err(st, 5);
+  }
+}
+
+fn step_args_q2(c: Int, st: Int) -> Int {
+  if (c == 34) {                  // '"'
+    return set_phase(st, 17);
+  } else {
+    return set_err(st, 5);
+  }
+}
+
+// Phase 17: ARGS_COLON — ws? ':'.
+fn step_args_colon(c: Int, st: Int) -> Int {
+  if (is_ws(c)) {
+    return st;
+  } else {
+    if (c == 58) {                // ':'
+      return set_phase(st, 18);
+    } else {
+      return set_err(st, 5);
+    }
+  }
+}
+
+// Phase 18: ARGS_OPEN — ws? '['.
+fn step_args_open(c: Int, st: Int) -> Int {
+  if (is_ws(c)) {
+    return st;
+  } else {
+    if (c == 91) {                // '['
+      return set_phase(st, 19);
+    } else {
+      return set_err(st, 5);      // args not a JSON array
+    }
+  }
+}
+
+// Phase 19: ARG_FIRST — ws? '-' or digit (first digit of an arg).
+fn step_arg_first(c: Int, st: Int) -> Int {
+  if (c == 32 || c == 9 || c == 10 || c == 13) {   // whitespace (inlined)
+    return st;
+  } else {
+    if (c == 45) {                // '-' (negative arg)
+      let z: Int = set_neg(st, 1);
+      let z2: Int = set_arg_mag(z, 0);
+      return set_phase(z2, 20);
+    } else {
+      if (c >= 48 && c <= 57) {   // digit (inlined)
+        // Reset the magnitude to 0 BEFORE the first digit (mirrors the '-'
+        // branch), so a positive arg never inherits the previous arg's
+        // magnitude. The old code skipped this and each new positive arg
+        // accumulated on top of the prior arg's value (e.g. [0,1,2] parsed
+        // the last arg as 12 instead of 2).
+        let z: Int = set_neg(st, 0);
+        let z0: Int = set_arg_mag(z, 0);
+        let z2: Int = set_phase(z0, 20);   // enter ARG_DIGITS with mag 0
+        return step_arg_digits(c, z2);    // reuse the WORKING digit path
+      } else {
+        if (c == 93) {            // ']' — empty array
+          return set_err(st, 6);  // arg_count 0
+        } else {
+          return set_err(st, 7);  // an arg is not an integer
+        }
+      }
+    }
+  }
+}
+
+// Phase 20: ARG_DIGITS — digits / ',' / ']'.
+fn step_arg_digits(c: Int, st: Int) -> Int {
+  if (c >= 48 && c <= 57) {       // digit (inlined)
+    let mag: Int = st / 1048576;
+    let d: Int = c - 48;          // bound first (emitter-safe)
+    let nm: Int = mag * 10 + d;
+    if (nm > 2147483648) {
+      return set_err(st, 7);      // arg out of range
+    } else {
+      return set_arg_mag(st, nm);
+    }
+  } else {
+    if (c == 44) {                // ',' — another arg
+      let cnt: Int = json_arg_count(st);
+      if (cnt >= 8) {
+        return set_err(st, 6);    // arg_count > 8
+      } else {
+        let z: Int = bump_arg_count(st);
+        let z2: Int = set_neg(z, 0);
+        // Reset the magnitude for the next arg (defense-in-depth: the
+        // step_arg_first digit branch also resets, but this guarantees a new
+        // arg always starts at mag 0 regardless of the entry path).
+        let z3: Int = set_arg_mag(z2, 0);
+        return set_phase(z3, 19);
+      }
+    } else {
+      if (c == 93) {              // ']' — args complete
+        let cnt: Int = json_arg_count(st);
+        let nc: Int = cnt + 1;
+        if (nc >= 1 && nc <= 8) {
+          let z: Int = bump_arg_count(st);
+          return set_phase(z, 22);
+        } else {
+          return set_err(st, 6);  // arg_count 0 or > 8
+        }
+      } else {
+        return set_err(st, 7);    // not a JSON integer
+      }
+    }
+  }
+}
+
+// Phase 22: OBJ_CLOSE — ws? '}'.
+fn step_obj_close(c: Int, st: Int) -> Int {
+  if (is_ws(c)) {
+    return st;
+  } else {
+    if (c == 125) {               // '}'
+      return set_phase(st, 23);
+    } else {
+      return set_err(st, 9);      // generic structural error
+    }
+  }
+}
+
+// Phase 23: TRAIL — ws? then end (EOF).
+fn step_trail(c: Int, st: Int) -> Int {
+  if (is_ws(c)) {
+    return st;
+  } else {
+    return set_err(st, 8);        // trailing garbage
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The dispatcher: json_step(c, st) -> st'
+// ---------------------------------------------------------------------------
+//
+// Consumes one byte c and returns the next state. Any byte in the frozen error
+// phase is ignored (the error sticks). The dispatcher is a sequence of tiny
+// if-guards (each calls one small transition helper) — deliberately NOT one
+// monolithic if/else tree, so every compiled function stays small.
+fn json_step(c: Int, st: Int) -> Int {
+  let ph: Int = json_phase(st);
+  if (ph == 30) {
+    return st;                                    // frozen error: ignore input
+  }
+  if (ph == 0) {
+    return step_start(c, st);
+  }
+  if (ph == 1) {
+    return step_lbrace(c, st);
+  }
+  if (ph == 2) {
+    return step_key_t(c, st);
+  }
+  if (ph == 3) {
+    return step_key_o1(c, st);
+  }
+  if (ph == 4) {
+    return step_key_o2(c, st);
+  }
+  if (ph == 5) {
+    return step_key_l(c, st);
+  }
+  if (ph == 6) {
+    return step_key_quote(c, st);
+  }
+  if (ph == 7) {
+    return step_colon(c, st);
+  }
+  if (ph == 8) {
+    return step_val_open(c, st);
+  }
+  if (ph == 9) {
+    return step_val_chars(c, st);
+  }
+  if (ph == 10) {
+    return step_comma(c, st);
+  }
+  if (ph == 11) {
+    return step_args_q1(c, st);
+  }
+  if (ph == 12) {
+    return step_args_a(c, st);
+  }
+  if (ph == 13) {
+    return step_args_r(c, st);
+  }
+  if (ph == 14) {
+    return step_args_g(c, st);
+  }
+  if (ph == 15) {
+    return step_args_s(c, st);
+  }
+  if (ph == 16) {
+    return step_args_q2(c, st);
+  }
+  if (ph == 17) {
+    return step_args_colon(c, st);
+  }
+  if (ph == 18) {
+    return step_args_open(c, st);
+  }
+  if (ph == 19) {
+    return step_arg_first(c, st);
+  }
+  if (ph == 20) {
+    return step_arg_digits(c, st);
+  }
+  if (ph == 22) {
+    return step_obj_close(c, st);
+  }
+  if (ph == 23) {
+    return step_trail(c, st);
+  }
+  return set_err(st, 9);                          // unreachable / generic
+}
+
+// ---------------------------------------------------------------------------
+// Finalization + length gate (called by the driver)
+// ---------------------------------------------------------------------------
+
+// After the driver feeds every byte, json_end maps the terminal state to the
+// wire doc parse_error code: 0 when the object closed cleanly (phase 23), the
+// frozen error when the machine errored, else 9 (premature end — EOF before
+// the object closed).
+fn json_end(st: Int) -> Int {
+  let ph: Int = json_phase(st);
+  if (ph == 30) {
+    return json_error(st);
+  } else {
+    if (ph == 23) {
+      return 0;
+    } else {
+      return 9;
+    }
+  }
+}
+
+// Wire doc §3.2: the response is at most 256 bytes. The driver must reject a
+// longer body BEFORE feeding bytes (the machine itself never scans past the
+// bytes it is fed). Returns 1 when len > 256, else 0.
+fn json_check_len(len: Int) -> Int {
+  if (len > 256) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
