@@ -38,6 +38,7 @@ DRIVER_C      := kernel/putc_driver.c
 VGA_SETUP_C   := kernel/vga_setup.c
 FB_C          := kernel/fb.c
 MB2_C         := kernel/mb2.c
+VBE_C         := kernel/vbe.c
 LIBGCC32_C    := kernel/libgcc32.c
 LINKER_GRUB   := scripts/linker-grub.ld
 MERGE_SCRIPT  := scripts/build-kernel.sh
@@ -55,7 +56,7 @@ AS := as
 LD := ld
 
 .PHONY: all kernel check pack-run canvas-run iso iso-fb qemu run verify clean \
-        qemu-loop-smoke
+        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke
 
 all: kernel
 
@@ -70,7 +71,7 @@ $(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(MERGE_S
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
-$(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C)
+$(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel.o
@@ -83,11 +84,15 @@ $(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C)
 	# ring/asset region, which is where the framebuffer flip actually runs.
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
+	# Phase 2f: Bochs VBE probe (kernel/vbe.c) — PVH-only. The GRUB/ISO path
+	# (kernel-grub.elf) does NOT link it (dead code there: the multiboot2 tag
+	# always wins; see the kernel-grub.elf rule below).
+	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_C) -o $(BUILD_DIR)/vbe.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
 	  $(BUILD_DIR)/kernel.o $(BUILD_DIR)/putc_driver.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 	@echo "Built $@"
 	@echo "Entry:"; objdump -f $@ | grep 'start address'
@@ -197,7 +202,10 @@ qemu-gui: $(KERNEL_ELF)
 # serial log contains the expected message. This is the dynamic acceptance
 # gate: it proves the whole pipeline (merge -> verify -> codegen -> compile ->
 # assemble -> link -> PVH boot -> curlee_main -> display + serial).
-qemu-smoke: check
+# The PVH smoke kernel: built like kernel.elf (JOE_PVH_BOOT, crt0.S +
+# linker.ld, vbe.c linked) but with its own objects so the smoke gates never
+# clobber the dev-loop build. Shared by qemu-smoke and qemu-pvh-fb-smoke.
+$(BUILD_DIR)/kernel-smoke.elf: check
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel-smoke.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel-smoke.c -o $(BUILD_DIR)/kernel-smoke.o
@@ -205,12 +213,19 @@ qemu-smoke: check
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_SETUP_C) -o $(BUILD_DIR)/vga_setup.o
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
+	# Phase 2f: vbe.c is PVH-only (see the kernel.elf rule).
+	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_C) -o $(BUILD_DIR)/vbe.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
 	  $(BUILD_DIR)/kernel-smoke.o $(BUILD_DIR)/putc_driver.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
-	  -o $(BUILD_DIR)/kernel-smoke.elf
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
+	  -o $@
+
+# Boot the PVH kernel (qemu -kernel) and assert the serial log contains the
+# expected message. Proves the whole pipeline (merge -> verify -> codegen ->
+# compile -> assemble -> link -> PVH boot -> curlee_main -> display + serial).
+qemu-smoke: $(BUILD_DIR)/kernel-smoke.elf
 	rm -f $(BUILD_DIR)/serial.log
 	@timeout 20 qemu-system-x86_64 -display none -no-reboot \
 	  -serial file:$(BUILD_DIR)/serial.log \
@@ -218,6 +233,23 @@ qemu-smoke: check
 	@grep -q 'Hello World from JOE' $(BUILD_DIR)/serial.log \
 	  && echo "PASS: qemu boot -> serial output: $$(cat $(BUILD_DIR)/serial.log)" \
 	  || (echo "FAIL: expected message not in serial log"; exit 1)
+
+# Phase 2f acceptance gate: boot the PVH kernel (qemu -kernel, kernel-smoke.elf
+# built exactly like kernel.elf with JOE_PVH_BOOT + vbe.c) with a std VGA
+# device and assert the serial log contains "FB: 1". This proves the Bochs VBE
+# probe validated a linear framebuffer on the PVH path (no multiboot2 info, no
+# ISO), fb_ready() returned 1, and the single-frame demo render ran before
+# halt. Mirror of the qemu-smoke pattern: timeout, -display none, -serial
+# file:, grep.
+qemu-pvh-fb-smoke: $(BUILD_DIR)/kernel-smoke.elf
+	rm -f $(BUILD_DIR)/serial-pvh-fb.log
+	@timeout 20 qemu-system-x86_64 -display none -no-reboot \
+	  -vga std -serial file:$(BUILD_DIR)/serial-pvh-fb.log \
+	  -kernel $(BUILD_DIR)/kernel-smoke.elf || true
+	@grep -q 'FB: 1' $(BUILD_DIR)/serial-pvh-fb.log \
+	  && echo "PASS: PVH path framebuffer active (fb_ready=1 via VBE probe) -> serial: $$(cat $(BUILD_DIR)/serial-pvh-fb.log)" \
+	  || (echo "FAIL: FB: 1 marker not in serial log (PVH VBE probe / draw target broken)"; \
+	      echo "serial log: $$(cat $(BUILD_DIR)/serial-pvh-fb.log)"; exit 1)
 
 # Phase 2e gate: boot the FB-mode GRUB ISO under QEMU with a linear
 # framebuffer and assert the serial log contains the "FB:" marker — proving

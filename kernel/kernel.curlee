@@ -238,41 +238,63 @@ fn render_frame(pm: cap phys.mem, frame: Int) -> Unit {
 fn main(pm: cap phys.mem) -> Unit {
   fb_init();
   if (fb_ready() == 1) {
-    // The linear framebuffer is active: the 32-bit multiboot2 boot stub
-    // (kernel/boot.S, as --32) captured the trusted info pointer in %ebx and
-    // mb2.c parsed the framebuffer tag (type 8) into the blitter globals.
-    // Phase 2b: hand off to the deterministic 60 FPS loop (see fb.c
-    // fb_run_loop) — the loop renders N frames, then returns to halt.
-    fb_loop_init();
-    while (fb_loop_frame() < 4) {
-      // One tick: render the current frame, emit the loop marker, enqueue a
-      // tool intent (exercising the producer API + slot mapping), then let
-      // fb_run_loop advance the counter and drain the ring.
-      let f: Int = fb_loop_frame();
-      render_frame(pm, f);
-      serial_frame_marker(f);
-      // Producer: enqueue a "frame-tick" intent (kind 1, arg = the frame
-      // number). The slot for this frame comes from tool_queue_slot
-      // (division-free wrap). kind 1 is the reserved "frame tick" intent kind;
-      // future producers (LLM bridge, input) use their own kinds.
-      let slot: Int = tool_queue_slot(f);
-      let enq: Int = fb_tool_enqueue(1, slot);
-      // The ring has 8 slots and we enqueue 1 intent per frame, so enqueue
-      // always succeeds here; ignore the return for the smoke path.
-      let drained: Int = fb_tool_drained();
-      let pending: Int = fb_tool_pending();
-      fb_run_loop();
+    // The linear framebuffer is active. Two sub-paths, distinguished by
+    // whether the frame ring/asset region are compiled in:
+    //
+    // (a) GRUB path (kernel-grub.elf, 32-bit multiboot2 entry): the 32-bit
+    //     boot stub (kernel/boot.S, as --32) captured the trusted info
+    //     pointer in %ebx and mb2.c parsed the framebuffer tag (type 8) into
+    //     the blitter globals; the frame ring is compiled in and fb_present()
+    //     performs a REAL back-buffer flip. Phase 2b: hand off to the
+    //     deterministic 60 FPS loop (see fb.c fb_run_loop) — the loop renders
+    //     N frames, then returns to halt.
+    // (b) PVH path (kernel.elf, qemu -kernel): no multiboot2 info; the
+    //     framebuffer comes from the Phase 2f Bochs VBE probe (kernel/vbe.c).
+    //     The frame ring/asset region are compiled OUT (JOE_PVH_BOOT — QEMU's
+    //     PVH loader rejects a large BSS, see fb.c), so fb_asset_region_w()
+    //     reads 0 and fb_present() is a single-buffer no-op. Render ONE frame
+    //     directly into the VBE LFB, emit the FB: 1 marker, then halt — the
+    //     ring loop stays a GRUB-path feature.
+    let region_w: Int = fb_asset_region_w();
+    if (region_w == 0) {
+      // PVH path: single frame into the VBE-probed LFB (frame 0), then the
+      // FB: 1 marker proves fb_ready()==1 and the renderer ran under
+      // `qemu -kernel` (make qemu-pvh-fb-smoke greps for it).
+      render_frame(pm, 0);
+      serial_fb_marker();
+    } else {
+      // GRUB path: the 60 FPS ring loop.
+      fb_loop_init();
+      while (fb_loop_frame() < 4) {
+        // One tick: render the current frame, emit the loop marker, enqueue
+        // a tool intent (exercising the producer API + slot mapping), then
+        // let fb_run_loop advance the counter and drain the ring.
+        let f: Int = fb_loop_frame();
+        render_frame(pm, f);
+        serial_frame_marker(f);
+        // Producer: enqueue a "frame-tick" intent (kind 1, arg = the frame
+        // number). The slot for this frame comes from tool_queue_slot
+        // (division-free wrap). kind 1 is the reserved "frame tick" intent
+        // kind; future producers (LLM bridge, input) use their own kinds.
+        let slot: Int = tool_queue_slot(f);
+        let enq: Int = fb_tool_enqueue(1, slot);
+        // The ring has 8 slots and we enqueue 1 intent per frame, so enqueue
+        // always succeeds here; ignore the return for the smoke path.
+        let drained: Int = fb_tool_drained();
+        let pending: Int = fb_tool_pending();
+        fb_run_loop();
+      }
+      // After the loop, the frame ring has been exercised (fb_present
+      // flipped each frame). Emit the ring-active marker so the smoke gate
+      // can prove the Phase 2c flip ran (grep "RING: 1" alongside "FB:").
+      let ring_on: Int = fb_ring_active();
+      if (ring_on == 1) {
+        serial_ring_marker();
+      }
+      serial_fb_marker();
     }
-    // After the loop, the frame ring has been exercised (fb_present flipped
-    // each frame). Emit the ring-active marker so the smoke gate can prove
-    // the Phase 2c flip ran (grep "RING: 1" alongside "FB:").
-    let ring_on: Int = fb_ring_active();
-    if (ring_on == 1) {
-      serial_ring_marker();
-    }
-    serial_fb_marker();
   } else {
-    // No trusted framebuffer (text-mode ISO, QEMU PVH path): VGA text +
+    // No trusted framebuffer (text-mode ISO, no VBE device): VGA text +
     // serial fallback keeps the Phase 1 gates green.
     vga_text_setup();
   }
