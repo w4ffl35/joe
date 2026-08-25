@@ -83,6 +83,24 @@ extern fn fb_tool_pending() -> Int;
 // Provided by kernel/vga_setup.c: programs VGA text mode 3 (QEMU fallback).
 extern fn vga_text_setup() -> Unit;
 
+// Phase 2d-1 — VirtIO-net driver (kernel/virtio_net.c). The first six are the
+// LOCKED 2d-1 extern surface (docs/phase2d-wire.md §6); the byte-buffer window
+// (net_rx_byte / net_tx_stage_byte / net_mac_byte / net_poll_tick) plus the
+// deterministic smoke helpers (net_rx_wait / net_arp_request_gateway) are the
+// C API 2d-2 will consume (kernel/net.h). All return 0 with no NIC present.
+extern fn net_probe() -> Int;
+extern fn net_init() -> Int;
+extern fn net_link_up() -> Int;
+extern fn net_rx_len() -> Int;
+extern fn net_rx_byte(i: Int) -> Int;
+extern fn net_rx_done() -> Unit;
+extern fn net_tx_stage_byte(i: Int, b: Int) -> Int;
+extern fn net_tx_send(len: Int) -> Int;
+extern fn net_mac_byte(i: Int) -> Int;
+extern fn net_poll_tick() -> Int;
+extern fn net_rx_wait() -> Int;
+extern fn net_arp_request_gateway() -> Int;
+
 // ===========================================================================
 // Phase 2 declarative render scene (called per-frame by fb_run_loop's C loop)
 // ===========================================================================
@@ -154,6 +172,66 @@ fn serial_ring_marker() -> Unit {
   curlee_putc(32);   // space
   curlee_putc(49);   // 1 (ring active)
   curlee_putc(10);   // newline
+  return;
+}
+
+// Phase 2d-1 markers (docs/phase2d-wire.md §5): "NET: <n>" proves the
+// VirtIO-net bring-up step n passed (1 = PCI found, 2 = device ready, 3 =
+// link up). `n` is a single digit (1..3), so the marker is 6 chars + \n.
+// Grepped in order by the qemu-net-smoke gate.
+fn serial_net_marker(n: Int) -> Unit {
+  curlee_putc(78);   // N
+  curlee_putc(69);   // E
+  curlee_putc(84);   // T
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  curlee_putc(48 + n);   // digit n (1..3)
+  curlee_putc(10);   // newline
+  return;
+}
+
+// Phase 2d-1 RX marker: "RX: <len>" reports the received frame length (the
+// slirp ARP reply, 42-60 bytes — two digits max). No modulo (rejected by the
+// compiler): split tens/ones with division + subtraction.
+fn serial_rx_marker(len: Int) -> Unit {
+  curlee_putc(82);   // R
+  curlee_putc(88);   // X
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  let tens: Int = len / 10;
+  let ones: Int = len - tens * 10;
+  curlee_putc(48 + tens);
+  curlee_putc(48 + ones);
+  curlee_putc(10);   // newline
+  return;
+}
+
+// Phase 2d-1: VirtIO-net bring-up — probe, init, link, then the deterministic
+// RX smoke path (the guest ARPs the slirp gateway 10.0.2.2; slirp auto-answers,
+// delivering the first RX frame). Every step is gated on the previous step's
+// return, so a missing NIC emits nothing and existing gates (which boot
+// WITHOUT -netdev) stay green — acceptance criterion 6 (no-NIC-safe).
+fn net_bringup() -> Unit {
+  let p: Int = net_probe();
+  if (p == 1) {
+    serial_net_marker(1);
+    let i: Int = net_init();
+    if (i == 1) {
+      serial_net_marker(2);
+      let l: Int = net_link_up();
+      if (l == 1) {
+        serial_net_marker(3);
+        // Deterministic frame source (LOCKED): guest ARPs the gateway, slirp
+        // answers automatically — the first RX frame, no host-side injection.
+        let sent: Int = net_arp_request_gateway();
+        let rlen: Int = net_rx_wait();
+        if (rlen > 0) {
+          serial_rx_marker(rlen);
+          net_rx_done();
+        }
+      }
+    }
+  }
   return;
 }
 
@@ -236,6 +314,12 @@ fn render_frame(pm: cap phys.mem, frame: Int) -> Unit {
 // FB_LOOP_FRAMES frames. The loop is bounded (not `while(true)`) so the
 // qemu-fb-smoke / qemu-loop-smoke gates stay deterministic and timeout-safe.
 fn main(pm: cap phys.mem) -> Unit {
+  // Phase 2d-1: VirtIO-net bring-up first — the NIC sequence (NET: 1..3,
+  // RX: <len>) runs before the display branch so the smoke gate can observe
+  // it on any boot path. With no virtio-net device, net_probe() finds
+  // nothing and the whole sequence is a safe no-op (existing gates stay
+  // green — acceptance criterion 6).
+  net_bringup();
   fb_init();
   if (fb_ready() == 1) {
     // The linear framebuffer is active. Two sub-paths, distinguished by

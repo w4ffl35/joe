@@ -39,6 +39,8 @@ VGA_SETUP_C   := kernel/vga_setup.c
 FB_C          := kernel/fb.c
 MB2_C         := kernel/mb2.c
 VBE_C         := kernel/vbe.c
+NET_C         := kernel/virtio_net.c
+NET_H         := kernel/net.h
 LIBGCC32_C    := kernel/libgcc32.c
 LINKER_GRUB   := scripts/linker-grub.ld
 MERGE_SCRIPT  := scripts/build-kernel.sh
@@ -56,7 +58,7 @@ AS := as
 LD := ld
 
 .PHONY: all kernel check pack-run canvas-run iso iso-fb qemu run verify clean \
-        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke
+        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke
 
 all: kernel
 
@@ -71,7 +73,7 @@ $(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(MERGE_S
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
-$(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C)
+$(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $(NET_H)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel.o
@@ -88,11 +90,17 @@ $(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C
 	# (kernel-grub.elf) does NOT link it (dead code there: the multiboot2 tag
 	# always wins; see the kernel-grub.elf rule below).
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_C) -o $(BUILD_DIR)/vbe.o
+	# Phase 2d-1: VirtIO-net driver (kernel/virtio_net.c). PVH path — option 1
+	# ACTIVE (JOE_PVH_BOOT): 1-byte ring/buffer stubs, every extern returns 0,
+	# net_probe() is a safe no-op (the PVH machine has no legacy PCI config
+	# space — see the file header). The GRUB/ISO path compiles WITHOUT the
+	# macro and gets the full option-2 rings (see kernel-grub.elf below).
+	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
 	  $(BUILD_DIR)/kernel.o $(BUILD_DIR)/putc_driver.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 	@echo "Built $@"
 	@echo "Entry:"; objdump -f $@ | grep 'start address'
@@ -138,7 +146,7 @@ iso: $(ISO)
 # Int math is implemented by libgcc32.o's __muldi3/__divdi3/... helpers).
 #
 # The 64-bit PVH/QEMU path (kernel.elf via crt0.S) is completely unchanged.
-$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(LIBGCC32_C) $(LINKER_GRUB)
+$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(LIBGCC32_C) $(NET_C) $(NET_H) $(LINKER_GRUB)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel-grub.o
@@ -146,6 +154,10 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(DRIVER_C) $(VGA_SETUP_
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_SETUP_C) -o $(BUILD_DIR)/vga_setup.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
+	# Phase 2d-1: VirtIO-net driver — GRUB/ISO path compiles WITHOUT JOE_PVH_BOOT,
+	# so option 2 is ACTIVE: full rings (2 RX x 2048 + 2 TX x 2048, depth 256)
+	# and the NIC runs (this is where qemu-net-smoke boots; see the target).
+	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(LIBGCC32_C) -o $(BUILD_DIR)/libgcc32.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	# boot.S: ELFCLASS32 object with the multiboot2 header + 32-bit protected-mode
@@ -154,7 +166,7 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(DRIVER_C) $(VGA_SETUP_
 	$(AS) --32 $(BOOT_ASM) -o $(BUILD_DIR)/boot.o
 	$(LD) -m elf_i386 -nostdlib -static -T $(LINKER_GRUB) \
 	  $(BUILD_DIR)/kernel-grub.o $(BUILD_DIR)/driver.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/libgcc32.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/boot.o \
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/libgcc32.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/boot.o \
 	  -o $@
 	@echo "Built $@ (GRUB multiboot2, 32-bit entry)"
 
@@ -215,11 +227,15 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
 	# Phase 2f: vbe.c is PVH-only (see the kernel.elf rule).
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_C) -o $(BUILD_DIR)/vbe.o
+	# Phase 2d-1: VirtIO-net driver, PVH option-1 stubs (JOE_PVH_BOOT) — the
+	# NIC is compiled IN so the no-NIC-safe path is exercised on the existing
+	# smoke gates (net_probe finds nothing, all externs return 0).
+	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
 	  $(BUILD_DIR)/kernel-smoke.o $(BUILD_DIR)/putc_driver.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 
 # Boot the PVH kernel (qemu -kernel) and assert the serial log contains the
@@ -289,6 +305,61 @@ qemu-loop-smoke: $(BUILD_DIR)/joeos-fb.iso
 	  || (echo "FAIL: serial log does not contain the exact ordered loop sequence"; \
 	      echo "expected: FR:0 FR:1 FR:2 FR:3 RING: 1 FB: 1 Hello World from JOE!"; \
 	      echo "serial log: $$(cat $(BUILD_DIR)/serial-loop.log)"; exit 1)
+
+# Phase 2d-1 acceptance gate: boot the GRUB ISO with a VirtIO-net NIC attached
+# and assert the serial log contains, IN ORDER, NET: 1 (PCI found), NET: 2
+# (device ready / rings up), NET: 3 (link up), and RX: <len> (the first RX
+# frame).
+#
+# Frame-injection mechanism (LOCKED in issue #5, adjusted for QEMU 10):
+# the plan's slirp ARP-answer (guest ARPs the gateway 10.0.2.2, slirp
+# auto-replies) does NOT fire on QEMU 10.0.11 user-net in practice (verified:
+# no RX with -netdev user; slirp only answers once it has a route/DHCP entry
+# for the guest). The DETERMINISTIC replacement keeps the same guest-ARP
+# mechanism but uses a second QEMU instance connected via a socket netdev:
+# the SENDER instance's broadcast ARP request is delivered by the socket
+# backend to the RECEIVER instance's NIC, which reports it via RX: <len>.
+# No host-side injection, no live network, fully deterministic — and it
+# exercises the exact RX path 2d-2 will consume.
+#
+# This gate boots the GRUB/ISO path (kernel-grub.elf, no JOE_PVH_BOOT) with
+# the full option-2 rings, because the QEMU `-kernel` PVH machine (xenpvh)
+# exposes NO legacy PCI config space (docs/phase2f-report.md §4) — the NIC is
+# only reachable where SeaBIOS runs (the ISO boot). The gate uses a dedicated
+# ISO (joeos-net.iso) so the existing qemu-fb-smoke / qemu-loop-smoke gates
+# are untouched.
+$(BUILD_DIR)/joeos-net.iso: $(BUILD_DIR)/kernel-grub.elf
+	bash scripts/build_iso.sh $(BUILD_DIR)/kernel-grub.elf $@ text
+
+qemu-net-smoke: $(BUILD_DIR)/joeos-net.iso
+	rm -f $(BUILD_DIR)/serial-net.log $(BUILD_DIR)/serial-net-sender.log
+	# Free the socket port from any stale listener (e.g. an interrupted run).
+	@(command -v fuser >/dev/null 2>&1 && fuser -k 11000/tcp 2>/dev/null) || true
+	@sleep 1
+	# RECEIVER: the gate's subject — boots first, listens on the socket.
+	@qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-net.iso -boot d -no-reboot \
+	  -netdev socket,id=n0,listen=127.0.0.1:11000 \
+	  -device virtio-net-pci,disable-modern=on,netdev=n0 \
+	  -serial file:$(BUILD_DIR)/serial-net.log \
+	  -display none > $(BUILD_DIR)/net-recv.err 2>&1 &
+	@echo $$! > $(BUILD_DIR)/net-recv.pid
+	@sleep 2
+	# SENDER: boots second, connects to the receiver, broadcasts the ARP.
+	@timeout 20 qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-net.iso -boot d -no-reboot \
+	  -netdev socket,id=n0,connect=127.0.0.1:11000 \
+	  -device virtio-net-pci,disable-modern=on,netdev=n0 \
+	  -serial file:$(BUILD_DIR)/serial-net-sender.log \
+	  -display none > $(BUILD_DIR)/net-send.err 2>&1 || true
+	@kill $$(cat $(BUILD_DIR)/net-recv.pid) 2>/dev/null || true
+	@rm -f $(BUILD_DIR)/net-recv.pid
+	@grep -Pzo 'NET: 1\nNET: 2\nNET: 3\n' $(BUILD_DIR)/serial-net.log > /dev/null \
+	  && echo "PASS: virtio-net bring-up (NET: 1 -> NET: 2 -> NET: 3) -> serial: $$(cat $(BUILD_DIR)/serial-net.log)" \
+	  || (echo "FAIL: NET: 1..3 markers not in order in serial log"; \
+	      echo "serial log: $$(cat $(BUILD_DIR)/serial-net.log)"; exit 1)
+	@grep -q 'RX: ' $(BUILD_DIR)/serial-net.log \
+	  && echo "PASS: RX frame received (socket netdev delivery) -> serial: $$(cat $(BUILD_DIR)/serial-net.log)" \
+	  || (echo "FAIL: RX: marker not in serial log (no frame received)"; \
+	      echo "serial log: $$(cat $(BUILD_DIR)/serial-net.log)"; exit 1)
 
 # Boot the GRUB ISO under qemu (sanity check for the VirtualBox path).
 qemu-iso: $(ISO)
