@@ -1,0 +1,243 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// canvas_test.curlee — VM-runnable assertion suite for the Phase 2 renderer
+// pure modules (canvas.curlee, glyphs.curlee, assets.curlee).
+//
+// `curlee run kernel/canvas_test.curlee` runs the full check pipeline (lex ->
+// parse -> resolve -> type-check -> verify) then executes this program on the
+// deterministic VM. It returns 0 iff every assertion holds. Each assertion
+// block returns a UNIQUE non-zero code so a failure pinpoints the section:
+//   2  color packing (rgb)
+//   3  channel extraction (red/green/blue)
+//   4  clamp
+//   5  rect_contains
+//   6  clip_rect (packed + decomposed)
+//   7  blend_alpha
+//   8  glyph text layout (text_width/char_x/glyph_height)
+//   9  5x7 glyph pixels
+//   10 asset blit-fit gates
+//   11 frame ring math
+//   12 Phase 2b tool-queue geometry (fixed-slot ring)
+//   13 tool_queue_slot — producer frame->slot mapping (wrap)
+//
+// This is the authoritative correctness gate for the functions whose
+// contracts the Z3 fragment cannot prove (division, non-linear
+// multiplication, packed encodings) — see the module headers.
+//
+// Layout: this file lives in kernel/ so `import canvas` (and friends)
+// resolves to the sibling modules in the same directory (module resolution
+// searches the importing file's directory first).
+//
+// Verifier quirks honored here:
+//   - A function call is NOT allowed as an argument inside another call's
+//     argument expression ("calls are not supported in verification
+//     expressions"). Every call result is bound to a `let` variable first.
+//   - Bool comparison uses ! (Bool == Bool is rejected).
+
+import canvas as c;
+import glyphs as g;
+import assets as a;
+
+fn main() -> Int {
+  // --- 2: color packing ------------------------------------------------------
+  let r: Int = c.rgb(255, 0, 0);
+  if (r != 16711680) { return 2; }                 // 0xFF0000
+  let g1: Int = c.rgb(0, 255, 0);
+  if (g1 != 65280) { return 2; }                   // 0x00FF00
+  let b1: Int = c.rgb(0, 0, 255);
+  if (b1 != 255) { return 2; }                     // 0x0000FF
+
+  // --- 3: channel extraction (division helpers) -----------------------------
+  let r2: Int = c.red(16711680);
+  if (r2 != 255) { return 3; }
+  let g2: Int = c.green(65280);
+  if (g2 != 255) { return 3; }
+  let b2: Int = c.blue(255);
+  if (b2 != 255) { return 3; }
+  // rgb(220, 80, 40) = 220*65536 + 80*256 + 40 = 14438440, round-trips
+  // through all three channels.
+  let cr: Int = c.red(14438440);
+  if (cr != 220) { return 3; }
+  let cg: Int = c.green(14438440);
+  if (cg != 80) { return 3; }
+  let cb: Int = c.blue(14438440);
+  if (cb != 40) { return 3; }
+
+  // --- 4: clamp (verified contract, spot-check VM behavior) -----------------
+  let cl1: Int = c.clamp(42, 0, 10);
+  if (cl1 != 10) { return 4; }
+  let cl2: Int = c.clamp(-5, 0, 10);
+  if (cl2 != 0) { return 4; }
+  let cl3: Int = c.clamp(7, 0, 10);
+  if (cl3 != 7) { return 4; }
+
+  // --- 5: rect_contains (half-open) -----------------------------------------
+  // 10x10 rect at (5,5) contains (5,5) and (14,14); excludes (15,15) and (4,4).
+  let rc1: Bool = c.rect_contains(5, 5, 10, 10, 5, 5);
+  if (!rc1) { return 5; }
+  let rc2: Bool = c.rect_contains(5, 5, 10, 10, 14, 14);
+  if (!rc2) { return 5; }
+  let rc3: Bool = c.rect_contains(5, 5, 10, 10, 15, 15);
+  if (rc3) { return 5; }
+  let rc4: Bool = c.rect_contains(5, 5, 10, 10, 4, 4);
+  if (rc4) { return 5; }
+
+  // --- 6: clip_rect (packed; decomposed and bounds-checked) -----------------
+  // Full inside: clip (2,2,10,10) to screen (0,0,100,100) -> (2,2,10,10).
+  let full: Int = c.clip_rect(2, 2, 10, 10, 0, 0, 100, 100);
+  let fx: Int = c.clip_x(full);
+  let fy: Int = c.clip_y(full);
+  let fw: Int = c.clip_w(full);
+  let fh: Int = c.clip_h(full);
+  if (fx != 2 || fy != 2) { return 6; }
+  if (fw != 10 || fh != 10) { return 6; }
+  // Partially outside left/top: clip (-5,-5,20,20) to (0,0,100,100) -> (0,0,15,15).
+  let clipped: Int = c.clip_rect(-5, -5, 20, 20, 0, 0, 100, 100);
+  let cx: Int = c.clip_x(clipped);
+  let cy: Int = c.clip_y(clipped);
+  let cw: Int = c.clip_w(clipped);
+  let ch: Int = c.clip_h(clipped);
+  if (cx != 0 || cy != 0) { return 6; }
+  if (cw != 15 || ch != 15) { return 6; }
+  // Fully outside: clip (200,200,10,10) to (0,0,100,100) -> empty (0).
+  let empty: Int = c.clip_rect(200, 200, 10, 10, 0, 0, 100, 100);
+  let ew: Int = c.clip_w(empty);
+  let eh: Int = c.clip_h(empty);
+  if (ew != 0 || eh != 0) { return 6; }
+  // Result is always non-negative sized.
+  if (cw < 0 || ch < 0) { return 6; }
+
+  // --- 7: blend_alpha (integer over) ----------------------------------------
+  // fg white over bg black at alpha 255 -> white; alpha 0 -> bg.
+  let bw1: Int = c.blend_alpha(16777215, 0, 255);
+  if (bw1 != 16777215) { return 7; }
+  let bw2: Int = c.blend_alpha(16777215, 0, 0);
+  if (bw2 != 0) { return 7; }
+  // fg red over bg black at alpha 128 -> half red (255*128/255 = 128 = 0x80,
+  // so 128*65536 = 8388608 = 0x800000).
+  let br: Int = c.blend_alpha(16711680, 0, 128);
+  if (br != 8388608) { return 7; }
+
+  // --- 8: glyph text layout --------------------------------------------------
+  let tw1: Int = g.text_width(4, 1);
+  if (tw1 != 24) { return 8; }                     // 4 glyphs * 6
+  let tw2: Int = g.text_width(4, 4);
+  if (tw2 != 96) { return 8; }                     // 4 glyphs * 24
+  let cx2: Int = g.char_x(2, 4);
+  if (cx2 != 48) { return 8; }                     // glyph 2 at scale 4
+  let gh: Int = g.glyph_height(4);
+  if (gh != 28) { return 8; }                      // 7 rows * 4
+
+  // --- 9: 5x7 glyph pixels (mirrors fb.c tables) ----------------------------
+  // 'H' row 3 is the full bar (0x1F = 31): all 5 columns set.
+  let h0: Bool = g.glyph_pixel(72, 0, 3);
+  if (!h0) { return 9; }
+  let h1: Bool = g.glyph_pixel(72, 4, 3);
+  if (!h1) { return 9; }
+  // 'H' row 0: only columns 0 and 4 (0x11 = 17).
+  let h2: Bool = g.glyph_pixel(72, 0, 0);
+  if (!h2) { return 9; }
+  let h3: Bool = g.glyph_pixel(72, 1, 0);
+  if (h3) { return 9; }
+  let h4: Bool = g.glyph_pixel(72, 2, 0);
+  if (h4) { return 9; }
+  let h5: Bool = g.glyph_pixel(72, 4, 0);
+  if (!h5) { return 9; }
+  // 'o' row 0 (0x0E = 14): columns 1,2,3 set, edges clear.
+  let o1: Bool = g.glyph_pixel(111, 1, 0);
+  if (!o1) { return 9; }
+  let o2: Bool = g.glyph_pixel(111, 0, 0);
+  if (o2) { return 9; }
+  // Unknown char 'z' (122) is blank.
+  let z1: Bool = g.glyph_pixel(122, 0, 0);
+  if (z1) { return 9; }
+
+  // --- 10: asset blit-fit gates ---------------------------------------------
+  // 10x10 asset at (0,0) fits a 100x100 screen; at (95,95) does not.
+  let bf1: Bool = a.blit_fits(10, 10, 0, 0, 100, 100);
+  if (!bf1) { return 10; }
+  let bf2: Bool = a.blit_fits(10, 10, 95, 95, 100, 100);
+  if (bf2) { return 10; }
+  let bf3: Bool = a.blit_fits(10, 10, 5, 5, 100, 100);
+  if (!bf3) { return 10; }
+  let bf4: Bool = a.blit_fits(10, 10, -1, 0, 100, 100);
+  if (bf4) { return 10; }
+  // dst_fits gate for fill/text rects.
+  let df1: Bool = a.dst_fits(0, 0, 100, 100, 100, 100);
+  if (!df1) { return 10; }
+  let df2: Bool = a.dst_fits(0, 0, 101, 100, 100, 100);
+  if (df2) { return 10; }
+
+  // --- 11: frame ring math ---------------------------------------------------
+  // 4-slot ring wraps 3 -> 0; monotonic elsewhere.
+  let rn1: Int = a.ring_next(0, 4);
+  if (rn1 != 1) { return 11; }
+  let rn2: Int = a.ring_next(3, 4);
+  if (rn2 != 0) { return 11; }
+  // Slot offsets and capacity.
+  let ro1: Int = a.ring_offset(2, 400);
+  if (ro1 != 800) { return 11; }
+  let rc: Int = a.ring_capacity(4, 400);
+  if (rc != 1600) { return 11; }
+  let rv1: Bool = a.ring_valid_slot(3, 4);
+  if (!rv1) { return 11; }
+  let rv2: Bool = a.ring_valid_slot(4, 4);
+  if (rv2) { return 11; }
+  let rv3: Bool = a.ring_valid_slot(-1, 4);
+  if (rv3) { return 11; }
+
+  // --- 12: Phase 2b tool-queue geometry (fixed-slot ring in fb.c) -----------
+  // The C constants (TOOL_QUEUE_SLOTS / TOOL_SLOT_BYTES in kernel/fb.c) MUST
+  // agree with these pure values — the VM asserts the geometry both sides
+  // depend on, so a drift fails `make canvas-run` before any kernel boot.
+  let tq_slots: Int = a.tool_queue_slots();
+  if (tq_slots != 8) { return 12; }                 // TOOL_QUEUE_SLOTS
+  let tq_bytes: Int = a.tool_slot_bytes();
+  if (tq_bytes != 16) { return 12; }                // TOOL_SLOT_BYTES
+  // Total ring capacity: 8 slots * 16 bytes = 128.
+  let tq_cap: Int = a.tool_queue_capacity();
+  if (tq_cap != 128) { return 12; }
+  // Per-slot byte offsets: slot 3 -> 48, slot 0 -> 0.
+  let tq_off: Int = a.tool_slot_offset(3);
+  if (tq_off != 48) { return 12; }
+  let tq_off0: Int = a.tool_slot_offset(0);
+  if (tq_off0 != 0) { return 12; }
+  // Slot validity: 0..7 valid, 8 and -1 not.
+  let tsv1: Bool = a.tool_slot_valid(0);
+  if (!tsv1) { return 12; }
+  let tsv2: Bool = a.tool_slot_valid(7);
+  if (!tsv2) { return 12; }
+  let tsv3: Bool = a.tool_slot_valid(8);
+  if (tsv3) { return 12; }
+  let tsv4: Bool = a.tool_slot_valid(-1);
+  if (tsv4) { return 12; }
+  // Ring advance wraps 7 -> 0 (8-slot ring).
+  let trn1: Int = a.tool_ring_next(7);
+  if (trn1 != 0) { return 12; }
+  let trn2: Int = a.tool_ring_next(3);
+  if (trn2 != 4) { return 12; }
+
+  // --- 13: tool_queue_slot — the producer-side frame -> slot mapping --------
+  // Division-free wrap: frames 0..7 map 1:1 to slots 0..7, then 8 wraps to
+  // slot 0, 9 to slot 1, etc. This is what a producer (fb_tool_enqueue
+  // caller) uses to pick the ring slot for a given frame number, so an
+  // out-of-range index is impossible by construction.
+  let ts0: Int = a.tool_queue_slot(0);
+  if (ts0 != 0) { return 13; }
+  let ts1: Int = a.tool_queue_slot(7);
+  if (ts1 != 7) { return 13; }
+  let ts2: Int = a.tool_queue_slot(8);
+  if (ts2 != 0) { return 13; }           // wrap
+  let ts3: Int = a.tool_queue_slot(9);
+  if (ts3 != 1) { return 13; }           // wrap + 1
+  let ts4: Int = a.tool_queue_slot(15);
+  if (ts4 != 7) { return 13; }           // 15 -> slot 7
+  let ts5: Int = a.tool_queue_slot(16);
+  if (ts5 != 0) { return 13; }           // 16 -> slot 0 (second lap)
+  // A mapped slot is always valid for the ring.
+  let tsv: Bool = a.tool_slot_valid(ts2);
+  if (!tsv) { return 13; }
+
+  // All assertions held.
+  return 0;
+}

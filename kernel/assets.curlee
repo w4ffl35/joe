@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// assets.curlee — pure, verified asset blit and frame-ring math for the
+// Phase 2 software renderer. This is the OOB safety layer for asset and
+// video-frame copying: it decides, provably, whether a source buffer fits at
+// a destination on the framebuffer, and computes ring-buffer slot arithmetic
+// for the video frame buffer (30-60 FPS frame flipping on demand).
+//
+// It is freestanding-safe (Int/Bool only), verifies (Z3), and runs under the
+// VM (`curlee run kernel/canvas_test.curlee`). The kernel build inlines these
+// functions into kernel.curlee (see docs/phase2-architecture.md §1).
+//
+// Curlee verifier fragment (see canvas.curlee header): contracted functions
+// use + - * comparisons && || ! only; division and variable-variable
+// multiplication live in contract-less helpers asserted by the VM test.
+//
+// Ring buffer: a fixed array of `count` frame slots, each `frame_bytes`
+// bytes. ring_next(cur) advances the write pointer (wrap-around via
+// subtraction, no modulo); ring_offset(slot) is the byte offset of a slot
+// from the ring base. The C driver owns the actual buffer; this module
+// computes the indices it must stay within.
+
+// True when a source buffer of (src_w x src_h) pixels blitted to
+// (dst_x, dst_y) stays fully inside the framebuffer of (fb_w x fb_h).
+// Total and verified: any input yields a Bool. This is the blitter's OOB
+// gate — the C side only copies when this returns true (plus its own
+// bounds check as defense-in-depth).
+fn blit_fits(src_w: Int, src_h: Int, dst_x: Int, dst_y: Int,
+             fb_w: Int, fb_h: Int) -> Bool
+  [ requires src_w >= 0 && src_h >= 0;
+    requires fb_w >= 0 && fb_h >= 0;
+    ensures true; ] {
+  if (dst_x >= 0 && dst_y >= 0 &&
+      dst_x + src_w <= fb_w && dst_y + src_h <= fb_h) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// True when a destination rectangle of (w x h) at (x, y) is fully inside the
+// framebuffer of (fb_w x fb_h). Same gate as blit_fits but for already-sized
+// rects (used by fill/line/text primitives). Total and verified.
+fn dst_fits(x: Int, y: Int, w: Int, h: Int, fb_w: Int, fb_h: Int) -> Bool
+  [ requires w >= 0 && h >= 0; requires fb_w >= 0 && fb_h >= 0;
+    ensures true; ] {
+  if (x >= 0 && y >= 0 && x + w <= fb_w && y + h <= fb_h) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// Next ring write index after `cur` in a ring of `count` slots.
+// Contract-less: uses division-free wrap (if cur+1 == count then 0 else
+// cur+1), which is verifier-friendly and asserted by the VM test.
+fn ring_next(cur: Int, count: Int) -> Int {
+  if (cur + 1 == count) {
+    return 0;
+  } else {
+    return cur + 1;
+  }
+}
+
+// Byte offset of frame slot `slot` in a ring of `count` slots each holding
+// `frame_bytes` bytes. Contract-less: slot * frame_bytes is
+// variable-variable multiplication (non-linear for Z3); asserted by the VM
+// test. The caller guarantees slot < count and slot * frame_bytes fits the
+// ring allocation.
+fn ring_offset(slot: Int, frame_bytes: Int) -> Int {
+  return slot * frame_bytes;
+}
+
+// Total bytes needed for a ring of `count` slots of `frame_bytes` bytes
+// each. Contract-less (non-linear mult); asserted by the VM test.
+fn ring_capacity(count: Int, frame_bytes: Int) -> Int {
+  return count * frame_bytes;
+}
+
+// True when `slot` is a valid index into a ring of `count` slots
+// (0 <= slot < count). Total and verified.
+fn ring_valid_slot(slot: Int, count: Int) -> Bool
+  [ requires count > 0; ensures true; ] {
+  if (slot >= 0 && slot < count) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b kernel tool-call queue geometry (fixed-slot ring owned by fb.c)
+// ---------------------------------------------------------------------------
+//
+// The kernel's tool-call queue is a fixed-slot ring in C (kernel/fb.c): a
+// static array of `tool_queue_slots()` slots, each `tool_slot_bytes()` bytes,
+// with no malloc. These pure helpers compute the queue geometry the C driver
+// must honor — slot count, slot byte size, total capacity, per-slot byte
+// offset, index validity, and the next write index — reusing the verified
+// ring math above.
+//
+// They are CONTRACT-LESS (multiplication lives in ring_offset/ring_capacity;
+// the solver skips them), matching the module policy for non-linear helpers.
+// Correctness is asserted by the VM test (canvas_test.curlee §12), which is
+// the authoritative gate for the geometry both sides must agree on: the C
+// constants (TOOL_QUEUE_SLOTS / TOOL_SLOT_BYTES in fb.c) stay in sync with
+// these values.
+
+// Number of tool-call slots in the kernel's fixed ring (fb.c TOOL_QUEUE_SLOTS).
+fn tool_queue_slots() -> Int {
+  return 8;
+}
+
+// Bytes per tool-call slot (fb.c TOOL_SLOT_BYTES; struct tool_slot).
+fn tool_slot_bytes() -> Int {
+  return 16;
+}
+
+// Total bytes of the tool-queue ring (ring_capacity of the fixed geometry).
+fn tool_queue_capacity() -> Int {
+  let slots: Int = tool_queue_slots();
+  let bytes: Int = tool_slot_bytes();
+  return ring_capacity(slots, bytes);
+}
+
+// Byte offset of tool slot `slot` from the ring base (ring_offset of the
+// fixed slot size). The C driver reads/writes tool_queue + this offset.
+fn tool_slot_offset(slot: Int) -> Int {
+  let bytes: Int = tool_slot_bytes();
+  return ring_offset(slot, bytes);
+}
+
+// True when `slot` is a valid tool-queue slot (0 <= slot < count).
+// Contract-less and INLINE (does not call the contracted ring_valid_slot:
+// the verifier cannot prove `count > 0` for a count read from a contract-less
+// helper, which is opaque to the solver). The literal 8 must stay in sync
+// with tool_queue_slots(); the VM test asserts both.
+fn tool_slot_valid(slot: Int) -> Bool {
+  if (slot >= 0 && slot < 8) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// Frame -> tool-queue slot mapping: the ring slot a producer writes for a
+// given frame number. Division-free wrap-around (no `%` operator — rejected):
+//   frame 0..7  -> slot 0..7
+//   frame 8     -> slot 0  (wraps), frame 9 -> slot 1, ...
+// This is the natural producer-side helper for fb_tool_enqueue: the C ring
+// (fb.c TOOL_QUEUE_SLOTS == 8) accepts a slot index in 0..7, and the caller
+// maps frame to slot here so the producer never computes an out-of-range
+// index. Contract-less (division), asserted by the VM test (canvas_test.curlee
+// §12).
+fn tool_queue_slot(frame: Int) -> Int {
+  let wrap: Int = (frame / 8) * 8;
+  return frame - wrap;
+}
+
+// Next tool-queue write index after `cur` (ring_next of the fixed count).
+// ring_next is contract-less, so this is safe to call.
+fn tool_ring_next(cur: Int) -> Int {
+  let slots: Int = tool_queue_slots();
+  return ring_next(cur, slots);
+}

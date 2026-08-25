@@ -1,16 +1,30 @@
 // SPDX-License-Identifier: GPL-3.0
 //
-// boot.S — GRUB (VirtualBox ISO path) entry stub.
+// boot.S — GRUB (ISO path) 32-bit multiboot2 entry stub.
 //
-// GRUB's multiboot2 loader supports x86-64 ELF kernels: when the ELF entry
-// is a 64-bit entry (as here), GRUB sets up long mode itself and enters the
-// kernel in 64-bit long mode with identity paging — the same state the qemu
-// -kernel (PVH) path provides. So this stub mirrors curlee's runtime/crt0.S:
-// zero .bss, set the stack, call `curlee_main`, halt.
+// Phase 2e-2: the multiboot2 spec guarantees the boot info pointer in %ebx
+// ONLY for 32-bit protected-mode entries. GRUB's x86-64 ELF entry (ELFCLASS64,
+// long mode) leaves %ebx undefined and does not reliably load .data — verified
+// empirically (docs/phase2e-architecture.md §7). GNU ld also refuses to link
+// ELFCLASS32 + ELFCLASS64 objects in one image.
 //
-// This file is assembled with `as --64` and linked with curlee's linker.ld
-// (which KEEP(.multiboot2) and provides __bss_start/__bss_end/__stack_top).
-// Used ONLY by the VirtualBox ISO path; the primary qemu path uses crt0.S.
+// Therefore the GRUB-path kernel (kernel-grub.elf) is a FULLY 32-bit ELF:
+//   - boot.S is assembled with `as --32` (ELFCLASS32 object).
+//   - The codegen C + drivers are compiled with `-m32` and linked with
+//     `ld -m elf_i386` (Makefile kernel-grub.elf recipe).
+//   - GRUB's multiboot2 loader enters a 32-bit ELF in 32-bit protected mode
+//     with %ebx = trusted info pointer (the documented case), flat segments
+//     (CS/DS base 0, limit 0xFFFFFFFF) and paging disabled.
+//
+// This stub captures %ebx into the .data global mb2_info_addr (which
+// kernel/mb2.c parses to find the framebuffer tag), zeroes .bss, sets the
+// stack, calls curlee_main, and halts. No GDT or page tables are needed: the
+// multiboot2 handoff already provides flat 32-bit segments with paging off,
+// so the kernel addresses physical memory directly (same model as the VGA
+// text buffer at 0xB8000).
+//
+// The 64-bit QEMU/PVH path (kernel.elf via crt0.S) is completely unchanged;
+// this file is used ONLY by the ISO path (make iso / make iso-fb).
 
 .set MB2_MAGIC,   0xE85250D6   /* multiboot2 */
 .set MB2_ARCH,    0            /* i386 (protected mode) */
@@ -18,41 +32,63 @@
 .set MB2_TAG_END, 8
 
 .section .multiboot2, "a"
-.align 8
+.balign 8
 multiboot2_header:
     .long MB2_MAGIC
     .long MB2_ARCH
     .long multiboot2_header_end - multiboot2_header
     .long -(MB2_MAGIC + MB2_ARCH + (multiboot2_header_end - multiboot2_header))
+    /* Framebuffer request tag (type 5): ask GRUB for a 640x480x32 linear
+       framebuffer. The bootloader sets this mode before entry (independent
+       of gfxterm), so the multiboot2 info structure's framebuffer tag
+       (type 8) reports a real LFB that mb2.c can parse (bpp == 32). */
+    .word 5          /* type: framebuffer request */
+    .word 0          /* flags */
+    .long 20         /* size: width + height + depth */
+    .long 640        /* width */
+    .long 480        /* height */
+    .long 32         /* depth (bpp) */
+    /* Header tags must be 8-byte aligned; the 20-byte fb-request tag ends at
+       offset 36, so pad 4 bytes so the end tag starts at offset 40. */
+    .balign 8
     /* End tag (must be the last tag). */
     .word 0
     .word 0
     .long MB2_TAG_END
 multiboot2_header_end:
 
-/* 64-bit entry — GRUB enters here in long mode. */
+/* 32-bit entry — GRUB enters here in protected mode with %ebx = info ptr. */
 .section .text
 .global _start
 .type _start, @function
+.code32
 _start:
+    /* 0. Save the multiboot2 info pointer (%ebx, spec-guaranteed for 32-bit
+          entries) into the .data global mb2_info_addr. Explicitly zero the
+          high dword: never trust memory initializers before we have written
+          them ourselves (GRUB's ELF loading of .data is not assumed). */
+    movl %ebx, mb2_info_addr
+    movl $0, mb2_info_addr + 4
+
     /* 1. Zero .bss. __bss_start/__bss_end are absolute symbols from
           linker.ld; the size is computed at link time. */
-    movabs $__bss_start, %rax
-    movabs $__bss_end, %rcx
-    sub %rax, %rcx              /* rcx = bss size in bytes */
-    xor %al, %al                /* fill byte: 0 */
-1:  test %rcx, %rcx
+    movl $__bss_start, %edi
+    movl $__bss_end, %ecx
+    subl %edi, %ecx              /* ecx = bss size in bytes */
+    xorl %eax, %eax              /* fill byte: 0 */
+1:  testl %ecx, %ecx
     jz 2f
-    movb %al, (%rax)
-    inc %rax
-    dec %rcx
+    movb %al, (%edi)
+    incl %edi
+    decl %ecx
     jmp 1b
 2:
     /* 2. Stack pointer to the top of the reserved stack region. */
-    movabs $__stack_top, %rsp
-    xor %rbp, %rbp              /* clear frame pointer */
+    movl $__stack_top, %esp
+    xorl %ebp, %ebp              /* clear frame pointer */
 
-    /* 3. Call the verified kernel entry point (codegen emits curlee_main). */
+    /* 3. Call the verified kernel entry point (codegen emits curlee_main;
+          compiled -m32 for this path, so the call is a plain 32-bit call). */
     call curlee_main
 
     /* 4. Deterministic halt. */
@@ -60,5 +96,14 @@ _start:
 3:  hlt
     jmp 3b
 .size _start, . - _start
+
+/* .data global holding the multiboot2 info pointer (set from %ebx above;
+   read by kernel/mb2.c as unsigned long long). */
+.section .data
+.global mb2_info_addr
+.balign 8
+mb2_info_addr:
+    .quad 0
+.size mb2_info_addr, 8
 
 .section .note.GNU-stack, "", @progbits

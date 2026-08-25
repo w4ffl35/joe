@@ -59,19 +59,23 @@ to the screen, with serial output for verification.
 ### Project layout
 
 ```
-Makefile                 # build: kernel.elf, iso; run: qemu; verify gates
+Makefile                 # build: merged kernel.elf, iso; run: qemu; verify gates
 scripts/
   find-curlee.sh         # locate the curlee compiler (CURLEE/CURLEE_ROOT/PATH)
   build_iso.sh           # grub-mkrescue GRUB ISO (VirtualBox path)
   vbox-setup.sh          # automated VirtualBox VM creation + boot (VBoxManage)
+  build-kernel.sh        # concat pure modules + kernel.curlee -> single-TU merged file
 kernel/
-  kernel.curlee          # kmain: VGA text renderer + serial + halt
+  kernel.curlee          # Phase 2 entry: externs, render_frame scene, main
+  canvas.curlee          # pure verified color/geometry math (VM-tested)
+  glyphs.curlee          # pure 5x7 glyph math + text layout (VM-tested)
+  assets.curlee          # pure blit-fit + frame-ring math (VM-tested)
+  canvas_test.curlee     # VM-runnable assertions over the pure modules
   pack.curlee            # pure cell/pixel helpers (VM-testable, verified)
   boot.S                 # multiboot2 64-bit entry (GRUB ISO path)
   putc_driver.c          # COM1 serial override of weak curlee_putc
   vga_setup.c            # VGA text-mode-3 programming (QEMU display path)
-  fb.c                   # framebuffer glyph renderer (future path; needs
-                         # multiboot framebuffer address, see display note)
+  fb.c                   # linear-FB software blitter (pixel/fill/line/text/blit)
 ```
 
 ### Prerequisites
@@ -88,10 +92,13 @@ kernel/
 ```sh
 make kernel     # -> build/kernel.elf  (QEMU path)
 make iso        # -> build/joeos.iso   (VirtualBox path)
-make verify     # static gates: check, packer test, ELF entry, _start,
-                # curlee_main, PVH note
+make verify     # static gates: check, packer test, canvas-run, ELF entry,
+                # _start, curlee_main, PVH note
 make qemu-smoke # dynamic gate: boot kernel.elf, assert serial log contains
                 # "Hello World from JOE"
+make qemu-fb-smoke   # dynamic gate: boot FB ISO, assert serial "FB: 1"
+make qemu-loop-smoke # dynamic gate: boot FB ISO, assert the 60 FPS loop ran
+                     # frames FR:0..FR:2+ deterministically
 ```
 
 ### Run
@@ -159,12 +166,63 @@ proof there: `bash scripts/vbox-setup.sh --headless` then check
 
 | Gate | Command | Pass condition |
 |------|---------|----------------|
-| Verify | `make verify` | `curlee check` on kernel + packer; `curlee run` packer → 0; ELF entry set; `_start` + `curlee_main` present; `.note.Xen` PVH present |
+| Verify | `make verify` | `curlee check` on all pure modules + merged kernel; `curlee run` packer → 0; `curlee run` canvas_test → 0; ELF entry set; `_start` + `curlee_main` present; `.note.Xen` PVH present |
+| Renderer math | `make canvas-run` | `curlee run kernel/canvas_test.curlee` → 0 (color/geometry/glyph/asset/tool-queue assertions) |
 | Boot (QEMU) | `make qemu-smoke` | kernel.elf boots under QEMU; serial log contains `Hello World from JOE!` |
 | Boot (ISO/GRUB) | `make qemu-iso` | ISO boots under QEMU via GRUB; serial log contains `Hello World from JOE!` |
+| Framebuffer (ISO) | `make qemu-fb-smoke` | FB-mode ISO boots; serial log contains `FB: 1` (multiboot2 framebuffer tag parsed, `fb_ready()==1`) |
+| 60 FPS loop (ISO) | `make qemu-loop-smoke` | FB-mode ISO boots; serial log contains `FR:0`, `FR:1`, `FR:2` then `FB: 1` (the deterministic loop rendered >1 frame) |
 
 All gates pass on this branch (QEMU serial: `Hello World from JOE!`, GRUB
 ISO boots, ELF entry + symbols + PVH note verified).
+
+---
+
+## Phase 2: Agentic Framebuffer OS (software renderer)
+
+Phase 2 refactors the static test kernel into an AI-native, single-address-space
+OS with a freestanding software renderer targeting the linear framebuffer.
+
+### Architecture
+
+- **Two layers**: Curlee computes geometry/intent (pure, Z3-verified, VM-tested);
+  the C driver ([`kernel/fb.c`](kernel/fb.c)) owns mutable state and executes the
+  pixel loops. Curlee has no assignment and a small verifier fragment, so
+  imperative blitting lives in C while provable math lives in Curlee.
+- **Single-TU merge**: the freestanding codegen crashes on `import`, so
+  [`scripts/build-kernel.sh`](scripts/build-kernel.sh) concatenates the pure
+  modules + `kernel.curlee` into one self-contained translation unit.
+- **Pure modules** (all VM-testable via `make canvas-run`):
+  - [`kernel/canvas.curlee`](kernel/canvas.curlee) — color packing/channels,
+    rect containment/cover, clamp, clip, alpha blend
+  - [`kernel/glyphs.curlee`](kernel/glyphs.curlee) — 5x7 glyph pixel test +
+    text layout math
+  - [`kernel/assets.curlee`](kernel/assets.curlee) — blit-fit OOB gate + frame
+    ring-buffer slot math
+- **Blitter** ([`kernel/fb.c`](kernel/fb.c)): `fb_clear`, `fb_pixel`,
+  `fb_fill_rect`, `fb_line`, `fb_draw_char_color`, `fb_blit_asset`,
+  `fb_present`, plus the Phase 2b 60 FPS loop + tool ring
+  (`fb_loop_init`/`fb_loop_frame`/`fb_run_loop`/`fb_tool_enqueue`/...).
+  All bounds-checked; the tool ring is a fixed-slot static array (no malloc).
+- **Declarative scene**: `render_frame(frame)` in
+  [`kernel/kernel.curlee`](kernel/kernel.curlee) describes one frame (colors
+  bound to `let`s — the verifier rejects calls as call arguments); Curlee's
+  `main` drives the fuel-bounded loop when `fb_ready()` is 1, else falls back
+  to VGA text + serial.
+
+### Phase 2 roadmap
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 2a | Software renderer: blitter primitives, text, bitmap/frame blit, pure verified math modules | ✅ done |
+| 2b | Kernel tool API & 60 FPS event loop — Curlee `main` drives a fuel-bounded while-loop; `fb.c` owns the frame counter + fixed-slot tool ring; `make qemu-loop-smoke` asserts frames FR:0..FR:2+ | ✅ done |
+| 2c | Memory & asset management contracts (ring-buffer hardening, static buffers) | ⏳ in progress — ring/tool-queue geometry landed in 2b (assets.curlee + VM-asserted) |
+| 2d | LLM bridge (VirtIO-net/TCP + JSON) — host-side llama.cpp | planned |
+| 2e | Framebuffer address plumbing — 32-bit multiboot2 entry + framebuffer request tag; serial `FB: 1` proves `fb_ready()==1` (`make qemu-fb-smoke`) | ✅ done |
+
+See [`docs/phase2-architecture.md`](docs/phase2-architecture.md) for the full
+design, the Curlee verifier-fragment constraints discovered, and the Curlee
+codegen import fix as a follow-up work item.
 
 ### Design notes
 

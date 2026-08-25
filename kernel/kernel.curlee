@@ -1,49 +1,74 @@
 // SPDX-License-Identifier: GPL-3.0
 //
-// kernel.curlee — Phase 1 bare-metal "Hello World from JOE" kernel.
+// kernel.curlee — Phase 2 entry: agentic framebuffer OS (renderer kernel).
 //
 // Boot path (chosen): qemu -kernel via the curlee freestanding toolchain.
-//   - `curlee build --link` emits freestanding C from this file, compiles it
+//   - `curlee build --link` emits freestanding C from the MERGED file
+//     (scripts/build-kernel.sh concatenates canvas.curlee + glyphs.curlee +
+//     assets.curlee + this file into a single translation unit — the codegen
+//     crashes on imports, see docs/phase2-architecture.md §1), compiles it
 //     with -ffreestanding -fno-builtin -nostdlib, assembles runtime/crt0.S,
 //     and links with runtime/linker.ld into a multiboot2+PVH kernel ELF.
 //   - crt0.S (PVH entry) calls `curlee_main` (this file's `main`).
 //
-// Display: VGA text mode (80x25), which is the default VGA state at boot in
-// both QEMU (-kernel) and VirtualBox/GRUB — no mode switching required.
-//   - Text buffer base: 0xB8000. Each cell is 2 bytes: char, attribute.
-//   - Attribute 0x0F = bright white text on black background.
-//   - One Phys<U16> write per character; every address is a constant literal
-//     (Curlee rule: "physical address must be a constant literal").
+// THIS FILE IS NOT VERIFIED STANDALONE — it depends on the pure helpers from
+// canvas/glyphs/assets (supplied at merge time). Verify the merged file
+// (`make check`) or the individual modules (`curlee check kernel/canvas.curlee`).
+//
+// Display strategy (Phase 2): a software renderer targeting the UEFI/linear
+// framebuffer. Curlee computes geometry/intent (pure, verified); the C driver
+// (kernel/fb.c) executes pixels. When the framebuffer is available
+// (fb_ready() == 1) the kernel renders the declarative demo scene via
+// render_frame(); otherwise it falls back to the VGA text buffer (QEMU).
 //
 // Design laws honored:
-//   - Single address space, Ring 0: direct volatile stores via Phys<T>.
-//   - Deterministic verification: vga_cell is a pure, total function on
-//     Int -> Int; the verifier proves the contract. Addresses are literals.
-//   - Minimal footprint: no libc, no malloc, no String/Vec (all rejected in
-//     the freestanding target), no drivers beyond the VGA buffer + serial.
+//   - Single address space, Ring 0: direct volatile stores via Phys<T>/fb.c.
+//   - Deterministic verification: the pure geometry (canvas/glyphs/assets) is
+//     Z3-verified and VM-tested (kernel/canvas_test.curlee); no proof, no build.
+//   - Minimal footprint: no libc, no malloc, no String/Vec; the C driver owns
+//     mutable blitter state; Curlee owns pure math + declarative scenes.
 
 extern fn curlee_putc(c: Int) -> Unit;
 extern fn curlee_halt() -> Unit;
 
-// Provided by kernel/fb.c: parse the multiboot2 framebuffer tag (the real
-// framebuffer address GRUB set) and draw 5x7 glyphs as 32bpp pixels. This is
-// the reliable display path under VirtualBox (GRUB gfxterm -> linear FB).
+// Provided by kernel/fb.c — linear framebuffer software blitter.
 extern fn fb_init() -> Unit;
 extern fn fb_ready() -> Int;
+extern fn fb_clear(color: Int) -> Unit;
+extern fn fb_pixel(x: Int, y: Int, color: Int) -> Unit;
+extern fn fb_fill_rect(x: Int, y: Int, w: Int, h: Int, color: Int) -> Unit;
+extern fn fb_line(x0: Int, y0: Int, x1: Int, y1: Int, color: Int) -> Unit;
 extern fn fb_draw_char(ch: Int, x: Int, y: Int, scale: Int) -> Unit;
+extern fn fb_draw_char_color(ch: Int, x: Int, y: Int, scale: Int, color: Int) -> Unit;
+extern fn fb_blit_asset(src: Int, src_w: Int, src_h: Int, dst_x: Int, dst_y: Int) -> Unit;
+extern fn fb_present() -> Unit;
+extern fn fb_run_loop() -> Unit;
 
-// Provided by kernel/vga_setup.c: programs VGA text mode 3 so the 0xB8000
-// text buffer is rendered with the standard PC-437 font (QEMU fallback).
+// Phase 2b 60 FPS loop control + kernel tool-call queue (kernel/fb.c owns the
+// mutable state; these externs are the only window Curlee has into it).
+//   fb_loop_init()      -> reset the frame counter + tool ring
+//   fb_loop_frame()     -> current frame counter (the loop's fuel)
+//   fb_tool_enqueue(k,a)-> enqueue a (kind, arg) tool intent; 1 ok, 0 full
+//   fb_tool_drained()   -> intents consumed by the last fb_run_loop tick
+//   fb_tool_pending()   -> intents currently queued
+//
+// The PRODUCER API (fb_tool_enqueue / fb_tool_drained / fb_tool_pending) is
+// exercised live by main's loop (one "frame-tick" intent per frame) and is
+// the same entry point future producers (LLM bridge, input handler — Phase
+// 2d) will use. The producer-side frame -> slot mapping is `tool_queue_slot`
+// (assets.curlee), VM-asserted by canvas_test.curlee §13.
+extern fn fb_loop_init() -> Unit;
+extern fn fb_loop_frame() -> Int;
+extern fn fb_tool_enqueue(kind: Int, arg: Int) -> Int;
+extern fn fb_tool_drained() -> Int;
+extern fn fb_tool_pending() -> Int;
+
+// Provided by kernel/vga_setup.c: programs VGA text mode 3 (QEMU fallback).
 extern fn vga_text_setup() -> Unit;
 
-// Pack (char, color attribute) into the 2-byte VGA cell value:
-//   low byte  = ASCII character
-//   high byte = attribute (foreground | background << 4)
-// Pure and total: any Int in, a cell value out. Verified by contract below.
-fn vga_cell(ch: Int, attr: Int) -> Int
-  [ requires ch >= 0 && ch < 256; ensures true; ] {
-  return ch + attr * 256;
-}
+// ===========================================================================
+// Phase 2 declarative render scene (called per-frame by fb_run_loop's C loop)
+// ===========================================================================
 
 // Serial fallback: emit the message via the weak curlee_putc hook so the
 // boot is observable (the QEMU smoke path overrides it to write to COM1).
@@ -73,56 +98,111 @@ fn serial_hello() -> Unit {
   return;
 }
 
-// Kernel entry point (codegen exports this as curlee_main).
-//
-// Renders "Hello World from JOE" to the VGA text buffer at row 0 and
-// emits the same text to serial, then halts deterministically.
-//
-// `cap phys.mem` parameter: required by the verifier for any Phys<T>
-// read/write; authority is granted by the host at the link/run boundary.
-//
-// Display: 32bpp linear framebuffer at 0xFD00_0000 (VBE mode 640x480x32,
-// set by GRUB's gfxterm before handoff). Each pixel is one U32 (0x00RRGGBB).
-// We draw "HELLO" as large blocky glyphs — every write is a constant address
-// and a constant value, satisfying Curlee's "address must be a literal".
-// Draw "Hello world from JOE" to the linear framebuffer (5x7 glyphs,
-// 4x scale, starting at pixel (40,40)). Only called when fb_ready() is 1.
-fn fb_hello() -> Unit {
-  // "Hello world from JOE" — ASCII codes, drawn left to right with a
-  // 6-pixel advance (5 glyph cols + 1 space).
-  fb_draw_char(72, 40, 40, 4);    // H
-  fb_draw_char(101, 64, 40, 4);   // e
-  fb_draw_char(108, 88, 40, 4);   // l
-  fb_draw_char(108, 112, 40, 4);  // l
-  fb_draw_char(111, 136, 40, 4);  // o
-  fb_draw_char(32, 160, 40, 4);   // (space)
-  fb_draw_char(87, 184, 40, 4);   // W
-  fb_draw_char(111, 208, 40, 4);  // o
-  fb_draw_char(114, 232, 40, 4);  // r
-  fb_draw_char(108, 256, 40, 4);  // l
-  fb_draw_char(100, 280, 40, 4);  // d
-  fb_draw_char(32, 304, 40, 4);   // (space)
-  fb_draw_char(102, 328, 40, 4);  // f
-  fb_draw_char(114, 352, 40, 4);  // r
-  fb_draw_char(111, 376, 40, 4);  // o
-  fb_draw_char(109, 400, 40, 4);  // m
-  fb_draw_char(32, 424, 40, 4);   // (space)
-  fb_draw_char(67, 448, 40, 4);   // C
-  fb_draw_char(117, 472, 40, 4);  // u
-  fb_draw_char(114, 496, 40, 4);  // r
-  fb_draw_char(108, 520, 40, 4);  // l
-  fb_draw_char(101, 544, 40, 4);  // e
-  fb_draw_char(101, 568, 40, 4);  // e
+// Framebuffer-acquired marker for the Phase 2e-2 acceptance gate
+// (make qemu-fb-smoke): "FB: 1" proves fb_ready()==1 — the multiboot2
+// framebuffer tag captured by the 32-bit boot stub was parsed and the linear
+// framebuffer is active. The gate greps the serial log for "FB:".
+fn serial_fb_marker() -> Unit {
+  curlee_putc(70);   // F
+  curlee_putc(66);   // B
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  curlee_putc(49);   // 1 (fb_ready() == 1)
+  curlee_putc(10);   // newline
   return;
 }
 
+// Serial per-frame marker for the Phase 2b loop gate (make qemu-loop-smoke):
+// "FR:<n>" proves the loop advanced past frame 1. `n` must be a single digit
+// (the loop is fuel-bounded well under 10), so the marker is 6 chars + \n.
+fn serial_frame_marker(n: Int) -> Unit {
+  curlee_putc(70);   // F
+  curlee_putc(82);   // R
+  curlee_putc(58);   // :
+  curlee_putc(48 + n);   // digit n (0..9)
+  curlee_putc(10);   // newline
+  return;
+}
+
+// One frame of the demo scene. Geometry is computed by the verified pure
+// helpers (from canvas/glyphs/assets, merged in; provably in-bounds); the C
+// blitter executes the pixels.
+// The `pm: cap phys.mem` parameter satisfies the verifier's Phys rule and is
+// dropped by codegen (C calls curlee_render_frame(void) directly).
+//
+// Phase 2b: the scene is frame-index-aware so the demo animates — the panel
+// rectangle cycles its y position between two rows on alternate frames
+// (pure Int math, no mutable state), proving the loop actually re-renders.
+fn render_frame(pm: cap phys.mem, frame: Int) -> Unit {
+  // Bind colors to lets first (the verifier rejects calls as arguments to
+  // other calls: "calls are not supported in verification expressions").
+  let bg: Int = rgb(8, 8, 12);
+  let panel: Int = rgb(220, 80, 40);
+  let line: Int = rgb(40, 220, 80);
+  let white: Int = rgb(255, 255, 255);
+  // Clear to a dark background.
+  fb_clear(bg);
+  // A panel rectangle. The y position alternates between two rows with the
+  // frame index (pure Int math — frame is the loop counter from fb.c, opaque
+  // to the verifier, so the arithmetic here is contract-less by design). No
+  // modulo (rejected): fold the parity into a subtraction, then scale.
+  let panel_parity: Int = frame - (frame / 2) * 2;
+  let panel_y: Int = 40 + panel_parity * 60;
+  fb_fill_rect(40, panel_y, 200, 120, panel);
+  // A line under the panel.
+  fb_line(40, 170, 240, 170, line);
+  // "JOE" in 4x-scale glyphs at (60, 60) in white.
+  fb_draw_char_color(74, 60, 60, 4, white);   // J
+  fb_draw_char_color(79, 96, 60, 4, white);   // O
+  fb_draw_char_color(69, 132, 60, 4, white);  // E
+  fb_present();
+  return;
+}
+
+// Kernel entry point (codegen exports this as curlee_main).
+//
+// Renders the Phase 2 demo scene when the linear framebuffer is available,
+// else falls back to VGA text + serial (the Phase 1 acceptance path), then
+// halts deterministically.
+//
+// Phase 2b: when the framebuffer is active, `main` drives the deterministic,
+// fuel-bounded 60 FPS loop itself — the C driver (fb.c) owns the mutable
+// frame counter + tool ring, and Curlee owns the loop policy: render a frame,
+// emit FR:<n>, drain the tool queue, advance the counter, stop after
+// FB_LOOP_FRAMES frames. The loop is bounded (not `while(true)`) so the
+// qemu-fb-smoke / qemu-loop-smoke gates stay deterministic and timeout-safe.
 fn main(pm: cap phys.mem) -> Unit {
-  // Prefer the real linear framebuffer (VirtualBox, GRUB gfxterm). Fall back
-  // to VGA text mode (QEMU) when no multiboot framebuffer info is available.
   fb_init();
   if (fb_ready() == 1) {
-    fb_hello();
+    // The linear framebuffer is active: the 32-bit multiboot2 boot stub
+    // (kernel/boot.S, as --32) captured the trusted info pointer in %ebx and
+    // mb2.c parsed the framebuffer tag (type 8) into the blitter globals.
+    // Phase 2b: hand off to the deterministic 60 FPS loop (see fb.c
+    // fb_run_loop) — the loop renders N frames, then returns to halt.
+    fb_loop_init();
+    while (fb_loop_frame() < 4) {
+      // One tick: render the current frame, emit the loop marker, enqueue a
+      // tool intent (exercising the producer API + slot mapping), then let
+      // fb_run_loop advance the counter and drain the ring.
+      let f: Int = fb_loop_frame();
+      render_frame(pm, f);
+      serial_frame_marker(f);
+      // Producer: enqueue a "frame-tick" intent (kind 1, arg = the frame
+      // number). The slot for this frame comes from tool_queue_slot
+      // (division-free wrap). kind 1 is the reserved "frame tick" intent kind;
+      // future producers (LLM bridge, input) use their own kinds.
+      let slot: Int = tool_queue_slot(f);
+      let enq: Int = fb_tool_enqueue(1, slot);
+      // The ring has 8 slots and we enqueue 1 intent per frame, so enqueue
+      // always succeeds here; ignore the return for the smoke path.
+      let drained: Int = fb_tool_drained();
+      let pending: Int = fb_tool_pending();
+      fb_run_loop();
+    }
+    serial_fb_marker();
   } else {
+    // No trusted framebuffer (text-mode ISO, QEMU PVH path): VGA text +
+    // serial fallback keeps the Phase 1 gates green.
     vga_text_setup();
   }
   unsafe {
@@ -178,4 +258,13 @@ fn main(pm: cap phys.mem) -> Unit {
   serial_hello();
   curlee_halt();
   return;
+}
+
+// Pack (char, color attribute) into the 2-byte VGA cell value:
+//   low byte  = ASCII character
+//   high byte = attribute (foreground | background << 4)
+// Pure and total: any Int in, a cell value out.
+fn vga_cell(ch: Int, attr: Int) -> Int
+  [ requires ch >= 0 && ch < 256; ensures true; ] {
+  return ch + attr * 256;
 }
