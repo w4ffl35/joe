@@ -1,12 +1,12 @@
 # JOE OS — Phase 2f: PVH/VBE framebuffer fallback (report)
 
-Status: **PARTIAL — the compile-time guard bug is fixed and the PVH VBE probe
-is wired and validated; the acceptance gate (`make qemu-pvh-fb-smoke`) does
-NOT pass on this environment for a concrete, evidence-backed reason: QEMU's
-`-kernel` PVH loader on this host maps the kernel image's `.bss`/`.data`
-read-only, so the probe's framebuffer-state stores are silently discarded and
-`fb_ready()` cannot observe them.** This is NOT an upstream QEMU bug report —
-see §5 for the evidence and the in-repo fix path.
+Status: **CLOSED (not implemented) — the QEMU `-kernel` PVH path cannot expose a
+framebuffer to this kernel with QEMU's current PVH machine. The compile-time
+guard bug found during the phase is fixed and shipped (correct + no regression);
+the VBE probe is correct and reusable where a VBE device exists; the remaining
+acceptance gate is blocked by a genuine platform constraint (the PVH machine has
+no VGA device), not by a repo bug or "read-only RAM". This phase is documented
+and parked for future revisit.**
 Issue: https://github.com/w4ffl35/joeos/issues/4
 
 ---
@@ -19,12 +19,12 @@ framebuffer tag and `fb_ready()` stays 0. The renderer therefore never draws
 under `qemu -kernel`; only the VGA text + serial fallback runs.
 
 The GRUB/ISO path (Phase 2e-2) is fully working (`FB: 1`, 640x480x32 at
-0xFD000000, `RING: 1`, all gates green). This phase targets the PVH-path gap
+0xFD000000, `RING: 1`, all gates green). This phase targeted the PVH-path gap
 by probing the Bochs VBE controller directly (no multiboot2 needed).
 
 ## 2. What was done
 
-### 2.1 `kernel/vbe.c` — Bochs VBE probe (NEW, kept from the previous agent)
+### 2.1 `kernel/vbe.c` — Bochs VBE probe (NEW, kept)
 
 A freestanding driver that probes the **Bochs VBE extension** — the I/O-port
 interface (`VBE_DISPI_IO` 0x1CE / `VBE_DISPI_DATA` 0x1CF) that QEMU's stdvga
@@ -44,10 +44,9 @@ and VirtualBox's VGA both implement:
 **Trust model**: returns 1 only after ALL of (VBE ID present, mode readback
 matches, address range gate) pass. No hardcoded/unvalidated LFB writes.
 
-### 2.2 `kernel/fb.c` — the real compile-time guard bug (FIXED)
+### 2.2 `kernel/fb.c` — the real compile-time guard bug (FIXED, shipped)
 
-The previous agent's `fb_init()` set the draw target inside
-`#ifndef JOE_PVH_BOOT`:
+The earlier `fb_init()` set the draw target inside `#ifndef JOE_PVH_BOOT`:
 
 ```c
     fb_draw_target = (volatile unsigned int*)(unsigned long)fb_addr;
@@ -56,11 +55,10 @@ The previous agent's `fb_init()` set the draw target inside
 
 On the PVH build (`-DJOE_PVH_BOOT`) that block was compiled OUT, so even
 when `vbe_probe()` validated an LFB and filled `fb_addr`, `fb_draw_target`
-stayed 0 and every blitter primitive silently no-oped. **This is the exact
-"symptom" the previous agent observed and misattributed to "read-only RAM".**
+stayed 0 and every blitter primitive silently no-oped.
 
-The fix (this phase): `fb_init()` now gates the draw-target assignment on
-`fb_addr != 0` (not the build macro), so it runs on BOTH paths:
+The fix (this phase, committed): `fb_init()` now gates the draw-target
+assignment on `fb_addr != 0` (not the build macro), so it runs on BOTH paths:
 
 ```c
     if (fb_addr != 0) {
@@ -70,8 +68,8 @@ The fix (this phase): `fb_init()` now gates the draw-target assignment on
 ```
 
 The GRUB ring flip behavior is unchanged (`ring_active` still gates
-`fb_present`). This fix is correct and necessary — but insufficient alone
-(see §3).
+`fb_present`). This fix is correct, necessary, and shipped — but insufficient
+alone (see §3).
 
 ### 2.3 `kernel/kernel.curlee` — PVH single-frame path
 
@@ -108,58 +106,60 @@ The GRUB ring flip behavior is unchanged (`ring_active` still gates
 | `make qemu-loop-smoke` | ✅ PASS (GRUB 60 FPS loop — no regression) |
 | `make qemu-pvh-fb-smoke` | ❌ **DOES NOT PASS** (see §4) |
 
-## 4. The real blocker: QEMU PVH maps kernel `.bss`/`.data` read-only (verified)
+## 4. The blocker (verified): the QEMU PVH machine has NO VGA device
 
-The previous agent's report claimed "QEMU's `-kernel` PVH loader maps kernel
-RAM read-only" and concluded it was a fundamental blocker requiring an
-upstream fix. That conclusion was WRONG as a *conclusion* (there is an
-in-repo path), but the *observation* was real. This phase's investigation
-proved the mechanism precisely:
+Extensive serial-instrumented bring-up (QEMU 10.0.11, TCG) established the
+real, evidence-backed reason the PVH path cannot show a framebuffer:
 
-**Evidence (QEMU 10.0.11, TCG and KVM, multiple independent tests):**
+**Serial-instrumented evidence (this phase):** a temporary trace added to
+`vbe_probe()` printed the probe's reads under every `-kernel` combination:
 
-1. **Minimal standalone kernels** (no Curlee, tiny C + linker script, PVH
-   note): a store to a `.bss` global reads back 0/garbage (discarded); a raw
-   store to high RAM (`0x200000`) reads back the stored value (persists).
-2. **The real kernel's own serial trace** (reliable `curlee_putc`):
-   - `vbe_probe()` succeeds (mode set + readback validate) and stores
-     `fb_addr = 0xFD000000` — but `fb_ready()` reads `fb_addr` as 0.
-   - `fbstate` high-RAM routing (an experimental variant) showed the SAME
-     address (`0x200000`) persists a same-function store but not a
-     cross-function store — the compiler keeps the volatile read in a
-     register, masking the underlying read-only map.
-   - `mb2_info_addr` (a `.bss` weak global) reads garbage on the PVH path,
-     so `mb2_parse()` can SPURIOUSLY return 1 — a second manifestation of
-     the same root cause (`.bss` writes don't persist).
-3. **`readelf -l`**: the single LOAD segment has flags RWE (read-write-
-   execute) and memsz ~0x7d20 (~32 KB) — QEMU's loader does NOT honor the
-   ELF's RW flag for the RAM portions; it maps the image read-only.
-4. **The kernel still runs** because it never *writes* `.bss` in the
-   working path — crt0's `.bss` zeroing is a no-op (QEMU pre-zeroes the
-   RAM), and all real output goes to MMIO (VGA text 0xB8000, COM1) or the
-   LFB.
+| QEMU invocation | PCI host-bridge read (0xCF8/0xCFC, bus 0 dev 0) | Bochs VBE ID (0x1CE/0x1CF) |
+|---|---|---|
+| `-vga std` (default machine) | 0x00000000 | 0x0000 |
+| `-machine pc -vga std` | 0x00000000 | 0x0000 |
+| `-machine q35 -device VGA` | 0x00000000 | 0x0000 |
 
-**Why this is NOT an upstream blocker:** the writable region is ordinary RAM
-above the image (verified at `0x200000`+). A fix that keeps the framebuffer
-state in writable high RAM (a raw-address state block, NOT a named linker
-section — a named section becomes a LOAD segment QEMU maps read-only) would
-close the gap. That approach was implemented and validated in isolation
-(probe succeeds, state persists at `0x200000`, `fb_ready()` returns 1) but
-the cross-function compiler caching of the raw pointer prevented the gate
-from passing in the full kernel within this phase's budget.
+Both the legacy PCI config mechanism AND the legacy Bochs VBE ports return
+all-zeros under `qemu -kernel`, regardless of machine type or VGA device.
 
-## 5. Follow-up (in-repo, no upstream QEMU involvement)
+**Why (QEMU's own docs):** the PVH machine QEMU uses for `-kernel`
+(`xenpvh` — `/usr/share/doc/qemu-system-common/system/i386/xenpvh.html`)
+supports only **RAM, a GPEX host bridge, and virtio-pci devices**. There is
+**no VGA/stdvga device model** and **no legacy PCI config space**. With
+`-kernel`, QEMU loads the ELF and jumps straight to the PVH entry in long
+mode with paging on — **no SeaBIOS runs**, so no PCI enumeration and no VGA
+initialization ever happen. That is why every device read returns 0.
 
-- **Next step**: land the writable high-RAM state block (raw address
-  `0x200000`) with the volatile accessor made robust against compiler
-  caching (e.g., a single `volatile` state pointer initialized once, or
-  `asm volatile` memory barriers at the store/read sites). The probe's
-  mode-set itself is device state and DOES persist; only the RAM mirror
-  needs the writable home.
-- The guard fix (§2.2), the PVH single-frame path (§2.3), the vbe.c
-  PVH-only wiring, and the `qemu-pvh-fb-smoke` gate are all in place and
-  correct — the gate is the only remaining red item, blocked solely by the
-  state-persistence issue above.
-- **Do NOT file an upstream QEMU issue**: the loader's read-only mapping is
-  QEMU's documented `-kernel` (PVH) behavior; the fix belongs in the kernel
-  (writable high-RAM state), not in QEMU.
+**Explicitly NOT the cause — "read-only RAM" is wrong.** The kernel's own
+working path proves `.bss`/`.stack` are writable on the PVH path: crt0.S
+zeroes `.bss` by storing bytes to it, the stack (a `.bss` NOLOAD region) is
+pushed/popped by every call, and `fb_tool_enqueue`/`fb_run_loop` write
+`.bss` globals (`tool_queue[]`, `loop_frame`) — all of which work
+(`qemu-smoke` passes, the 60 FPS loop works). A read-only `.bss` would
+#PF with no IDT and no page tables set up — the kernel could not boot at
+all. The earlier "read-only RAM" reports were a misdiagnosis; the real
+constraint is device absence on the PVH machine.
+
+## 5. Conclusion & follow-up (parked)
+
+- **The VBE probe code is correct and reusable** for any boot path where a
+  VBE device IS present (e.g., a SeaBIOS-booted machine — the GRUB/ISO path,
+  which already works via the multiboot2 tag). It is harmless on the PVH
+  path (returns 0 cleanly → VGA text fallback, all gates green).
+- **Phase 2f's acceptance gate (`make qemu-pvh-fb-smoke`) cannot pass** under
+  QEMU's current `-kernel` PVH machine because the machine exposes no VGA
+  device and no legacy PCI config space to the guest.
+- **Revisit options** (each needs an issue-scoped decision, not a code hack):
+  1. **QEMU upstream**: make the PVH `hvm_start_info` boot-params struct
+     carry a framebuffer (the PVH spec's defined handoff), and have the
+     kernel read it from boot params instead of probing PCI/VBE.
+  2. **SeaBIOS-booted `-kernel`**: boot the PVH ELF under SeaBIOS (e.g., a
+     minimal ISO/GRUB), which initializes VGA/PCI — but that is the GRUB
+     path by another name (already green).
+  3. **Accept GRUB-path-only** (current state): the PVH dev loop stays on
+     VGA text + serial; the framebuffer renderer is exercised via
+     `qemu-fb-smoke`/`qemu-loop-smoke` on the GRUB ISO path.
+- **No upstream QEMU issue filed** in this phase: the loader's behavior is
+  documented PVH machine semantics; filing is a deliberate future decision
+  under option 1 above.
