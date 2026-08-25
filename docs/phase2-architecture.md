@@ -211,8 +211,6 @@ extern fn fb_clear(color: Int) -> Unit;
 extern fn fb_pixel(x: Int, y: Int, color: Int) -> Unit;
 extern fn fb_fill_rect(x: Int, y: Int, w: Int, h: Int, color: Int) -> Unit;
 extern fn fb_line(x0: Int, y0: Int, x1: Int, y1: Int, color: Int) -> Unit;
-extern fn fb_draw_char(ch: Int, x: Int, y: Int, scale: Int) -> Unit;        // Phase-1 compat (orange)
-extern fn fb_draw_char_color(ch: Int, x: Int, y: Int, scale: Int, color: Int) -> Unit;
 extern fn fb_blit_asset(src: Int, src_w: Int, src_h: Int,
                         dst_x: Int, dst_y: Int) -> Unit;
 extern fn fb_present() -> Unit;         // swap/blit to visible surface

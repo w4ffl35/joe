@@ -62,7 +62,8 @@ AS := as
 LD := ld
 
 .PHONY: all kernel check pack-run canvas-run json-run json-codegen-run iso iso-fb qemu run verify clean \
-        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke
+        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke \
+        c-boundary
 
 all: kernel
 
@@ -137,6 +138,12 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(MERGE
 # Pure packer is VM-runnable; assert the deterministic cell math.
 pack-run: $(PACK_SRC)
 	$(CURLEE) run $(PACK_SRC)
+
+# C boundary policy gate (docs/c-boundary-policy.md): no logic in C — only
+# I/O touches and raw memory moves. Fails if a kernel/*.c exceeds the line
+# cap or contains pure-data red flags (switch tables, large static consts).
+c-boundary:
+	bash scripts/check-c-boundary.sh
 
 # Pure renderer math is VM-runnable; assert color/geometry/glyph/asset math.
 canvas-run: $(CANVAS_TEST) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC)
@@ -438,7 +445,7 @@ run: qemu
 # ---------------------------------------------------------------------------
 # Verify (all acceptance gates)
 # ---------------------------------------------------------------------------
-verify: check pack-run canvas-run json-run json-codegen-run kernel
+verify: check pack-run canvas-run json-run json-codegen-run c-boundary kernel
 	@echo "=== Verification gates ==="
 	@test -s $(KERNEL_ELF) || (echo "FAIL: kernel.elf missing"; exit 1)
 	@objdump -f $(KERNEL_ELF) | grep -q 'start address 0x' && echo "PASS: ELF entry set"

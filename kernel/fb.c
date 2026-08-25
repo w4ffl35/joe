@@ -17,15 +17,16 @@
 //                     long long color);
 //   void fb_line(long long x0, long long y0, long long x1, long long y1,
 //                long long color);
-//   void fb_draw_char(long long ch, long long x, long long y, long long scale);
-//     // Phase-1 compat: draws in orange (fixed color).
-//   void fb_draw_char_color(long long ch, long long x, long long y,
-//                           long long scale, long long color);
 //   void fb_blit_asset(long long src, long long src_w, long long src_h,
 //                      long long dst_x, long long dst_y);
 //     // Blits a 32bpp RAW pixel buffer (src points at a uint32_t array of
 //     // src_w * src_h pixels) to the framebuffer at (dst_x, dst_y).
 //   void fb_present(void);   // flip: back-buffer ring -> visible FB
+//
+// Glyph text rendering moved to Curlee (draw_glyph in kernel.curlee drives
+// fb_pixel per set pixel; the 5x7 tables are authoritative in glyphs.curlee).
+// fb.c no longer carries a glyph_table copy — the C boundary rule (see
+// docs/c-boundary-policy.md) keeps pure data/logic out of C.
 //
 // Phase 2c — memory & asset management contracts. Accessor/geometry externs
 // the Curlee layer reads to enforce the verified gates at run time, plus the
@@ -378,111 +379,20 @@ void fb_line(long long x0, long long y0, long long x1, long long y1, long long c
 }
 
 // ---------------------------------------------------------------------------
-// Text rendering (5x7 glyphs, scaled)
+// Text rendering (5x7 glyphs, scaled) — MOVED TO CURLEE
 // ---------------------------------------------------------------------------
-
-// 5x7 glyph row for a character (bit 4 = leftmost pixel). Mirrors the
-// glyph tables in glyphs.curlee — keep in sync.
-static unsigned char glyph_row(char c, int row)
-{
-    switch (c)
-    {
-    case 'H': {
-        static const unsigned char g[7] = {0x44, 0x44, 0x44, 0x7C, 0x44, 0x44, 0x44};
-        return (row < 7) ? g[row] : 0;
-    }
-    case 'e': {
-        static const unsigned char g[7] = {0x38, 0x44, 0x7C, 0x40, 0x38, 0x00, 0x00};
-        return (row < 7) ? g[row] : 0;
-    }
-    case 'l': {
-        static const unsigned char g[7] = {0x20, 0x20, 0x20, 0x20, 0x38, 0x00, 0x00};
-        return (row < 7) ? g[row] : 0;
-    }
-    case 'o': {
-        static const unsigned char g[7] = {0x38, 0x44, 0x44, 0x44, 0x38, 0x00, 0x00};
-        return (row < 7) ? g[row] : 0;
-    }
-    case 'W': {
-        static const unsigned char g[7] = {0x44, 0x44, 0x44, 0x54, 0x6C, 0x44, 0x44};
-        return (row < 7) ? g[row] : 0;
-    }
-    case 'r': {
-        static const unsigned char g[7] = {0x18, 0x20, 0x20, 0x20, 0x70, 0x00, 0x00};
-        return (row < 7) ? g[row] : 0;
-    }
-    case 'd': {
-        static const unsigned char g[7] = {0x08, 0x08, 0x38, 0x48, 0x48, 0x38, 0x00};
-        return (row < 7) ? g[row] : 0;
-    }
-    case 'f': {
-        static const unsigned char g[7] = {0x30, 0x48, 0x70, 0x40, 0x40, 0x00, 0x00};
-        return (row < 7) ? g[row] : 0;
-    }
-    case 'm': {
-        static const unsigned char g[7] = {0x54, 0x54, 0x54, 0x54, 0x6C, 0x00, 0x00};
-        return (row < 7) ? g[row] : 0;
-    }
-    case 'C': {
-        static const unsigned char g[7] = {0x38, 0x44, 0x40, 0x40, 0x38, 0x00, 0x00};
-        return (row < 7) ? g[row] : 0;
-    }
-    case 'u': {
-        static const unsigned char g[7] = {0x28, 0x48, 0x48, 0x48, 0x38, 0x00, 0x00};
-        return (row < 7) ? g[row] : 0;
-    }
-    case '!': {
-        static const unsigned char g[7] = {0x20, 0x20, 0x20, 0x00, 0x20, 0x00, 0x00};
-        return (row < 7) ? g[row] : 0;
-    }
-    case ' ': {
-        return 0;
-    }
-    default:
-        return 0;
-    }
-}
-
-void fb_draw_char_color(long long ch, long long x, long long y, long long scale,
-                        long long color)
-{
-    if (!fb_addr)
-    {
-        return;
-    }
-    if (scale < 1)
-    {
-        scale = 1;
-    }
-    const unsigned int c = (unsigned int)color;
-    for (int row = 0; row < 7; ++row)
-    {
-        unsigned char bits = glyph_row((char)ch, row);
-        for (int col = 0; col < 5; ++col)
-        {
-            // Bit 4 (0x10) = leftmost pixel.
-            int on = (bits >> (4 - col)) & 1;
-            if (!on)
-            {
-                continue;
-            }
-            // Draw a scale x scale block of the requested color.
-            for (long long dy = 0; dy < scale; ++dy)
-            {
-                for (long long dx = 0; dx < scale; ++dx)
-                {
-                    fb_pixel(x + col * scale + dx, y + row * scale + dy, c);
-                }
-            }
-        }
-    }
-}
-
-// Phase-1 compatibility wrapper: draws in the classic orange.
-void fb_draw_char(long long ch, long long x, long long y, long long scale)
-{
-    fb_draw_char_color(ch, x, y, scale, 0x00FF8800);
-}
+//
+// The glyph tables (authoritative in glyphs.curlee) and the per-pixel draw
+// loop (draw_glyph in kernel.curlee) now live in the Curlee layer. Curlee
+// reads glyph_pixel() (pure, VM-asserted) and drives fb_pixel() per set
+// pixel — no C copy of the tables, no bit-twiddling loop in C.
+//
+// The fb_draw_char / fb_draw_char_color externs are intentionally REMOVED
+// from the Curlee surface (see kernel.curlee): the C boundary rule (see
+// docs/c-boundary-policy.md) keeps pure data/logic out of C.
+//
+// fb_draw_target guard for the removed functions is gone; Curlee's draw_glyph
+// calls fb_pixel which already no-ops when fb_draw_target is unset.
 
 // ---------------------------------------------------------------------------
 // Asset blitting (32bpp RAW pixel buffer)

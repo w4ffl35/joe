@@ -201,8 +201,12 @@ OS with a freestanding software renderer targeting the linear framebuffer.
     ring-buffer slot math, static asset-region geometry, runtime fit gates
     (rect/line/char/asset), frame-ring geometry (Phase 2c)
 - **Blitter** ([`kernel/fb.c`](kernel/fb.c)): `fb_clear`, `fb_pixel`,
-  `fb_fill_rect`, `fb_line`, `fb_draw_char_color`, `fb_blit_asset`,
+  `fb_fill_rect`, `fb_line`, `fb_blit_asset`,
   `fb_present`, plus the Phase 2b 60 FPS loop + tool ring
+  (glyph text rendering moved to Curlee — `draw_glyph` in
+  [`kernel/kernel.curlee`](kernel/kernel.curlee) reads `glyph_pixel` from
+  [`kernel/glyphs.curlee`](kernel/glyphs.curlee) and drives `fb_pixel`; the
+  C driver no longer carries a glyph-table copy)
   (`fb_loop_init`/`fb_loop_frame`/`fb_run_loop`/`fb_tool_enqueue`/...).
   All bounds-checked; the tool ring + asset region + frame ring are
   fixed-slot static arrays (no malloc). Phase 2c: `fb_present()` performs a
