@@ -98,11 +98,13 @@ tool-call queue, and rendered the acknowledgment frame.
 ## Acceptance criteria
 
 1. `make qemu-llm-smoke` PASSES: serial log contains the full ordered
-   sequence `NET: 1`, `NET: 2`, `NET: 3`, `ARP: 1`, `TCP: 1`, `SND: 36`,
-   `RCV: 36`, `JSON: 1`, `TOOL: 2`, `LLM: 1`, `Hello World from JOE!` — the
-   kernel → host stub → JSON parse → tool-queue enqueue → ack frame
-   round-trip, deterministic and timeout-safe. A `JSON: E<code>` marker
-   fails the gate.
+   sequence `NET: 1`, `NET: 2`, `NET: 3`, `RX: <len>` (the 2d-1 first-RX
+   marker — the slirp ARP reply consumed by `net_bringup`, emitted between
+   `NET: 3` and `ARP: 1` on the user-net smoke path; absent with no NIC),
+   `ARP: 1`, `TCP: 1`, `SND: 36`, `RCV: 36`, `JSON: 1`, `TOOL: 2`, `LLM: 1`,
+   `Hello World from JOE!` — the kernel → host stub → JSON parse → tool-queue
+   enqueue → ack frame round-trip, deterministic and timeout-safe. A
+   `JSON: E<code>` marker fails the gate.
 2. `make qemu-llm-smoke` fails fast (non-zero) on a missing/mismatched
    marker (grep with exit code, mirroring `qemu-smoke`).
 3. The real-llama.cpp variant is documented and runnable

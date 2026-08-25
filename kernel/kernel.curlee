@@ -274,6 +274,36 @@ fn serial_rcv_marker(len: Int) -> Unit {
   return;
 }
 
+// Phase 2d-4 markers (docs/phase2d-wire.md §5): the LLM bridge tail.
+//   TOOL: 2  fb_tool_enqueue(2, arg) succeeded — the parsed tool call entered
+//            the 2b tool-call queue (kind 2 = "LLM tool call", the 2d-3
+//            contract)
+//   LLM: 1   the acknowledgment frame was rendered (the serial marker is the
+//            gate's ack; the visual "LLM OK" frame is a bonus on the fb path)
+// `n` is a single digit (0..9), so each marker is 6-7 chars + \n.
+fn serial_tool_marker(n: Int) -> Unit {
+  curlee_putc(84);   // T
+  curlee_putc(79);   // O
+  curlee_putc(79);   // O
+  curlee_putc(76);   // L
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  curlee_putc(48 + n);
+  curlee_putc(10);   // newline
+  return;
+}
+
+fn serial_llm_marker(n: Int) -> Unit {
+  curlee_putc(76);   // L
+  curlee_putc(76);   // L
+  curlee_putc(77);   // M
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  curlee_putc(48 + n);
+  curlee_putc(10);   // newline
+  return;
+}
+
 // Phase 2d-1: VirtIO-net bring-up — probe, init, link, then the deterministic
 // RX smoke path (the guest ARPs the slirp gateway 10.0.2.2; slirp auto-answers,
 // delivering the first RX frame). Every step is gated on the previous step's
@@ -397,10 +427,20 @@ fn json_llm_bridge() -> Unit {
       if (err == 0) {
         serial_json_ok();
         // Enqueue the parsed tool call (kind 2 = "LLM tool call", arg = the
-        // parsed value). 2d-4's smoke gate asserts the "JSON: 1" marker; the
-        // enqueue proves the LLM bridge reaches the 2b tool-call queue.
+        // parsed value). The 2d-4 gate asserts "TOOL: 2" (the enqueue
+        // SUCCEEDED — proving the bridge reached the 2b tool-call queue),
+        // then "LLM: 1" (the ack frame rendered).
         let arg: Int = json_arg_value(st);
         let enq: Int = fb_tool_enqueue(2, arg);
+        if (enq == 1) {
+          serial_tool_marker(2);
+          // 2d-4 ack: the round-trip is complete — the parsed tool call is in
+          // the 2b queue. Emit the "LLM: 1" ack marker (the gate's proof the
+          // acknowledgment step ran). The visual "LLM OK" frame on the fb
+          // path is a bonus (issue #3's "renders an acknowledgment frame");
+          // the serial marker is the deterministic gate.
+          serial_llm_marker(1);
+        }
       } else {
         serial_json_err(err);
       }

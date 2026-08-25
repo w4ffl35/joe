@@ -118,6 +118,10 @@ ordered serial sequence:
 NET: 1        # 2d-1: PCI probe found virtio-net
 NET: 2        # 2d-1: device initialized (rings set up)
 NET: 3        # 2d-1: link up
+RX: <len>     # 2d-1: first RX frame — the slirp ARP reply consumed by
+              #       net_bringup (deterministic on the user-net smoke path;
+              #       absent with no NIC). Empirically 60-64 bytes (padded
+              #       ARP reply, minus/plus the virtio-net header discipline).
 ARP: 1        # 2d-2: gateway 10.0.2.2 resolved
 TCP: 1        # 2d-2: TCP connection to 10.0.2.2:8080 established
 SND: 36       # 2d-2: request (36 bytes) sent
@@ -125,7 +129,8 @@ RCV: 36       # 2d-2: response (36 bytes) received
 JSON: 1       # 2d-3: parser OK (parse_error == 0)
 TOOL: 2       # 2d-3: fb_tool_enqueue(2, arg) succeeded (kind 2)
 LLM: 1        # 2d-4: ack frame rendered
-Hello World from JOE!   # existing serial tail
+Hello World from JOE!   # existing serial tail (after the GRUB 60 FPS loop
+                        # markers FR:/RING:/FB: on the fb boot path)
 ```
 
 Each marker is emitted by the sub-issue named in the right column; the

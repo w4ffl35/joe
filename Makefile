@@ -62,7 +62,7 @@ AS := as
 LD := ld
 
 .PHONY: all kernel check pack-run canvas-run json-run json-codegen-run iso iso-fb qemu run verify clean \
-        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke
+        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke
 
 all: kernel
 
@@ -99,6 +99,12 @@ $(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C
 	# net_probe() is a safe no-op (the PVH machine has no legacy PCI config
 	# space — see the file header). The GRUB/ISO path compiles WITHOUT the
 	# macro and gets the full option-2 rings (see kernel-grub.elf below).
+	# NOTE: this compile was MISSING from this rule (the link below references
+	# build/virtio_net.o), so a clean-tree `make verify` failed with
+	# "ld: cannot find build/virtio_net.o" — the GRUB rule's 32-bit object was
+	# the only producer, a build-order-dependent accident. Fixed by compiling
+	# the PVH stub object here (2d-4 review, issue #8).
+	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
 	# Phase 2d-2: TCP/IP stack (kernel/net_stack.c) — same PVH discipline: the
 	# GRUB/ISO path (below) gets the full ARP/IPv4/TCP stack; the PVH path
 	# compiles the 1-byte stubs (every extern returns 0) so the PVH LOAD budget
@@ -400,6 +406,27 @@ qemu-net-smoke: $(BUILD_DIR)/joeos-net.iso
 	# (scripts/run-llm-smoke.sh, -netdev user against the host stub server).
 	# This 2d-1 gate stays exactly as-is: NET: 1..3 + RX: <len>.
 
+# ---------------------------------------------------------------------------
+# Phase 2d-4 acceptance gate (GitHub issue #8): the end-to-end LLM round-trip.
+# ---------------------------------------------------------------------------
+# Boots the GRUB/ISO path (kernel-grub.elf, NIC compiled in — the PVH `-kernel`
+# machine has no legacy PCI config space, so the NIC is only reachable where
+# SeaBIOS runs) with slirp user-net, against the deterministic host stub
+# (scripts/llm_stub_server.py on 127.0.0.1:8080, reachable from the guest at
+# the 10.0.2.2 gateway alias — no hostfwd needed for kernel -> host), and
+# asserts the FULL ordered marker sequence (docs/phase2d-wire.md §5):
+#   NET: 1, NET: 2, NET: 3, ARP: 1, TCP: 1, SND: 36, RCV: 36,
+#   JSON: 1, TOOL: 2, LLM: 1, Hello World from JOE!
+# A "JSON: E<code>" marker fails the gate.
+#
+# The real-llama.cpp variant (documented, NOT CI-gated — nondeterministic
+# model output would break the gate): run a llama server yourself and point
+# the harness at it:
+#   LLM_SERVER=skip make qemu-llm-smoke     # server already running on :8080
+#   LLM_SERVER=llama-server make qemu-llm-smoke   # harness starts it
+qemu-llm-smoke: $(BUILD_DIR)/joeos-net.iso
+	bash scripts/run-llm-smoke.sh
+
 # Boot the GRUB ISO under qemu (sanity check for the VirtualBox path).
 qemu-iso: $(ISO)
 	qemu-system-x86_64 -cdrom $(ISO) -boot d \
@@ -426,6 +453,9 @@ verify: check pack-run canvas-run json-run json-codegen-run kernel
 	@nm $(KERNEL_ELF) | grep -q ' net_stack_poll$$' && echo "PASS: net_stack_poll linked"
 	@nm $(KERNEL_ELF) | grep -q ' net_response_len$$' && echo "PASS: net_response_len linked"
 	@nm $(KERNEL_ELF) | grep -q ' net_response_byte$$' && echo "PASS: net_response_byte linked"
+	# Phase 2d-4: the tool-queue producer API the LLM bridge drives
+	# (fb_tool_enqueue(2, arg) — the 2d-3 contract, wired into the 2b ring).
+	@nm $(KERNEL_ELF) | grep -q ' fb_tool_enqueue$$' && echo "PASS: fb_tool_enqueue linked"
 	@echo "All verification gates passed."
 
 clean:

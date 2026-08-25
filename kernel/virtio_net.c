@@ -140,6 +140,23 @@ static unsigned int pci_config_read32(unsigned int bus, unsigned int dev,
 #define VIRTIO_NET_F_MAC    5
 #define VIRTIO_NET_F_STATUS 16
 // VIRTIO_F_VERSION_1 (bit 32) is NEVER offered — see file header.
+//
+// Virtio-net header handling (LOCKED, 2d-4 finding):
+//   The driver does NOT negotiate any csum/gso offload feature, but QEMU's
+//   virtio-net still expects a `struct virtio_net_hdr` (10 bytes) at the START
+//   of every TX buffer, and writes one at the start of every RX buffer. This
+//   was verified empirically (QEMU 10.0.11): a TX frame staged without the
+//   header reaches the network with its first 10 bytes (the Ethernet dst MAC
+//   and half the src MAC) consumed as the header — slirp sees `34:56:08:06:00:01`
+//   instead of `ff:ff:ff:ff:ff:ff` and drops it (the documented 2d-4 blocker).
+//   The qemu-net-smoke socket gate never caught this because BOTH QEMUs use
+//   virtio-net (symmetric header consumption) and it only greps the RX length.
+//
+//   The driver therefore stages the 10-byte header (all zeros — a plain,
+//   unoffloaded segment) before each Ethernet frame on TX, and skips the
+//   header on RX. The Curlee/net_stack layer above continues to see pure
+//   Ethernet frames (byte 0 = dst MAC), exactly as it always assumed.
+#define VIRTIO_NET_HDR_BYTES 10
 
 #define VIRTIO_NET_S_LINK_UP 0x01
 
@@ -552,6 +569,11 @@ long long net_link_up(void)
 
 // Bytes in the current RX frame (0 = none). Also advances the used ring so a
 // frame that arrived between polls is collected.
+//
+// The device writes the 10-byte virtio-net header at the START of the RX
+// buffer (see the file-header comment), so the Ethernet frame the stack reads
+// starts at byte VIRTIO_NET_HDR_BYTES. The reported length is the Ethernet
+// frame length (used-ring len minus the header).
 long long net_rx_len(void)
 {
     if (!net_ready)
@@ -571,17 +593,24 @@ long long net_rx_len(void)
     {
         return 0;
     }
-    return (long long)rx_frame_len[rx_current];
+    if (rx_frame_len[rx_current] <= VIRTIO_NET_HDR_BYTES)
+    {
+        return 0;  // header-only or undersized — nothing usable
+    }
+    return (long long)(rx_frame_len[rx_current] - VIRTIO_NET_HDR_BYTES);
 }
 
 // Byte i of the held RX frame (0 if none/out of range). 2d-2's byte source.
+// Skips the virtio-net header so the stack sees pure Ethernet (byte 0 = dst
+// MAC), exactly as it always assumed.
 long long net_rx_byte(long long i)
 {
-    if (!net_ready || rx_current < 0 || i < 0 || i >= (long long)rx_frame_len[rx_current])
+    if (!net_ready || rx_current < 0 || i < 0 ||
+        i >= (long long)(rx_frame_len[rx_current] - VIRTIO_NET_HDR_BYTES))
     {
         return 0;
     }
-    return (long long)rx_buf[rx_current][(unsigned int)i];
+    return (long long)rx_buf[rx_current][(unsigned int)(i + VIRTIO_NET_HDR_BYTES)];
 }
 
 // Release the held RX frame; the driver reclaims + re-arms the buffer.
@@ -608,9 +637,14 @@ long long net_tx_stage_byte(long long i, long long b)
 }
 
 // Queue the staged frame. 1 = queued, 0 = no free TX buffer / not ready.
+//
+// The stack stages the PURE Ethernet frame at offset 0..len-1; the virtio-net
+// header (10 zero bytes, see the file-header comment) is prepended HERE so the
+// device sees header + Ethernet on the ring. The descriptor length includes
+// the header (len + 10); the frame content is unchanged for the stack.
 long long net_tx_send(long long len)
 {
-    if (!net_ready || len <= 0 || len > NET_BUF_BYTES)
+    if (!net_ready || len <= 0 || len + VIRTIO_NET_HDR_BYTES > NET_BUF_BYTES)
     {
         return 0;
     }
@@ -618,9 +652,24 @@ long long net_tx_send(long long len)
     {
         return 0;  // no free TX slot
     }
+    // Shift the staged Ethernet frame up by the header size, then zero the
+    // header slot. (The stack staged bytes 0..len-1; the wire needs
+    // [header][frame].)
+    {
+        long long i;
+        for (i = len - 1; i >= 0; --i)
+        {
+            tx_buf[tx_stage][(unsigned int)(i + VIRTIO_NET_HDR_BYTES)] =
+                tx_buf[tx_stage][(unsigned int)i];
+        }
+        for (i = 0; i < VIRTIO_NET_HDR_BYTES; ++i)
+        {
+            tx_buf[tx_stage][(unsigned int)i] = 0;
+        }
+    }
     const unsigned int desc_id = NET_RX_BUFS + tx_stage;
     tx_desc[desc_id].addr = (uint64_t)(unsigned long)tx_buf[tx_stage];
-    tx_desc[desc_id].len = (uint32_t)len;
+    tx_desc[desc_id].len = (uint32_t)(len + VIRTIO_NET_HDR_BYTES);
     tx_desc[desc_id].flags = 0;  // device reads the TX buffer
     net_sfence();  // desc[] + ring[] stores visible before idx
     tx_avail->ring[tx_avail_head % NET_RING_NUM] = (uint16_t)desc_id;
@@ -676,6 +725,13 @@ long long net_rx_wait(void)
             queue_notify(VIRTIO_QUEUE_RX);
         }
         service_rx_used();
+        // Also reclaim completed TX frames while we wait: the one-shot TCP
+        // stack (net_stack.c) may have queued the ARP request on this wait
+        // (2d-4 keeps that optional path), and both TX slots must be free for
+        // the SYN that follows. Without this, a timed-out ARP wait leaves both
+        // TX buffers "in flight" forever and net_tx_send() for the SYN fails
+        // with "no free TX slot" — the documented 2d-4 blocker.
+        service_tx_used();
         if (rx_buf_state[0] == 2 || (NET_RX_BUFS > 1 && rx_buf_state[1] == 2))
         {
             return net_rx_len();

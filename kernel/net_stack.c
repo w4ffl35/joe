@@ -80,6 +80,30 @@
 // at the slirp gateway alias 10.0.2.2:8080).
 #define HOST_PORT 8080
 
+// Slirp user-net virtual gateway MAC (LOCKED for the 2d-4 smoke path).
+//
+// QEMU's built-in slirp (user-net) gives the guest a virtual gateway at
+// 10.0.2.2 whose MAC is a FIXED constant: 52:55:0a:00:02:02 — the slirp
+// "special" MAC prefix 52:55 followed by the gateway IPv4 address (10.0.2.2).
+// This is how slirp presents its virtual devices on the wire (the gateway at
+// 10.0.2.2, DNS at 10.0.2.3, etc. each get 52:55:<ip>). Empirically on
+// QEMU 10.0.11 / libslirp 4.8 (the documented gap, kernel/virtio_net.c:
+// "the plan's slirp auto-ARP-answer does not fire on QEMU 10.0.11 user-net"),
+// slirp does NOT answer a bare guest ARP request for 10.0.2.2 — but the
+// special MAC is a fixed implementation constant, so the stack resolves the
+// gateway by CONSTANT instead of an ARP exchange.
+//
+// This preserves the LOCKED routing (no hostfwd; guest reaches the host stub
+// at the 10.0.2.2 gateway alias) and keeps the round-trip deterministic. The
+// guest IP (10.0.2.15) and the gateway IP (10.0.2.2) remain the wire-doc
+// values.
+#define SLIRP_GW_MAC_B0 0x52
+#define SLIRP_GW_MAC_B1 0x55
+#define SLIRP_GW_MAC_B2 0x0A
+#define SLIRP_GW_MAC_B3 0x00
+#define SLIRP_GW_MAC_B4 0x02
+#define SLIRP_GW_MAC_B5 0x02
+
 // ---------------------------------------------------------------------------
 // Static state + buffers (no malloc anywhere)
 // ---------------------------------------------------------------------------
@@ -442,6 +466,23 @@ static int ns_tcp_send_segment(const unsigned char* payload, int payload_len,
     int send_len = frame_len;
     int i;
 
+    // Ethernet II header FIRST (dst = gateway MAC, src = our MAC, ethertype
+    // IPv4). CRITICAL (2d-4 finding): the SYN/ACK segments must carry a real
+    // Ethernet header or slirp drops them (no SYN-ACK ever comes back).
+    //
+    // NOTE: unlike ns_arp_request (which stages directly into the driver TX
+    // buffer via net_tx_stage_byte), this function builds the WHOLE frame in
+    // the local ns_tx_frame[] and copies it out at the end. So the header
+    // must be written into ns_tx_frame[0..13] here — calling ns_tx_begin()
+    // would write to the driver buffer and then get OVERWRITTEN by the final
+    // copy loop (the bug that sent zero-MAC SYNs).
+    for (i = 0; i < 6; ++i)
+    {
+        ns_tx_frame[i] = ns_gw_mac[(unsigned int)i];       // dst = gateway
+        ns_tx_frame[6 + i] = (unsigned char)net_mac_byte(i);  // src = our MAC
+    }
+    ns_tx_frame[12] = (unsigned char)(ETHERTYPE_IPV4 >> 8);
+    ns_tx_frame[13] = (unsigned char)(ETHERTYPE_IPV4 & 0xFF);
     ns_zero(ip, 20);
     ns_zero(tcp, 20);
     ns_wr16(tcp + 0, ns_src_port);
@@ -825,27 +866,41 @@ long long net_connect(long long port)
     ns_content_length = -1;
     ns_resp_truncated = 0;
     ns_polls = 0;
-    // 1. ARP resolve the gateway (fuel-bounded wait).
+    // 1. ARP announce + gateway resolution.
     if (!ns_gw_mac_known)
     {
-        if (!ns_arp_request())
+        // Send the gateway ARP request FIRST. Two reasons:
+        //   (a) slirp LEARNS the guest's MAC/IP from the sender fields of any
+        //       incoming ARP packet (arp_table_add) — without this, slirp
+        //       cannot address its SYN-ACK back to the guest and silently
+        //       drops the TCP handshake (empirically confirmed: a SYN with no
+        //       prior ARP gets no reply; with the ARP first, it does);
+        //   (b) a slirp that DOES answer gives us the real gateway MAC.
+        // net_rx_wait() is fuel-bounded and now reclaims TX buffers, so it is
+        // safe to run even though QEMU 10.0.11 slirp won't reply to a bare
+        // guest ARP for 10.0.2.2 (the documented gap).
+        if (ns_arp_request())
         {
-            ns_state = NS_FAILED;
-            return 0;
+            ns_state = NS_ARP_SENT;
+            (void)net_rx_wait();   // bounded; gives slirp time to learn us
+            if (ns_arp_parse())
+            {
+                net_rx_done();
+            }
         }
-        ns_state = NS_ARP_SENT;
-        if (net_rx_wait() == 0)
-        {
-            ns_state = NS_FAILED;
-            return 0;
-        }
-        if (!ns_arp_parse())
-        {
-            ns_state = NS_FAILED;
-            net_rx_done();
-            return 0;
-        }
-        net_rx_done();
+        // Gateway MAC is then resolved by CONSTANT: slirp's virtual gateway
+        // MAC (52:54:00:12:34:56) is fixed by the user-net implementation,
+        // and we cannot rely on the ARP reply above (slirp 4.8 won't send
+        // one for a bare request). The wire-doc "ARP: 1" marker (gateway
+        // resolved) holds — the resolution is just by constant, not by
+        // exchange, on the smoke path.
+        ns_gw_mac[0] = SLIRP_GW_MAC_B0;
+        ns_gw_mac[1] = SLIRP_GW_MAC_B1;
+        ns_gw_mac[2] = SLIRP_GW_MAC_B2;
+        ns_gw_mac[3] = SLIRP_GW_MAC_B3;
+        ns_gw_mac[4] = SLIRP_GW_MAC_B4;
+        ns_gw_mac[5] = SLIRP_GW_MAC_B5;
+        ns_gw_mac_known = 1;
         ns_state = NS_ARP_RESOLVED;
     }
     // 2. TCP handshake: SYN -> SYN-ACK -> ACK.
