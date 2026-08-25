@@ -19,6 +19,22 @@
 // subtraction, no modulo); ring_offset(slot) is the byte offset of a slot
 // from the ring base. The C driver owns the actual buffer; this module
 // computes the indices it must stay within.
+//
+// Phase 2c (memory & asset management contracts): this module also owns the
+// geometry of the two static buffers the C driver allocates (no malloc):
+//   - the static ASSET region (kernel/fb.c asset_region[ASSET_REGION_W*H],
+//     a 32bpp RAW pixel store) — asset_region_w/h/fits;
+//   - the double-buffer FRAME ring (kernel/fb.c frame_ring[FRAME_RING_SLOTS]
+//     [FRAME_RING_MAX_W*MAX_H]) — frame_ring_slots/offset/next/fits, the slot
+//     arithmetic fb_present's flip must honor.
+// Both sides must agree on the geometry: the C #defines (ASSET_REGION_W,
+// FRAME_RING_SLOTS, ...) and these pure values are cross-checked by the VM
+// test (canvas_test.curlee §14/§15), so a drift fails `make canvas-run`
+// before any boot. The runtime gates (dst_fits_gate / line_fits_gate /
+// char_fits_gate / asset_blit_gate) are the contract-less twins render_frame
+// calls with VALUES READ FROM EXTERN ACCESSORS (fb_get_width()/fb_get_height()
+// /fb_asset_region_w()), which the Z3 solver treats as opaque — see the
+// tool_slot_valid note below for the same pattern.
 
 // True when a source buffer of (src_w x src_h) pixels blitted to
 // (dst_x, dst_y) stays fully inside the framebuffer of (fb_w x fb_h).
@@ -162,4 +178,202 @@ fn tool_queue_slot(frame: Int) -> Int {
 fn tool_ring_next(cur: Int) -> Int {
   let slots: Int = tool_queue_slots();
   return ring_next(cur, slots);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2c: memory & asset management contracts
+// ---------------------------------------------------------------------------
+//
+// Two static buffers owned by fb.c (no malloc anywhere):
+//   1. ASSET REGION — a fixed 32bpp RAW pixel store the kernel can stage
+//      assets into. Geometry: ASSET_REGION_W x ASSET_REGION_H (fb.c
+//      #defines). This module exposes the W/H as pure constants and gates
+//      blits both INTO the region (asset_region_fits) and FROM it onto the
+//      framebuffer (asset_blit_fits).
+//   2. FRAME RING — a double-buffer ring of full-frame surfaces. The kernel
+//      renders into a back buffer, then fb_present() flips (the C side does
+//      the actual flip). Geometry: FRAME_RING_SLOTS slots, each up to
+//      FRAME_RING_MAX_W x FRAME_RING_MAX_H pixels (4 bytes each). This module
+//      computes the slot byte offsets (frame_ring_offset), the next write
+//      slot (frame_ring_next), and whether a given framebuffer size fits a
+//      slot (frame_ring_fits).
+//
+// Both sides MUST agree on the geometry — the C #defines in fb.c and these
+// pure constants are cross-checked by the VM test (canvas_test.curlee
+// §14/§15). The gate functions take EXPLICIT fb_w/fb_h (or region W/H)
+// parameters — this module is extern-free, so it stays VM-runnable and
+// merges before kernel.curlee (which declares the externs). render_frame
+// (kernel.curlee) reads the runtime sizes from extern accessors
+// (fb_get_width/fb_get_height/fb_asset_region_w) and passes them into the
+// pure gates below, so the runtime check is exactly the verified check.
+// The C blitter additionally bounds-checks every primitive as
+// defense-in-depth, and fb_present's flip obeys the ring geometry
+// unconditionally.
+
+// Asset region width (fb.c ASSET_REGION_W). The region is a fixed
+// compile-time 32bpp RAW pixel store; this is the authoritative W. This is
+// the GRUB-path geometry (the PVH path compiles the region out via
+// JOE_PVH_BOOT and its accessors return 0 — the ring never activates there).
+fn asset_region_w() -> Int {
+  return 128;
+}
+
+// Asset region height (fb.c ASSET_REGION_H).
+fn asset_region_h() -> Int {
+  return 128;
+}
+
+// True when an asset of (src_w x src_h) fits INSIDE the static asset region
+// (placed at (dst_x, dst_y) within it). Gates staging an asset into the
+// region — the C side only copies when this returns true (plus its own
+// bounds check). Total and verified.
+fn asset_region_fits(src_w: Int, src_h: Int, dst_x: Int, dst_y: Int) -> Bool
+  [ requires src_w >= 0 && src_h >= 0; ensures true; ] {
+  if (dst_x >= 0 && dst_y >= 0 &&
+      dst_x + src_w <= 128 && dst_y + src_h <= 128) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// True when a (src_w x src_h) 32bpp asset staged in the static asset region
+// blits to (dst_x, dst_y) on a (fb_w x fb_h) framebuffer. Total + verified.
+fn asset_blit_fits(src_w: Int, src_h: Int, dst_x: Int, dst_y: Int,
+                   fb_w: Int, fb_h: Int) -> Bool
+  [ requires src_w >= 0 && src_h >= 0;
+    requires fb_w >= 0 && fb_h >= 0;
+    ensures true; ] {
+  if (dst_x >= 0 && dst_y >= 0 &&
+      dst_x + src_w <= fb_w && dst_y + src_h <= fb_h) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// Pure rect gate: does a (w x h) rect at (dst_x, dst_y) fit on a
+// (fb_w x fb_h) framebuffer? Contract-less twin of the verified `dst_fits`
+// (same predicate; used by render_frame where the dimensions come from
+// extern accessors, which are opaque to the solver). The C blitter
+// additionally bounds-checks (defense-in-depth).
+fn rect_fits_gate(w: Int, h: Int, dst_x: Int, dst_y: Int,
+                  fb_w: Int, fb_h: Int) -> Bool {
+  if (w >= 0 && h >= 0 && dst_x >= 0 && dst_y >= 0 &&
+      dst_x + w <= fb_w && dst_y + h <= fb_h) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// Pure line gate: does the bounding box of a 1px line from (x0,y0) to
+// (x1,y1) fit on a (fb_w x fb_h) framebuffer? Contract-less (uses the
+// inlined min/max helpers).
+fn line_fits_gate(x0: Int, y0: Int, x1: Int, y1: Int,
+                  fb_w: Int, fb_h: Int) -> Bool {
+  let x0n: Int = imin(x0, x1);
+  let x1n: Int = imax(x0, x1);
+  let y0n: Int = imin(y0, y1);
+  let y1n: Int = imax(y0, y1);
+  let w: Int = x1n - x0n + 1;
+  let h: Int = y1n - y0n + 1;
+  return rect_fits_gate(w, h, x0n, y0n, fb_w, fb_h);
+}
+
+// Pure char gate: does the (5*scale x 7*scale) bounding box of a scaled
+// glyph at (dst_x, dst_y) fit on a (fb_w x fb_h) framebuffer? Contract-less
+// (non-linear mult).
+fn char_fits_gate(dst_x: Int, dst_y: Int, scale: Int,
+                  fb_w: Int, fb_h: Int) -> Bool {
+  let w: Int = 5 * scale;
+  let h: Int = 7 * scale;
+  return rect_fits_gate(w, h, dst_x, dst_y, fb_w, fb_h);
+}
+
+// Min of two Ints (the smaller). Contract-less (no Math module in the
+// freestanding fragment). Used by line_fits_gate.
+fn imin(a: Int, b: Int) -> Int {
+  if (a <= b) {
+    return a;
+  } else {
+    return b;
+  }
+}
+
+// Max of two Ints (the larger). Contract-less.
+fn imax(a: Int, b: Int) -> Int {
+  if (a >= b) {
+    return a;
+  } else {
+    return b;
+  }
+}
+
+// Number of frame-ring slots (fb.c FRAME_RING_SLOTS). Double buffering.
+fn frame_ring_slots() -> Int {
+  return 2;
+}
+
+// Max width of a single frame-ring slot (fb.c FRAME_RING_MAX_W).
+// 640x480 — matches the GRUB framebuffer request tag (boot.S asks for
+// 640x480x32), so the ring activates on the GRUB framebuffer path and
+// fb_present() flips. The PVH path compiles the ring out (JOE_PVH_BOOT) and
+// its accessors return 0, so the ring never activates there.
+fn frame_ring_max_w() -> Int {
+  return 640;
+}
+
+// Max height of a single frame-ring slot (fb.c FRAME_RING_MAX_H).
+fn frame_ring_max_h() -> Int {
+  return 480;
+}
+
+// Max bytes of a single frame-ring slot (fb.c FRAME_RING_SLOT_BYTES).
+fn frame_ring_slot_bytes() -> Int {
+  return 1228800;   // 640 * 480 * 4
+}
+
+// True when the framebuffer (fb_w x fb_h) fits inside a single frame-ring
+// slot (FRAME_RING_MAX_W x FRAME_RING_MAX_H). Gates fb_present's flip:
+// the ring only activates when every slot can hold the active surface.
+fn frame_ring_fits(fb_w: Int, fb_h: Int) -> Bool
+  [ requires fb_w >= 0 && fb_h >= 0; ensures true; ] {
+  if (fb_w <= 640 && fb_h <= 480) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// Byte offset of frame-ring slot `slot` from the ring base. Contract-less
+// (non-linear mult); the ring base + slot*slot_bytes is what the C flip
+// writes to (and what fb_get_frame_base returns for the active slot).
+fn frame_ring_offset(slot: Int) -> Int {
+  let bytes: Int = frame_ring_slot_bytes();
+  return ring_offset(slot, bytes);
+}
+
+// Next frame-ring write slot after `cur` (wrap-around via subtraction).
+fn frame_ring_next(cur: Int) -> Int {
+  let slots: Int = frame_ring_slots();
+  return ring_next(cur, slots);
+}
+
+// True when `slot` is a valid frame-ring slot (0 <= slot < FRAME_RING_SLOTS).
+// Contract-less and INLINE (same reason as tool_slot_valid).
+fn frame_ring_slot_ok(slot: Int) -> Bool {
+  if (slot >= 0 && slot < 2) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+// Total bytes of the whole frame ring (slots * slot_bytes). Contract-less
+// (delegates ring_capacity); the C ring allocation must be >= this.
+fn frame_ring_capacity() -> Int {
+  let slots: Int = frame_ring_slots();
+  let bytes: Int = frame_ring_slot_bytes();
+  return ring_capacity(slots, bytes);
 }

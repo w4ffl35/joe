@@ -19,6 +19,10 @@
 //   11 frame ring math
 //   12 Phase 2b tool-queue geometry (fixed-slot ring)
 //   13 tool_queue_slot — producer frame->slot mapping (wrap)
+//   14 Phase 2c static asset region (geometry + fits)
+//   15 Phase 2c frame ring (geometry + fits)
+//   16 Phase 2c pure rect/line/char runtime gates
+//   17 Phase 2c asset-blit gate (region -> framebuffer)
 //
 // This is the authoritative correctness gate for the functions whose
 // contracts the Z3 fragment cannot prove (division, non-linear
@@ -237,6 +241,114 @@ fn main() -> Int {
   // A mapped slot is always valid for the ring.
   let tsv: Bool = a.tool_slot_valid(ts2);
   if (!tsv) { return 13; }
+
+  // --- 14: Phase 2c static asset region (geometry + fits) -------------------
+  // The static asset region is ASSET_REGION_W x ASSET_REGION_H (fb.c
+  // #defines). The VM asserts the pure constants so a C/Curlee geometry
+  // drift fails `make canvas-run` before any boot.
+  let arw: Int = a.asset_region_w();
+  if (arw != 128) { return 14; }            // ASSET_REGION_W
+  let arh: Int = a.asset_region_h();
+  if (arh != 128) { return 14; }            // ASSET_REGION_H
+  // A 32x32 asset staged at (0,0) fits; at (100,100) does not (100+32>128).
+  let arf1: Bool = a.asset_region_fits(32, 32, 0, 0);
+  if (!arf1) { return 14; }
+  let arf2: Bool = a.asset_region_fits(32, 32, 100, 100);
+  if (arf2) { return 14; }
+  let arf3: Bool = a.asset_region_fits(32, 32, 96, 96);
+  if (!arf3) { return 14; }                 // exactly at the edge
+  let arf4: Bool = a.asset_region_fits(32, 32, -1, 0);
+  if (arf4) { return 14; }
+  // An asset exactly the region size fits at (0,0); one pixel larger does not.
+  let arf5: Bool = a.asset_region_fits(128, 128, 0, 0);
+  if (!arf5) { return 14; }
+  let arf6: Bool = a.asset_region_fits(129, 128, 0, 0);
+  if (arf6) { return 14; }
+
+  // --- 15: Phase 2c frame ring (geometry + fits) ----------------------------
+  // The frame ring is FRAME_RING_SLOTS slots of FRAME_RING_MAX_W x
+  // FRAME_RING_MAX_H 32bpp surfaces (fb.c #defines). The VM asserts the
+  // geometry both sides depend on (fb_present's flip obeys it).
+  let frs: Int = a.frame_ring_slots();
+  if (frs != 2) { return 15; }              // FRAME_RING_SLOTS (double buffer)
+  let frmw: Int = a.frame_ring_max_w();
+  if (frmw != 640) { return 15; }           // FRAME_RING_MAX_W (GRUB FB size)
+  let frmh: Int = a.frame_ring_max_h();
+  if (frmh != 480) { return 15; }           // FRAME_RING_MAX_H
+  let frb: Int = a.frame_ring_slot_bytes();
+  if (frb != 1228800) { return 15; }        // 640*480*4
+  // A 640x480 framebuffer fits (the GRUB framebuffer activates the ring);
+  // anything larger does not.
+  let frf1: Bool = a.frame_ring_fits(640, 480);
+  if (!frf1) { return 15; }
+  let frf2: Bool = a.frame_ring_fits(641, 480);
+  if (frf2) { return 15; }
+  let frf3: Bool = a.frame_ring_fits(640, 481);
+  if (frf3) { return 15; }
+  let frf4: Bool = a.frame_ring_fits(320, 240);
+  if (!frf4) { return 15; }                 // smaller modes also fit
+  let frf5: Bool = a.frame_ring_fits(100, 100);
+  if (!frf5) { return 15; }
+  // Slot offsets: slot 0 -> 0, slot 1 -> slot_bytes.
+  let fro0: Int = a.frame_ring_offset(0);
+  if (fro0 != 0) { return 15; }
+  let fro1: Int = a.frame_ring_offset(1);
+  if (fro1 != 1228800) { return 15; }
+  // Wrap-around: 1 -> 0 in a 2-slot ring.
+  let frn1: Int = a.frame_ring_next(1);
+  if (frn1 != 0) { return 15; }
+  let frn2: Int = a.frame_ring_next(0);
+  if (frn2 != 1) { return 15; }
+  // Slot validity: 0 and 1 valid, 2 and -1 not.
+  let frs1: Bool = a.frame_ring_slot_ok(0);
+  if (!frs1) { return 15; }
+  let frs2: Bool = a.frame_ring_slot_ok(1);
+  if (!frs2) { return 15; }
+  let frs3: Bool = a.frame_ring_slot_ok(2);
+  if (frs3) { return 15; }
+  let frs4: Bool = a.frame_ring_slot_ok(-1);
+  if (frs4) { return 15; }
+  // Total ring capacity: 2 * 1228800.
+  let frc: Int = a.frame_ring_capacity();
+  if (frc != 2457600) { return 15; }
+
+  // --- 16: Phase 2c pure rect/line/char runtime gates -----------------------
+  // Contract-less twins of dst_fits/blit_fits that take explicit fb_w/fb_h
+  // (render_frame passes the runtime size read from the extern accessors).
+  let rg1: Bool = a.rect_fits_gate(200, 120, 40, 40, 640, 480);
+  if (!rg1) { return 16; }
+  let rg2: Bool = a.rect_fits_gate(200, 120, 500, 400, 640, 480);
+  if (rg2) { return 16; }
+  let rg3: Bool = a.rect_fits_gate(200, 120, -10, 0, 640, 480);
+  if (rg3) { return 16; }
+  let rg4: Bool = a.rect_fits_gate(640, 480, 0, 0, 640, 480);
+  if (!rg4) { return 16; }                  // exactly the full screen
+  let lg1: Bool = a.line_fits_gate(40, 170, 240, 170, 640, 480);
+  if (!lg1) { return 16; }
+  let lg2: Bool = a.line_fits_gate(600, 400, 700, 450, 640, 480);
+  if (lg2) { return 16; }
+  let lg3: Bool = a.line_fits_gate(300, 300, 100, 100, 640, 480);
+  if (!lg3) { return 16; }                  // reversed endpoints
+  let cg1: Bool = a.char_fits_gate(60, 60, 4, 640, 480);
+  if (!cg1) { return 16; }                  // 20x28 at (60,60)
+  let cg2: Bool = a.char_fits_gate(630, 470, 4, 640, 480);
+  if (cg2) { return 16; }                   // 20x28 at (630,470) -> OOB
+  let cg3: Bool = a.char_fits_gate(100, 100, 1, 640, 480);
+  if (!cg3) { return 16; }                  // 5x7 at (100,100)
+
+  // --- 17: Phase 2c asset-blit gate (region -> framebuffer) -----------------
+  // A 32x32 asset staged in the region blits to (100,100) on a 640x480
+  // framebuffer; at (620,460) it does not (620+32>640).
+  let ag1: Bool = a.asset_blit_fits(32, 32, 100, 100, 640, 480);
+  if (!ag1) { return 17; }
+  let ag2: Bool = a.asset_blit_fits(32, 32, 620, 460, 640, 480);
+  if (ag2) { return 17; }
+  let ag3: Bool = a.asset_blit_fits(32, 32, 608, 448, 640, 480);
+  if (!ag3) { return 17; }                  // exactly at the edge
+  let ag4: Bool = a.asset_blit_fits(32, 32, -1, 0, 640, 480);
+  if (ag4) { return 17; }
+  let ag5: Bool = a.asset_blit_fits(640, 480, 0, 0, 640, 480);
+  if (!ag5) { return 17; }                  // exactly the full screen
 
   // All assertions held.
   return 0;

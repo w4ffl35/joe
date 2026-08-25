@@ -25,7 +25,18 @@
 //                      long long dst_x, long long dst_y);
 //     // Blits a 32bpp RAW pixel buffer (src points at a uint32_t array of
 //     // src_w * src_h pixels) to the framebuffer at (dst_x, dst_y).
-//   void fb_present(void);   // no-op until double-buffering lands
+//   void fb_present(void);   // flip: back-buffer ring -> visible FB
+//
+// Phase 2c — memory & asset management contracts. Accessor/geometry externs
+// the Curlee layer reads to enforce the verified gates at run time, plus the
+// ring/region state they describe:
+//   long long fb_get_width(void);        // current FB width  (pixels)
+//   long long fb_get_height(void);       // current FB height (pixels)
+//   long long fb_asset_region_w(void);   // static asset region width
+//   long long fb_asset_region_h(void);   // static asset region height
+//   long long fb_asset_region_base(void);// base address of the asset region
+//   long long fb_ring_active(void);      // 1 when the frame ring is active
+//   long long fb_ring_slot(void);        // current back-buffer slot index
 //
 // Phase 2b 60 FPS event loop + kernel tool-call API (the loop is driven by
 // Curlee's `main`; this file owns ALL the mutable loop state):
@@ -59,6 +70,84 @@ unsigned int fb_pitch = 0;
 unsigned int fb_width = 0;
 unsigned int fb_height = 0;
 
+// ---------------------------------------------------------------------------
+// Phase 2c: static asset region + frame ring (no malloc anywhere)
+// ---------------------------------------------------------------------------
+//
+// The Curlee layer (assets.curlee) owns the pure geometry for these two
+// static buffers; this file owns the actual storage. The values MUST stay in
+// sync — canvas_test.curlee §14/§15 asserts the pure constants
+// (asset_region_w/h, frame_ring_slots/max_w/max_h/slot_bytes) and a drift
+// fails `make canvas-run` before any boot.
+//
+// PVH size constraint (critical): QEMU's `-kernel` PVH loader refuses ELFs
+// whose LOAD segment (file + BSS) exceeds a hard budget — empirically the
+// image must stay under ~0x8000-0x10000 bytes of memsz beyond the base.
+// The pristine kernel is already near that limit, so ANY large static buffer
+// (a 128x128 asset region = 64 KB, a 2x320x240 frame ring = 614 KB) blows
+// the PVH budget and QEMU silently fails to enter the kernel (verified: the
+// BIOS hangs executing zeros — no exception, no serial).
+//
+// The PVH path (`kernel.elf`, qemu -kernel via crt0.S) has NO framebuffer
+// (fb_ready()==0 — it falls back to VGA text + serial), so it never uses the
+// ring/asset region. The GRUB path (`kernel-grub.elf`, ISO via boot.S + the
+// 32-bit linker-grub.ld) HAS the linear framebuffer and is where the ring
+// actually flips. Therefore: the buffers are compiled OUT on the PVH build
+// (JOE_PVH_BOOT defined by the Makefile for kernel.elf/kernel-smoke.elf) and
+// compiled IN at full size on the GRUB build (no macro) — no malloc anywhere,
+// and the PVH gate stays green.
+#ifndef JOE_PVH_BOOT
+// ASSET REGION: a fixed 128x128 32bpp RAW pixel store the kernel can stage
+// assets into (fb_blit_asset stages; fb_asset_region_base exposes it).
+#define ASSET_REGION_W 128
+#define ASSET_REGION_H 128
+static unsigned int asset_region[ASSET_REGION_W * ASSET_REGION_H];
+
+// FRAME RING: a double-buffer ring of full-frame 32bpp surfaces, each up to
+// 640x480 — the exact size the multiboot2 framebuffer request tag (boot.S)
+// asks GRUB for, so the ring activates on the GRUB framebuffer path and
+// fb_present() performs a REAL flip. The kernel renders into the CURRENT
+// BACK BUFFER (fb_draw_target + fb_target_stride); fb_present() copies it
+// onto the visible framebuffer, then advances the ring slot. GRUB loads this
+// 32-bit ELF with no PVH size limit, so the 2.4 MB ring BSS is fine here.
+#define FRAME_RING_SLOTS     2
+#define FRAME_RING_MAX_W     640
+#define FRAME_RING_MAX_H     480
+#define FRAME_RING_SLOT_BYTES (FRAME_RING_MAX_W * FRAME_RING_MAX_H * 4)
+static unsigned int frame_ring[FRAME_RING_SLOTS][FRAME_RING_MAX_W * FRAME_RING_MAX_H];
+#else
+// PVH path (qemu -kernel, crt0.S): NO framebuffer and QEMU's PVH loader
+// refuses ELFs whose LOAD segment (file + BSS) exceeds a hard budget
+// (verified empirically: a large BSS makes the BIOS hang with no serial).
+// So the ring/asset region are compile-time empty here. The accessor externs
+// still exist and return 0, keeping the Curlee extern surface identical on
+// both paths (the Curlee gates see a 0-sized region and never activate).
+#define ASSET_REGION_W 0
+#define ASSET_REGION_H 0
+#define FRAME_RING_SLOTS     0
+#define FRAME_RING_MAX_W     0
+#define FRAME_RING_MAX_H     0
+#define FRAME_RING_SLOT_BYTES 0
+static unsigned int asset_region[1];
+static unsigned int frame_ring[1][1];
+#endif
+
+// Ring bookkeeping: the current back-buffer slot (the one render_frame draws
+// into) and whether the ring is active (fb_ring_active). The ring activates
+// on the first fb_present() when the framebuffer fits a slot (Curlee's
+// frame_ring_fits gates the geometry; this flag gates the flip).
+static unsigned int ring_active = 0;
+static unsigned int ring_slot = 0;
+
+// Target indirection: the blitter writes to fb_draw_target (an abstract
+// 32bpp surface with its own stride) instead of the visible framebuffer when
+// the ring is active. Before the first present the target IS the visible
+// framebuffer (fb_addr), preserving 2a/2e single-buffer behavior exactly.
+// fb_target_stride is the byte stride of the active target (fb_pitch for the
+// visible FB, FRAME_RING_MAX_W * 4 for a ring slot).
+static volatile unsigned int* fb_draw_target = 0;
+static unsigned int fb_target_stride = 0;
+
 // kernel/mb2.c — parse the multiboot2 info structure captured by boot.S into
 // the framebuffer globals above. Returns 1 on a usable 32bpp framebuffer tag.
 int mb2_parse(void);
@@ -71,6 +160,66 @@ unsigned long long mb2_info_addr __attribute__((weak)) = 0;
 long long fb_ready(void)
 {
     return (fb_addr != 0) ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2c accessor/geometry externs (called by Curlee render_frame to
+// enforce the verified gates with the RUNTIME sizes)
+// ---------------------------------------------------------------------------
+
+long long fb_get_width(void)
+{
+    return (long long)fb_width;
+}
+
+long long fb_get_height(void)
+{
+    return (long long)fb_height;
+}
+
+long long fb_asset_region_w(void)
+{
+#ifdef JOE_PVH_BOOT
+    return 0;
+#else
+    return ASSET_REGION_W;
+#endif
+}
+
+long long fb_asset_region_h(void)
+{
+#ifdef JOE_PVH_BOOT
+    return 0;
+#else
+    return ASSET_REGION_H;
+#endif
+}
+
+long long fb_asset_region_base(void)
+{
+#ifdef JOE_PVH_BOOT
+    return 0;
+#else
+    return (long long)(unsigned long)asset_region;
+#endif
+}
+
+long long fb_ring_active(void)
+{
+#ifdef JOE_PVH_BOOT
+    return 0;
+#else
+    return ring_active ? 1 : 0;
+#endif
+}
+
+long long fb_ring_slot(void)
+{
+#ifdef JOE_PVH_BOOT
+    return 0;
+#else
+    return (long long)ring_slot;
+#endif
 }
 
 // Phase 2e-2: fb_init() activates the linear framebuffer by parsing the
@@ -89,6 +238,13 @@ long long fb_ready(void)
 void fb_init(void)
 {
     mb2_parse();
+#ifndef JOE_PVH_BOOT
+    // Target indirection: before the frame ring activates, the draw target
+    // IS the visible framebuffer (single-buffer 2a/2e behavior exactly).
+    // fb_present() re-points fb_draw_target at the ring back buffers.
+    fb_draw_target = (volatile unsigned int*)(unsigned long)fb_addr;
+    fb_target_stride = fb_pitch;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -97,12 +253,12 @@ void fb_init(void)
 
 void fb_clear(long long color)
 {
-    if (!fb_addr)
+    if (!fb_draw_target)
     {
         return;
     }
     const unsigned int c = (unsigned int)color;
-    volatile unsigned int* p = (volatile unsigned int*)fb_addr;
+    volatile unsigned int* p = fb_draw_target;
     const unsigned int total = fb_width * fb_height;
     for (unsigned int i = 0; i < total; ++i)
     {
@@ -112,7 +268,7 @@ void fb_clear(long long color)
 
 void fb_pixel(long long x, long long y, long long color)
 {
-    if (!fb_addr)
+    if (!fb_draw_target)
     {
         return;
     }
@@ -121,13 +277,13 @@ void fb_pixel(long long x, long long y, long long color)
         return;
     }
     volatile unsigned int* p =
-        (volatile unsigned int*)(fb_addr + (unsigned int)y * fb_pitch + (unsigned int)x * 4);
+        fb_draw_target + (unsigned int)y * (fb_target_stride / 4) + (unsigned int)x;
     *p = (unsigned int)color;
 }
 
 void fb_fill_rect(long long x, long long y, long long w, long long h, long long color)
 {
-    if (!fb_addr)
+    if (!fb_draw_target)
     {
         return;
     }
@@ -145,7 +301,7 @@ void fb_fill_rect(long long x, long long y, long long w, long long h, long long 
     for (long long py = y0; py < y1; ++py)
     {
         volatile unsigned int* row =
-            (volatile unsigned int*)(fb_addr + (unsigned int)py * fb_pitch);
+            fb_draw_target + (unsigned int)py * (fb_target_stride / 4);
         for (long long px = x0; px < x1; ++px)
         {
             row[(unsigned int)px] = c;
@@ -301,7 +457,7 @@ void fb_draw_char(long long ch, long long x, long long y, long long scale)
 void fb_blit_asset(long long src, long long src_w, long long src_h,
                    long long dst_x, long long dst_y)
 {
-    if (!fb_addr || src == 0)
+    if (!fb_draw_target || src == 0)
     {
         return;
     }
@@ -316,11 +472,11 @@ void fb_blit_asset(long long src, long long src_w, long long src_h,
         return;
     }
     const volatile unsigned int* src_p = (const volatile unsigned int*)(unsigned long)src;
+    const unsigned int tstride = fb_target_stride / 4;
     for (long long py = 0; py < src_h; ++py)
     {
         volatile unsigned int* dst_row =
-            (volatile unsigned int*)(fb_addr + (unsigned int)(dst_y + py) * fb_pitch +
-                                     (unsigned int)dst_x * 4);
+            fb_draw_target + (unsigned int)(dst_y + py) * tstride + (unsigned int)dst_x;
         const volatile unsigned int* src_row = src_p + (unsigned long)py * (unsigned long)src_w;
         for (long long px = 0; px < src_w; ++px)
         {
@@ -333,12 +489,85 @@ void fb_blit_asset(long long src, long long src_w, long long src_h,
 // Present + event loop
 // ---------------------------------------------------------------------------
 
-// No-op until double-buffering lands (Phase 2b). The framebuffer is
-// memory-mapped and writes are immediately visible; fb_present is the
-// extension point for a back-buffer flip.
+// Phase 2c: fb_present() is now a REAL flip when the frame ring is active.
+//
+// Lifecycle:
+//   1. Before the first present, ring_active == 0 and fb_draw_target IS the
+//      visible framebuffer (single-buffer 2a/2e behavior exactly — writes are
+//      immediately visible, fb_present is a no-op).
+//   2. On the first present, if the framebuffer fits a ring slot (Curlee's
+//      frame_ring_fits gates this; here we enforce the same condition with
+//      the C constants), the ring activates: ring_active = 1, and the draw
+//      target re-points at frame_ring[ring_slot] (the back buffer).
+//   3. Every subsequent present copies the CURRENT back buffer onto the
+//      visible framebuffer (a full-frame 32bpp memcpy), then advances
+//      ring_slot via the verified ring arithmetic (frame_ring_next: 0->1->0)
+//      and re-points the target at the new back buffer.
+//
+// The flip is a copy (not a page flip) because the multiboot2 framebuffer is
+// a single linear surface — there is no hardware scanline base to swap. The
+// copy is bounded by fb_width * fb_height * 4 (the visible surface size),
+// which frame_ring_fits guarantees is <= FRAME_RING_MAX_W * MAX_H * 4, so
+// the back buffer is always large enough. No partial writes: the copy only
+// happens after render_frame has fully drawn the back buffer (render_frame
+// calls fb_present last).
 void fb_present(void)
 {
-    // Intentionally empty.
+    if (!fb_addr)
+    {
+        return;
+    }
+
+#ifdef JOE_PVH_BOOT
+    // PVH path: no framebuffer ring (compile-time empty), so present is a
+    // no-op — single-buffer 2a/2e behavior exactly.
+    (void)ring_active;
+    (void)ring_slot;
+    (void)fb_target_stride;
+    return;
+#else
+    if (!ring_active)
+    {
+        // First present: check the framebuffer fits a ring slot (same gate as
+        // Curlee's frame_ring_fits). If not, stay single-buffered forever
+        // (no-op present — preserves 2a/2e behavior on oversized modes).
+        if (fb_width > FRAME_RING_MAX_W || fb_height > FRAME_RING_MAX_H)
+        {
+            return;
+        }
+        ring_active = 1;
+        ring_slot = 0;
+        fb_draw_target = frame_ring[ring_slot];
+        fb_target_stride = FRAME_RING_MAX_W * 4;
+        return;
+    }
+
+    // Ring active: copy the back buffer we just rendered onto the visible
+    // framebuffer, then advance the slot (verified ring arithmetic).
+    const volatile unsigned int* src =
+        (const volatile unsigned int*)fb_draw_target;
+    volatile unsigned int* dst = (volatile unsigned int*)fb_addr;
+    const unsigned int copy_w = fb_width;              // pixels per row
+    const unsigned int copy_h = fb_height;             // rows
+    const unsigned int src_stride = fb_target_stride / 4;
+    const unsigned int dst_stride = fb_pitch / 4;
+    for (unsigned int row = 0; row < copy_h; ++row)
+    {
+        const volatile unsigned int* s = src + (unsigned long)row * src_stride;
+        volatile unsigned int* d = dst + (unsigned long)row * dst_stride;
+        for (unsigned int col = 0; col < copy_w; ++col)
+        {
+            d[col] = s[col];
+        }
+    }
+
+    // Advance: 0 -> 1 -> 0, matching assets.curlee's frame_ring_next /
+    // ring_next exactly for FRAME_RING_SLOTS == 2 (C is free to use %; the
+    // division-free rule applies to the Curlee verifier fragment only).
+    ring_slot = (ring_slot + 1) % FRAME_RING_SLOTS;
+    fb_draw_target = frame_ring[ring_slot];
+    fb_target_stride = FRAME_RING_MAX_W * 4;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -434,9 +663,9 @@ long long fb_tool_drained(void)
 // Loop control (called by Curlee main)
 // ---------------------------------------------------------------------------
 
-// Reset the frame counter and the tool ring (called once by Curlee main
-// before entering the loop). void return to match the Curlee `-> Unit`
-// extern exactly (codegen emits `extern void fb_loop_init(void)`).
+// Reset the frame counter, the tool ring, and the frame ring (called once by
+// Curlee main before entering the loop). void return to match the Curlee
+// `-> Unit` extern exactly (codegen emits `extern void fb_loop_init(void)`).
 void fb_loop_init(void)
 {
     loop_frame = 0;
@@ -448,6 +677,14 @@ void fb_loop_init(void)
         tool_queue[i].kind = 0;
         tool_queue[i].arg = 0;
     }
+#ifndef JOE_PVH_BOOT
+    // Reset the Phase 2c frame ring to single-buffer mode. fb_present() will
+    // re-activate the ring on the first flip of this loop run.
+    ring_active = 0;
+    ring_slot = 0;
+    fb_draw_target = (volatile unsigned int*)(unsigned long)fb_addr;
+    fb_target_stride = fb_pitch;
+#endif
 }
 
 // Current frame counter (the loop's fuel in Curlee main).
@@ -462,8 +699,10 @@ long long fb_loop_frame(void)
 
 // One loop tick: consume (drain) any queued tool intents, then advance the
 // frame counter. The actual render + present happen in Curlee's render_frame
-// (called by main before fb_run_loop); this function is where the C driver
-// would poll input and dispatch drained tool intents in a later phase.
+// (called by main before fb_run_loop; render_frame calls fb_present() last,
+// which performs the Phase 2c back-buffer flip); this function is where the
+// C driver would poll input and dispatch drained tool intents in a later
+// phase.
 //
 // Deterministic + fuel-bounded by design: it never spins; it advances the
 // counter exactly once per call, so the Curlee while-loop is the fuel gate.

@@ -76,7 +76,12 @@ $(KERNEL_ELF): $(MERGED_SRC) $(DRIVER_C) $(VGA_SETUP_C) $(FB_C) $(MB2_C)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(DRIVER_C) -o $(BUILD_DIR)/putc_driver.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_SETUP_C) -o $(BUILD_DIR)/vga_setup.o
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
+	# PVH path (qemu -kernel): compile-time-empty frame ring/asset region
+	# (JOE_PVH_BOOT) so the image stays within QEMU's PVH LOAD budget (a large
+	# BSS silently breaks the PVH entry — see kernel/fb.c header). The GRUB/ISO
+	# path (kernel-grub.elf) compiles WITHOUT this macro and gets the full
+	# ring/asset region, which is where the framebuffer flip actually runs.
+	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
@@ -198,7 +203,7 @@ qemu-smoke: check
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel-smoke.c -o $(BUILD_DIR)/kernel-smoke.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(DRIVER_C) -o $(BUILD_DIR)/putc_driver.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_SETUP_C) -o $(BUILD_DIR)/vga_setup.o
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
+	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
@@ -218,6 +223,8 @@ qemu-smoke: check
 # framebuffer and assert the serial log contains the "FB:" marker — proving
 # the multiboot2 framebuffer plumbing works end-to-end (boot.S saved %ebx,
 # mb2.c parsed the framebuffer tag, fb_ready() returned 1, render_frame ran).
+# Phase 2c: also assert "RING: 1" — the frame ring activated and fb_present()
+# performed a real back-buffer flip during the loop.
 qemu-fb-smoke: $(BUILD_DIR)/joeos-fb.iso
 	rm -f $(BUILD_DIR)/serial-fb.log
 	@timeout 25 qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-fb.iso -boot d -no-reboot \
@@ -227,23 +234,28 @@ qemu-fb-smoke: $(BUILD_DIR)/joeos-fb.iso
 	  && echo "PASS: framebuffer active (fb_ready=1) -> serial: $$(cat $(BUILD_DIR)/serial-fb.log)" \
 	  || (echo "FAIL: FB: marker not in serial log (framebuffer plumbing broken)"; \
 	      echo "serial log: $$(cat $(BUILD_DIR)/serial-fb.log)"; exit 1)
+	@grep -q 'RING: 1' $(BUILD_DIR)/serial-fb.log \
+	  && echo "PASS: frame ring active (fb_present flip ran)" \
+	  || (echo "FAIL: RING: 1 marker not in serial log (frame ring did not flip)"; \
+	      echo "serial log: $$(cat $(BUILD_DIR)/serial-fb.log)"; exit 1)
 
 # Phase 2b gate: boot the FB-mode ISO and assert the 60 FPS loop actually
 # ran the FULL ordered sequence — the serial log must contain, IN ORDER,
 # FR:0, FR:1, FR:2, FR:3 (the deterministic loop renders 4 frames), then
-# FB: 1, then the Phase 1 serial + halt. Grepping the exact ordered sequence
-# (not just individual markers) catches a loop that skips or reorders a frame
+# RING: 1 (Phase 2c: the frame ring flipped — fb_present ran), then FB: 1,
+# then the Phase 1 serial + halt. Grepping the exact ordered sequence (not
+# just individual markers) catches a loop that skips or reorders a frame
 # mid-way, deterministically and within the timeout.
 qemu-loop-smoke: $(BUILD_DIR)/joeos-fb.iso
 	rm -f $(BUILD_DIR)/serial-loop.log
 	@timeout 25 qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-fb.iso -boot d -no-reboot \
 	  -vga std -serial file:$(BUILD_DIR)/serial-loop.log \
 	  -display none || true
-	@grep -Pzo 'FR:0\nFR:1\nFR:2\nFR:3\nFB: 1\nHello World from JOE!\n' \
+	@grep -Pzo 'FR:0\nFR:1\nFR:2\nFR:3\nRING: 1\nFB: 1\nHello World from JOE!\n' \
 	    $(BUILD_DIR)/serial-loop.log > /dev/null \
-	  && echo "PASS: 60 FPS loop ran the full ordered sequence (FR:0..FR:3, FB: 1, Hello World from JOE!) -> serial: $$(cat $(BUILD_DIR)/serial-loop.log)" \
+	  && echo "PASS: 60 FPS loop ran the full ordered sequence (FR:0..FR:3, RING: 1, FB: 1, Hello World from JOE!) -> serial: $$(cat $(BUILD_DIR)/serial-loop.log)" \
 	  || (echo "FAIL: serial log does not contain the exact ordered loop sequence"; \
-	      echo "expected: FR:0 FR:1 FR:2 FR:3 FB: 1 Hello World from JOE!"; \
+	      echo "expected: FR:0 FR:1 FR:2 FR:3 RING: 1 FB: 1 Hello World from JOE!"; \
 	      echo "serial log: $$(cat $(BUILD_DIR)/serial-loop.log)"; exit 1)
 
 # Boot the GRUB ISO under qemu (sanity check for the VirtualBox path).

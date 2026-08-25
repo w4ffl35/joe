@@ -44,6 +44,23 @@ extern fn fb_blit_asset(src: Int, src_w: Int, src_h: Int, dst_x: Int, dst_y: Int
 extern fn fb_present() -> Unit;
 extern fn fb_run_loop() -> Unit;
 
+// Phase 2c — memory & asset management contracts. Accessor/geometry externs
+// (kernel/fb.c owns the static asset region + frame ring; these externs are
+// the runtime window Curlee's render_frame uses to enforce the verified
+// gates with the ACTUAL framebuffer/region sizes):
+//   fb_get_width()/fb_get_height()      -> current framebuffer size
+//   fb_asset_region_w/h()               -> static asset region geometry
+//   fb_asset_region_base()              -> base address of the asset region
+//   fb_ring_active()                    -> 1 when the frame ring is active
+//   fb_ring_slot()                      -> current back-buffer slot index
+extern fn fb_get_width() -> Int;
+extern fn fb_get_height() -> Int;
+extern fn fb_asset_region_w() -> Int;
+extern fn fb_asset_region_h() -> Int;
+extern fn fb_asset_region_base() -> Int;
+extern fn fb_ring_active() -> Int;
+extern fn fb_ring_slot() -> Int;
+
 // Phase 2b 60 FPS loop control + kernel tool-call queue (kernel/fb.c owns the
 // mutable state; these externs are the only window Curlee has into it).
 //   fb_loop_init()      -> reset the frame counter + tool ring
@@ -124,6 +141,22 @@ fn serial_frame_marker(n: Int) -> Unit {
   return;
 }
 
+// Phase 2c marker: "RING: 1" proves the frame ring is active — fb_present()
+// performed a REAL back-buffer flip (ring_active == 1) during the loop. The
+// marker is emitted after the loop when fb_ring_active() reports the ring
+// flipped at least once. Grepped by the qemu-fb-smoke gate alongside "FB:".
+fn serial_ring_marker() -> Unit {
+  curlee_putc(82);   // R
+  curlee_putc(73);   // I
+  curlee_putc(78);   // N
+  curlee_putc(71);   // G
+  curlee_putc(58);   // :
+  curlee_putc(32);   // space
+  curlee_putc(49);   // 1 (ring active)
+  curlee_putc(10);   // newline
+  return;
+}
+
 // One frame of the demo scene. Geometry is computed by the verified pure
 // helpers (from canvas/glyphs/assets, merged in; provably in-bounds); the C
 // blitter executes the pixels.
@@ -133,6 +166,14 @@ fn serial_frame_marker(n: Int) -> Unit {
 // Phase 2b: the scene is frame-index-aware so the demo animates — the panel
 // rectangle cycles its y position between two rows on alternate frames
 // (pure Int math, no mutable state), proving the loop actually re-renders.
+//
+// Phase 2c (memory & asset management contracts): EVERY primitive is gated by
+// the verified pure gate before dispatch — the framebuffer size is read from
+// the extern accessors (fb_get_width/fb_get_height) and passed into the pure
+// gates (rect_fits_gate / line_fits_gate / char_fits_gate), so a deliberately
+// out-of-bounds primitive is SKIPPED (never a partial write). The C blitter
+// additionally bounds-checks as defense-in-depth. fb_clear is full-screen, so
+// it is always in-bounds by construction (no gate needed).
 fn render_frame(pm: cap phys.mem, frame: Int) -> Unit {
   // Bind colors to lets first (the verifier rejects calls as arguments to
   // other calls: "calls are not supported in verification expressions").
@@ -140,7 +181,12 @@ fn render_frame(pm: cap phys.mem, frame: Int) -> Unit {
   let panel: Int = rgb(220, 80, 40);
   let line: Int = rgb(40, 220, 80);
   let white: Int = rgb(255, 255, 255);
-  // Clear to a dark background.
+  // Read the runtime framebuffer size from the C accessors (opaque to the
+  // verifier — these are extern calls, so the gates below are contract-less
+  // and asserted by the VM test; the C blitter double-checks).
+  let fbw: Int = fb_get_width();
+  let fbh: Int = fb_get_height();
+  // Clear to a dark background (full-screen: always in-bounds).
   fb_clear(bg);
   // A panel rectangle. The y position alternates between two rows with the
   // frame index (pure Int math — frame is the loop counter from fb.c, opaque
@@ -148,13 +194,31 @@ fn render_frame(pm: cap phys.mem, frame: Int) -> Unit {
   // modulo (rejected): fold the parity into a subtraction, then scale.
   let panel_parity: Int = frame - (frame / 2) * 2;
   let panel_y: Int = 40 + panel_parity * 60;
-  fb_fill_rect(40, panel_y, 200, 120, panel);
-  // A line under the panel.
-  fb_line(40, 170, 240, 170, line);
-  // "JOE" in 4x-scale glyphs at (60, 60) in white.
-  fb_draw_char_color(74, 60, 60, 4, white);   // J
-  fb_draw_char_color(79, 96, 60, 4, white);   // O
-  fb_draw_char_color(69, 132, 60, 4, white);  // E
+  // Gate the fill rect (200x120 at (40, panel_y)): skip if it doesn't fit.
+  let panel_fits: Bool = rect_fits_gate(200, 120, 40, panel_y, fbw, fbh);
+  if (panel_fits) {
+    fb_fill_rect(40, panel_y, 200, 120, panel);
+  }
+  // Gate the line (1px at y=170 from x=40 to x=240).
+  let line_fits: Bool = line_fits_gate(40, 170, 240, 170, fbw, fbh);
+  if (line_fits) {
+    fb_line(40, 170, 240, 170, line);
+  }
+  // "JOE" in 4x-scale glyphs at (60, 60) in white — gate each char (5*4 x
+  // 7*4 = 20x28 bounding box).
+  let j_fits: Bool = char_fits_gate(60, 60, 4, fbw, fbh);
+  if (j_fits) {
+    fb_draw_char_color(74, 60, 60, 4, white);   // J
+  }
+  let o_fits: Bool = char_fits_gate(96, 60, 4, fbw, fbh);
+  if (o_fits) {
+    fb_draw_char_color(79, 96, 60, 4, white);   // O
+  }
+  let e_fits: Bool = char_fits_gate(132, 60, 4, fbw, fbh);
+  if (e_fits) {
+    fb_draw_char_color(69, 132, 60, 4, white);  // E
+  }
+  // Present the frame (Phase 2c: the ring flip).
   fb_present();
   return;
 }
@@ -198,6 +262,13 @@ fn main(pm: cap phys.mem) -> Unit {
       let drained: Int = fb_tool_drained();
       let pending: Int = fb_tool_pending();
       fb_run_loop();
+    }
+    // After the loop, the frame ring has been exercised (fb_present flipped
+    // each frame). Emit the ring-active marker so the smoke gate can prove
+    // the Phase 2c flip ran (grep "RING: 1" alongside "FB:").
+    let ring_on: Int = fb_ring_active();
+    if (ring_on == 1) {
+      serial_ring_marker();
     }
     serial_fb_marker();
   } else {

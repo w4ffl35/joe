@@ -373,7 +373,7 @@ from the modules. This eliminates the drift risk entirely:
 |-------|-------------|--------|
 | 2a | Software renderer: blitter primitives, text, bitmap/frame blit (THIS SESSION) | ✅ DONE — canvas/glyphs/assets modules (VM-verified), fb.c blitter extensions, merge pipeline, demo scene; all gates pass |
 | 2b | Kernel tool API & 60 FPS event loop | ✅ DONE — Curlee `main` drives the deterministic, fuel-bounded while-loop (4 frames); `fb.c` owns the frame counter + fixed-slot tool ring (no malloc); per-frame `FR:<n>` serial markers; `make qemu-loop-smoke` asserts frames 0..2+ |
-| 2c | Memory & asset management contracts | Blit-fit/ring math (assets.curlee) + C double-checks; static buffers only |
+| 2c | Memory & asset management contracts | ✅ DONE — static asset region (128x128) + 2-slot 640x480 frame ring (fb.c, no malloc); every blit/fill/line/text path gated by verified pure gates (rect_fits_gate/line_fits_gate/char_fits_gate/asset_blit_fits) reading runtime FB size from extern accessors; `fb_present()` performs a REAL flip on the GRUB framebuffer path (`RING: 1` in serial, asserted by qemu-fb-smoke/qemu-loop-smoke); PVH path compiles the ring out (`JOE_PVH_BOOT`) because QEMU's PVH loader rejects ELFs with a large BSS (verified empirically — see fb.c header); all gates green |
 | 2d | LLM bridge (VirtIO-net / TCP + JSON) | Host-side llama.cpp HTTP; kernel JSON module (pure parser, single TU) + net driver in C; out of current scope — needs a NIC driver first |
 | 2e | Framebuffer address plumbing | ✅ DONE — Phase 2e groundwork (mb2.c parser, fb.c blitter, qemu-fb-smoke gate) + **Phase 2e-2** (32-bit multiboot2 entry + framebuffer request tag): `make qemu-fb-smoke` PASSES, serial `FB: 1` proves `fb_ready()==1` under QEMU/VirtualBox |
 | 2f | PVH/VBE framebuffer fallback | ⏳ OPEN — the QEMU `-kernel` (PVH) path has no multiboot2 info, so `fb_ready()` stays 0 there and it falls back to VGA text. A VBE/EDID probe in the C driver (or `qemu -kernel` with a real framebuffer) would activate the renderer on that path too. See `docs/phase2e-2-report.md` §5 |
@@ -420,3 +420,27 @@ All five criteria verified on this branch.
    documented, no malloc. ✅
 
 All six criteria verified (see `docs/phase2-report.md` Phase 2b section).
+
+## 11. Acceptance criteria (Phase 2c — memory & asset management contracts)
+
+1. `make canvas-run` passes with the extended ring/blit assertions
+   (canvas_test.curlee §14–§17: static asset region geometry, 2-slot 640x480
+   frame ring geometry, rect/line/char/asset-blit gates). ✅
+2. Every blit/fill/line/text path in `render_frame` is gated by BOTH the
+   Curlee verified pure gate (rect_fits_gate / line_fits_gate /
+   char_fits_gate, reading the runtime FB size from `fb_get_width`/
+   `fb_get_height`) AND the C bounds check in fb.c — a deliberately
+   out-of-bounds primitive is skipped (never a partial write). ✅
+3. `make qemu-fb-smoke` passes and now ALSO asserts `RING: 1` — the frame
+   ring activated and `fb_present()` performed a real back-buffer flip on the
+   GRUB 640x480 framebuffer path. ✅
+4. `make qemu-loop-smoke` passes with the full ordered sequence
+   `FR:0..FR:3, RING: 1, FB: 1, Hello World from JOE!`. ✅
+5. `make verify` + `make qemu-smoke` still pass (PVH path unchanged — the
+   ring/asset region are compiled out via `JOE_PVH_BOOT` because QEMU's PVH
+   loader rejects ELFs with a large BSS, verified empirically; see fb.c). ✅
+6. No malloc/libc anywhere; all buffers are static arrays (asset_region,
+   frame_ring, tool_queue) with size-validated geometry cross-checked by the
+   VM test. ✅
+
+All six criteria verified (see `docs/phase2e-2-report.md` and the code).

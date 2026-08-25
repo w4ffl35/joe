@@ -198,17 +198,22 @@ OS with a freestanding software renderer targeting the linear framebuffer.
   - [`kernel/glyphs.curlee`](kernel/glyphs.curlee) — 5x7 glyph pixel test +
     text layout math
   - [`kernel/assets.curlee`](kernel/assets.curlee) — blit-fit OOB gate + frame
-    ring-buffer slot math
+    ring-buffer slot math, static asset-region geometry, runtime fit gates
+    (rect/line/char/asset), frame-ring geometry (Phase 2c)
 - **Blitter** ([`kernel/fb.c`](kernel/fb.c)): `fb_clear`, `fb_pixel`,
   `fb_fill_rect`, `fb_line`, `fb_draw_char_color`, `fb_blit_asset`,
   `fb_present`, plus the Phase 2b 60 FPS loop + tool ring
   (`fb_loop_init`/`fb_loop_frame`/`fb_run_loop`/`fb_tool_enqueue`/...).
-  All bounds-checked; the tool ring is a fixed-slot static array (no malloc).
+  All bounds-checked; the tool ring + asset region + frame ring are
+  fixed-slot static arrays (no malloc). Phase 2c: `fb_present()` performs a
+  real back-buffer flip on the GRUB framebuffer path (serial `RING: 1`).
 - **Declarative scene**: `render_frame(frame)` in
   [`kernel/kernel.curlee`](kernel/kernel.curlee) describes one frame (colors
-  bound to `let`s — the verifier rejects calls as call arguments); Curlee's
-  `main` drives the fuel-bounded loop when `fb_ready()` is 1, else falls back
-  to VGA text + serial.
+  bound to `let`s — the verifier rejects calls as call arguments); every
+  primitive is gated by a verified pure gate reading the runtime FB size from
+  `fb_get_width`/`fb_get_height` (out-of-bounds primitives are skipped);
+  Curlee's `main` drives the fuel-bounded loop when `fb_ready()` is 1, else
+  falls back to VGA text + serial.
 
 ### Phase 2 roadmap
 
@@ -216,7 +221,7 @@ OS with a freestanding software renderer targeting the linear framebuffer.
 |-------|-------|--------|
 | 2a | Software renderer: blitter primitives, text, bitmap/frame blit, pure verified math modules | ✅ done |
 | 2b | Kernel tool API & 60 FPS event loop — Curlee `main` drives a fuel-bounded while-loop; `fb.c` owns the frame counter + fixed-slot tool ring; `make qemu-loop-smoke` asserts frames FR:0..FR:2+ | ✅ done |
-| 2c | Memory & asset management contracts (ring-buffer hardening, static buffers) | ⏳ in progress — ring/tool-queue geometry landed in 2b (assets.curlee + VM-asserted) |
+| 2c | Memory & asset management contracts (ring-buffer hardening, static buffers) | ✅ done — static asset region (128x128) + 2-slot 640x480 frame ring (no malloc); every blit/fill/line/text path gated by verified pure gates (OOB primitives skipped); `fb_present()` real flip on the GRUB FB path (serial `RING: 1`); PVH path compiles the ring out (`JOE_PVH_BOOT`) for QEMU's PVH loader limit; canvas_test §14–17 VM-asserts all geometry |
 | 2d | LLM bridge (VirtIO-net/TCP + JSON) — host-side llama.cpp | planned |
 | 2e | Framebuffer address plumbing — 32-bit multiboot2 entry + framebuffer request tag; serial `FB: 1` proves `fb_ready()==1` (`make qemu-fb-smoke`) | ✅ done |
 
