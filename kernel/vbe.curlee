@@ -4,8 +4,9 @@
 // probe, ported from the former kernel/vbe.c (deleted in gh issue #11).
 //
 // Phase 2f: the QEMU `-kernel` (PVH) path has no multiboot2 info structure,
-// so kernel/mb2.c cannot find a framebuffer tag and fb_ready() stays 0 there
-// (VGA text + serial fallback only). This module probes the Bochs VBE
+// so kernel/mb2.curlee's mb2_parse cannot find a framebuffer tag (the info
+// addr reads 0 and the walk no-ops — gh issue #15) and fb_ready() stays 0
+// there (VGA text + serial fallback only). This module probes the Bochs VBE
 // controller — the I/O-port interface (0x1CE/0x1CF) that QEMU's stdvga and
 // VirtualBox's VGA both implement — to:
 //
@@ -17,10 +18,11 @@
 //   (c) validate the mode was accepted by reading the registers back.
 //
 // On success it fills the SAME framebuffer globals (fb_addr/pitch/width/
-// height) that kernel/mb2.c fills from the multiboot2 tag, so the blitter
-// (kernel/fb.c) is unchanged and fb_ready() returns 1.
+// height) that kernel/mb2.curlee's mb2_parse fills from the multiboot2 tag,
+// so the blitter (kernel/fb.c) is unchanged and fb_ready() returns 1.
 //
-// Trust model (matches kernel/mb2.c): fb_ready() must return 1 only for a
+// Trust model (matches the former kernel/mb2.c / the current mb2.curlee):
+// fb_ready() must return 1 only for a
 // VALIDATED framebuffer. Validation here is: Bochs VBE ID present AND the
 // 32bpp LFB mode-set was accepted (register readback matches) AND the LFB
 // base passes a 32-bit MMIO-range sanity gate. Only then do we touch the

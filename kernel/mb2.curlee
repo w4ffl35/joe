@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// mb2.curlee — multiboot2 info structure parser (framebuffer tag), ported
+// from the former kernel/mb2.c (deleted in gh issue #15).
+//
+// Phase 2e: GRUB hands the kernel a multiboot2 info structure whose pointer
+// is passed in %ebx on entry. kernel/boot.S saves that pointer into the .data
+// global `mb2_info_addr` (before zeroing .bss), and this module walks the
+// info structure to find the framebuffer tag (type 8), filling the
+// framebuffer globals that kernel/fb.c's blitter uses. The read is a
+// runtime-address physical read (curlee gh issue #279's phys_read_u* surface)
+// — the info structure lives at a runtime address captured by the boot stub,
+// so a compile-time-literal Phys<T> cannot address it.
+//
+// Multiboot2 info layout (spec):
+//   offset 0: u32 total_size        (whole structure, 8-byte aligned tags)
+//   offset 4: u32 reserved          (must be 0)
+//   offset 8: tags...               each: u32 type, u32 size, payload
+// Framebuffer tag (type 8) payload (packed):
+//   u64 framebuffer_addr
+//   u32 framebuffer_pitch
+//   u32 framebuffer_width
+//   u32 framebuffer_height
+//   u8  bpp
+//   u8  type (0=indexed, 1=RGB, 2=EGA text)
+//   ... reserved ...
+//
+// Only 32bpp linear framebuffers are supported (the blitter writes U32s).
+//
+// Port notes:
+//   - The mutable cursor (`p`) is plain assignment (curlee gh issue #268);
+//     the `(size + 7) & ~7` tag-alignment math is direct bitwise-op
+//     translation (#270). `~7` is Int -8 (two's complement); for the
+//     non-negative `size + 7` (size is a u32 bounded by total_size, itself
+//     gated to <= 0x10000) `x & ~7` rounds down to the next multiple of 8,
+//     identical to C's `(size + 7) & ~7U`.
+//   - The framebuffer address is read as TWO u32s (low word at +8, high word
+//     at +12) instead of one u64: the C original truncated the u64 to the
+//     u32 `fb_addr` global, and the packed-struct read does not exist — the
+//     per-field runtime-Phys reads are the #279 pattern. The usable gate is
+//     `bpp == 32 && addr_hi == 0 && addr_lo != 0` — exactly the C gate
+//     (`t->fb_addr != 0`) for every real GRUB framebuffer (always < 4 GiB),
+//     and strictly saner for a pathological tag whose high dword is non-zero
+//     while the low dword is 0 (C would return 1 with an unusable fb_addr=0).
+//   - `phys_read_u8`/`phys_read_u32` are declared extern here and DEFINED in
+//     kernel/mb2_state.c as raw volatile loads (the second pillar of the C
+//     boundary policy: "I/O touches and raw memory moves" — docs/
+//     c-boundary-policy.md §1). The curlee runtime (rt.c) does not carry the
+//     symbols in the current toolchain build, so the raw memory move lives
+//     with the rest of the mb2 state shim, mirroring vbe_state.c (gh #11).
+//
+// Trust model (matches the C original): the boot info pointer is TRUSTED —
+// it comes from the 32-bit multiboot2 entry's %ebx (spec-guaranteed), stored
+// by boot.S before curlee_main. The guard is minimal: non-zero and within
+// the 32-bit address space (GRUB places the structure right after the kernel
+// image, e.g. 0x109A78 for a kernel loaded at 0x100000 — NOT below 1 MiB).
+// The C original compared the u64 global UNSIGNED (`mb2_info_addr >=
+// 0x100000000ULL`), which also rejects any value with bit 63 set; the signed
+// Int getter renders those negative, so the gate below adds `base < 0` to
+// keep the exact C semantics (a negative base would otherwise dereference a
+// wild address in phys_read_u32). The total_size check below bounds every
+// walk, so a bad pointer can never run away. The framebuffer tag is
+// additionally gated (32bpp AND non-zero address) as defense-in-depth
+// against a bogus tag from a corrupt info.
+//
+// Design laws honored:
+//   - Single address space, Ring 0: phys_read_u* are direct volatile loads
+//     from physical memory (identity-mapped, exactly like the VGA text
+//     buffer at 0xB8000).
+//   - Deterministic verification: `curlee check mb2.curlee` runs standalone
+//     and the merged kernel re-verifies it (`make check`).
+//   - Minimal footprint: no libc, no String/Vec; the walk is ~40 lines.
+
+// Provided by kernel/mb2_state.c:
+//   - mb2_info_addr_get() reads the .data global `mb2_info_addr` that
+//     kernel/boot.S fills from %ebx on the GRUB path (0 on the PVH path via
+//     kernel/fb.c's weak default).
+//   - mb2_state_set() fills the framebuffer globals fb_addr/fb_pitch/
+//     fb_width/fb_height (C-visible .data owned by kernel/fb.c; Curlee has
+//     no globals and no way to address C globals — the vbe_state.c pattern).
+//   - phys_read_u8()/phys_read_u32() — runtime-address physical reads
+//     (curlee #279); raw volatile loads, opaque to the verifier.
+extern fn mb2_info_addr_get() -> Int;
+extern fn mb2_state_set(addr: U32, pitch: U32, width: U32, height: U32) -> Unit;
+extern fn phys_read_u8(addr: Int) -> U8;
+extern fn phys_read_u32(addr: Int) -> U32;
+
+// Parse the multiboot2 info structure at mb2_info_addr and fill the
+// framebuffer globals. Returns 1 if a 32bpp framebuffer tag was found and
+// the globals were set; 0 otherwise (no info, or no usable framebuffer tag).
+// The reads are opaque to the verifier (runtime-address physical reads, no
+// axioms), so this function is contract-less — the trust gates (non-zero
+// address, < 4 GiB, total_size bounds, size != 0, 8-byte alignment) are the
+// same ones the C original enforced, ported verbatim.
+fn mb2_parse(pm: cap phys.mem) -> Int {
+  let base: Int = mb2_info_addr_get();
+  // Same trust gate as the C original (`mb2_info_addr == 0 ||
+  // mb2_info_addr >= 0x100000000ULL`, an UNSIGNED u64 comparison). The
+  // getter casts the u64 global to a signed Int, so a value with bit 63 set
+  // arrives NEGATIVE — `base < 0` restores the exact C rejection for those
+  // BEFORE any physical read (a wild dereference at (uintptr_t)-1 would
+  // otherwise follow).
+  if (base < 0 || base == 0 || base >= 4294967296) {   // >= 0x100000000 (4 GiB)
+    return 0;
+  }
+  unsafe {
+    let total: U32 = phys_read_u32(base);  // total_size field
+    if (total < 16 || total > 65536) {     // 0x10000
+      return 0;
+    }
+    let end: Int = base + total;
+    // Skip total_size + reserved; walk 8-byte-aligned tags from offset 8.
+    let p: Int = base + 8;
+    while (p + 8 <= end) {
+      let tag_type: U32 = phys_read_u32(p);       // tag header word 1
+      let tag_size: U32 = phys_read_u32(p + 4);   // tag header word 2
+      if (tag_size == 0) {
+        return 0;   // malformed guard (C broke out of the loop -> return 0)
+      } else {
+        if (tag_type == 8) {
+          // Framebuffer tag (type 8), packed per spec 3.6.7.
+          let addr_lo: U32 = phys_read_u32(p + 8);
+          let addr_hi: U32 = phys_read_u32(p + 12);
+          let pitch: U32 = phys_read_u32(p + 16);
+          let width: U32 = phys_read_u32(p + 20);
+          let height: U32 = phys_read_u32(p + 24);
+          let bpp: U8 = phys_read_u8(p + 28);
+          // Only refine the framebuffer state when the tag is genuinely
+          // usable: 32bpp AND a non-zero framebuffer address (defense-in-
+          // depth against a bogus tag from a corrupt info).
+          if (bpp == 32 && addr_hi == 0 && addr_lo != 0) {
+            mb2_state_set(addr_lo, pitch, width, height);
+            return 1;
+          }
+          return 0;   // framebuffer tag present but not usable
+        } else {
+          // Tags are 8-byte aligned: advance by (size + 7) & ~7.
+          let aligned: Int = (tag_size + 7) & ~7;
+          p = p + aligned;
+        }
+      }
+    }
+  }
+  return 0;
+}

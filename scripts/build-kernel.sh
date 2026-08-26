@@ -13,11 +13,13 @@
 #
 # Order matters (dependencies first): canvas.curlee -> glyphs.curlee ->
 # assets.curlee -> json.curlee -> serial.curlee -> vga_setup.curlee ->
-# vbe.curlee -> net_stack.curlee -> net_glue.curlee -> kernel.curlee. Each
-# pure module contains NO `main`, so the merged file has exactly one `main`
-# (from kernel.curlee). All modules are already individually verified by
-# `make check` (net_glue.curlee is verified via the merged file, like
-# kernel.curlee — it calls net_stack.curlee's functions).
+# vbe.curlee -> net_stack.curlee -> net_glue.curlee -> mb2.curlee ->
+# kernel.curlee. Each pure module contains NO `main`, so the merged file has
+# exactly one `main` (from kernel.curlee). All modules are already
+# individually verified by `make check` (net_glue.curlee and mb2.curlee are
+# verified via the merged file too — the glue calls net_stack.curlee's
+# functions and kernel.curlee's main calls mb2.curlee's mb2_parse; both are
+# checked standalone as well).
 #
 # When the Curlee codegen import fix lands, this script is deleted and
 # kernel.curlee imports the modules natively.
@@ -41,6 +43,7 @@ MODULES=(
   "$ROOT/kernel/vbe.curlee"
   "$ROOT/kernel/net_stack.curlee"
   "$ROOT/kernel/net_glue.curlee"
+  "$ROOT/kernel/mb2.curlee"
   "$ROOT/kernel/kernel.curlee"
 )
 
@@ -63,7 +66,7 @@ done
   echo "// and re-run the merge. When the Curlee codegen import bug is fixed,"
   echo "// this script is deleted and kernel.curlee imports the modules."
   echo "//"
-  echo "// Modules (in dependency order): canvas, glyphs, assets, json, serial, vga_setup, vbe, net_stack, net_glue, kernel."
+  echo "// Modules (in dependency order): canvas, glyphs, assets, json, serial, vga_setup, vbe, net_stack, net_glue, mb2, kernel."
   echo
   for f in "${MODULES[@]}"; do
     echo "// ==== $(basename "$f") ===="

@@ -17,8 +17,10 @@
 //     (CS/DS base 0, limit 0xFFFFFFFF) and paging disabled.
 //
 // This stub captures %ebx into the .data global mb2_info_addr (which
-// kernel/mb2.c parses to find the framebuffer tag), zeroes .bss, sets the
-// stack, calls curlee_main, and halts. No GDT or page tables are needed: the
+// kernel/mb2.curlee's mb2_parse reads through kernel/mb2_state.c's
+// mb2_info_addr_get to find the framebuffer tag — gh issue #15), zeroes .bss,
+// sets the stack, calls curlee_main, and halts. No GDT or page tables are
+// needed: the
 // multiboot2 handoff already provides flat 32-bit segments with paging off,
 // so the kernel addresses physical memory directly (same model as the VGA
 // text buffer at 0xB8000).
@@ -41,7 +43,8 @@ multiboot2_header:
     /* Framebuffer request tag (type 5): ask GRUB for a 640x480x32 linear
        framebuffer. The bootloader sets this mode before entry (independent
        of gfxterm), so the multiboot2 info structure's framebuffer tag
-       (type 8) reports a real LFB that mb2.c can parse (bpp == 32). */
+       (type 8) reports a real LFB that mb2.curlee's mb2_parse finds
+       (bpp == 32 — gh issue #15). */
     .word 5          /* type: framebuffer request */
     .word 0          /* flags */
     .long 20         /* size: width + height + depth */
@@ -98,7 +101,9 @@ _start:
 .size _start, . - _start
 
 /* .data global holding the multiboot2 info pointer (set from %ebx above;
-   read by kernel/mb2.c as unsigned long long). */
+   read by kernel/mb2_state.c's mb2_info_addr_get as unsigned long long —
+   gh issue #15). The weak default in kernel/fb.c (0, for the PVH path) is
+   overridden by this strong definition on the GRUB/ISO path. */
 .section .data
 .global mb2_info_addr
 .balign 8

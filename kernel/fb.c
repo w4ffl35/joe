@@ -62,10 +62,12 @@
 // fb_height (defense-in-depth over the Curlee geometry layer, which is
 // provably in-bounds). Out-of-bounds writes are impossible by construction.
 
-// Framebuffer state. NON-static so kernel/mb2.c (the multiboot2 parser) can
-// fill them from the trusted framebuffer tag captured by the 32-bit boot stub.
-// The blitter below reads them. Zero until fb_init() parses the multiboot2
-// framebuffer tag.
+// Framebuffer state. NON-static so kernel/mb2_state.c (the Curlee
+// mb2_parse's raw state shim, gh issue #15) and kernel/vbe_state.c (the
+// Curlee vbe_probe's shim, gh issue #11) can fill them from the trusted
+// framebuffer tag captured by the 32-bit boot stub. The blitter below reads
+// them. Zero until the multiboot2 framebuffer tag (GRUB path) or the Bochs
+// VBE probe (PVH path) is parsed.
 unsigned int fb_addr = 0;
 unsigned int fb_pitch = 0;
 unsigned int fb_width = 0;
@@ -149,22 +151,25 @@ static unsigned int ring_slot = 0;
 static volatile unsigned int* fb_draw_target = 0;
 static unsigned int fb_target_stride = 0;
 
-// kernel/mb2.c — parse the multiboot2 info structure captured by boot.S into
-// the framebuffer globals above. Returns 1 on a usable 32bpp framebuffer tag.
-int mb2_parse(void);
-
+// The multiboot2 info structure parser is PORTED TO CURLEE in gh issue #15
+// (kernel/mb2.curlee, `mb2_parse`) — C can no longer call it: the codegen
+// emits it as a static `curlee_mb2_parse` symbol and the C boundary policy
+// forbids C calling up (docs/c-boundary-policy.md §2). Curlee main now drives
+// the parse itself and calls fb_wire_draw_target() after it. The parser fills
+// the SAME framebuffer globals as the old mb2_parse() via the raw state shim
+// kernel/mb2_state.c (`mb2_state_set` + `mb2_info_addr_get` + the
+// runtime-address `phys_read_u*` reads — curlee gh issue #279).
+//
 // Phase 2f Bochs VBE probe (QEMU stdvga / VirtualBox) used on the PVH path,
 // where there is no multiboot2 info structure. PORTED TO CURLEE in gh issue
-// #11 (kernel/vbe.curlee, `vbe_probe`) — C can no longer call it: the codegen
-// emits it as a static `curlee_vbe_probe` symbol and the C boundary policy
-// forbids C calling up (docs/c-boundary-policy.md §2). Curlee main now drives
-// the probe itself and calls fb_wire_draw_target() after it (see fb_init).
-// The probe fills the SAME framebuffer globals as mb2_parse() via the raw
-// state shim kernel/vbe_state.c (`vbe_state_set`).
+// #11 (kernel/vbe.curlee, `vbe_probe`) — C can no longer call it either; the
+// probe fills the SAME framebuffer globals as mb2_parse() via the raw state
+// shim kernel/vbe_state.c (`vbe_state_set`).
 
-// Weak defaults so the QEMU PVH path (which links crt0.S, not boot.S) still
+// Weak default so the QEMU PVH path (which links crt0.S, not boot.S) still
 // links; boot.S's strong .data definition overrides this when present.
-// mb2.c reads it to find the multiboot2 framebuffer tag (best-effort).
+// kernel/mb2_state.c's mb2_info_addr_get() reads it to find the multiboot2
+// framebuffer tag (best-effort; 0 on the PVH path).
 unsigned long long mb2_info_addr __attribute__((weak)) = 0;
 
 long long fb_ready(void)
@@ -232,33 +237,11 @@ long long fb_ring_slot(void)
 #endif
 }
 
-// Phase 2e-2: fb_init() activates the linear framebuffer by parsing the
-// TRUSTED multiboot2 info structure captured by the 32-bit boot stub.
-//
-// GRUB enters a 32-bit ELF (kernel-grub.elf, as --32 + ld -m elf_i386) in
-// 32-bit protected mode with %ebx = the boot info pointer (spec-guaranteed),
-// which boot.S stores into mb2_info_addr. mb2_parse() walks that structure,
-// finds the framebuffer tag (type 8), and fills fb_addr/pitch/width/height.
-//
-// No hardcoded VBE address is used: writing an LFB constant when no gfxterm
-// framebuffer is actually mapped faults the VM (docs/phase2e-architecture.md
-// §7 finding 4). Order of sources, most trusted first:
-//   (a) multiboot2 info structure (GRUB path): the 32-bit boot stub captures
-//       %ebx into mb2_info_addr; mb2_parse() walks the structure and finds
-//       the framebuffer tag (type 8) — the single source of truth.
-//   (b) Bochs VBE probe (QEMU `-kernel` PVH path, Phase 2f): no multiboot2
-//       info exists, so the Curlee `vbe_probe` (kernel/vbe.curlee, gh issue
-//       #11) programs 640x480x32 via the Bochs VBE I/O interface (ports
-//       0x1CE/0x1CF) and fills the same framebuffer globals. Only a
-//       VALIDATED framebuffer (VBE ID present + mode readback matches +
-//       address range gate) is accepted.
-// When neither source yields a framebuffer, fb_ready() stays 0 and the
-// kernel falls back to VGA text + serial (all gates green).
-//
-// Wire the draw target to the visible framebuffer. Before the frame ring
-// activates, the draw target IS the visible framebuffer (single-buffer 2a/2e
-// behavior exactly); fb_present() re-points fb_draw_target at the ring back
-// buffers on the GRUB path (where the ring is compiled in).
+// Phase 2e-2: wire the draw target to the visible framebuffer. Before the
+// frame ring activates, the draw target IS the visible framebuffer
+// (single-buffer 2a/2e behavior exactly); fb_present() re-points
+// fb_draw_target at the ring back buffers on the GRUB path (where the ring
+// is compiled in).
 //
 // Phase 2f: this MUST run on the PVH path too. The previous #ifndef
 // JOE_PVH_BOOT guard compiled this block OUT under qemu -kernel, so even
@@ -269,10 +252,15 @@ long long fb_ring_slot(void)
 // (multiboot2 tag) and PVH (VBE probe) both land here, and the GRUB ring
 // flip behavior is unchanged (ring_active gates the flip).
 //
-// gh issue #11: fb_init() calls this once after mb2_parse(); Curlee main
-// calls it AGAIN after the Curlee vbe_probe fills the globals on the PVH
-// path (fb_init's own call ran while fb_addr was still 0, so the draw target
-// would otherwise stay unwired).
+// gh issue #15: the old fb_init() is GONE — its only logic was "parse the
+// multiboot2 tag, then wire the draw target", and both halves now live in
+// the Curlee layer (the parse is `mb2_parse` in kernel/mb2.curlee, ported
+// from kernel/mb2.c; the wire is this function). Curlee main calls
+// mb2_parse(pm) itself (the multiboot2 tag always wins on the GRUB path),
+// then calls this once; and calls it AGAIN after the Curlee vbe_probe fills
+// the globals on the PVH path (the first call ran while fb_addr was still
+// 0, so the draw target would otherwise stay unwired — the gh issue #11
+// pattern).
 void fb_wire_draw_target(void)
 {
     if (fb_addr != 0)
@@ -280,23 +268,6 @@ void fb_wire_draw_target(void)
         fb_draw_target = (volatile unsigned int*)(unsigned long)fb_addr;
         fb_target_stride = fb_pitch;
     }
-}
-
-// gh issue #11: fb_init() no longer calls vbe_probe() — it moved to Curlee,
-// and the codegen emits it as a static `curlee_vbe_probe` symbol the C layer
-// must not call (C boundary policy). Curlee main runs fb_init() first (the
-// multiboot2 tag always wins on the GRUB path), then calls vbe_probe(pm)
-// itself when fb_ready()==0 AND the PVH build marker reads 0 (the former
-// #ifdef JOE_PVH_BOOT gate, expressed via fb_asset_region_w()), then calls
-// fb_wire_draw_target() to re-point the draw target once the probe filled
-// the globals.
-void fb_init(void)
-{
-    if (mb2_parse())
-    {
-        /* GRUB multiboot2 framebuffer tag is the single source of truth. */
-    }
-    fb_wire_draw_target();
 }
 
 // ---------------------------------------------------------------------------
