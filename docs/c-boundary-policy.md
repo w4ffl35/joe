@@ -32,7 +32,12 @@ C exists for exactly two reasons in JOE:
    the VBE probe fills (`fb_addr/pitch/width/height`) are C-visible `.data`
    state owned by `fb.c`, and Curlee has no globals, so those four stores
    stay in C as a raw state shim (`vbe_state.c`, issue #11) — same class as
-   `vga_text_clear.c`'s memory move.
+   `vga_text_clear.c`'s memory move. The 1056-line TCP/IP stack
+   (`net_stack.c`) migrated in issue #12: the protocol logic became
+   `net_stack.curlee` (pure, VM-verified) + the kernel.curlee glue, and the
+   file is now a raw-state shim in the same class — the mutable one-shot
+   connection state and the 256-byte response byte store Curlee cannot own
+   (no globals, no arrays), with no protocol logic left.
 
 Everything else — parsers, protocol logic, checksums, layout math, glyph
 tables, geometry — belongs in the **pure, verified Curlee layer**
@@ -40,17 +45,21 @@ tables, geometry — belongs in the **pure, verified Curlee layer**
 
 The pattern is already proven: `json.curlee` is a 692-line pure parser that
 was deliberately written in Curlee (not C), VM-tested, and codegen-verified.
-The network protocol logic in `net_stack.c` and the multiboot2 parser in
-`mb2.c` are the *same class of code* and should migrate to Curlee as the
-language gains assignment + bitwise ops (see §4).
+The network protocol logic in `net_stack.c` followed in issue #12 — the full
+ARP/IPv4/TCP byte layout, the RFC 1071/793 checksums and the HTTP framing
+state machine are now `net_stack.curlee` (pure, VM-verified against the C
+ground truth) plus the kernel.curlee glue. The multiboot2 parser in `mb2.c`
+is the *same class of code* and should migrate as the language gains
+assignment (see §4).
 
 ## 2. What "no logic" means concretely (review checklist)
 
 A C file **violates** the policy if it contains:
 
 - **Protocol/format logic** — big-endian header packing, checksums, length
-  framing, field parsing. (`net_stack.c`'s ARP/IPv4/TCP byte layout is the
-  canonical violation; `mb2.c`'s tag walk is a parser.)
+  framing, field parsing. (`net_stack.c`'s ARP/IPv4/TCP byte layout was the
+  canonical violation — migrated to `net_stack.curlee` in issue #12;
+  `mb2.c`'s tag walk is a parser.)
 - **Pure data tables** — glyph bitmaps, lookup tables, color palettes.
   (`fb.c` carried a 5x7 glyph table duplicate until 2026-08 — deleted; the
   authoritative copy is `glyphs.curlee`.)
@@ -78,11 +87,14 @@ The current offenders (grandfathered, tracked for migration):
 
 | File | Lines | Pure-logic estimate | Migrate when |
 |---|---|---|---|
-| `net_stack.c` | 1056 | ~700 (protocol) | Curlee gains assignment + bitwise |
 | `virtio_net.c` | 798 | ~300 (ring math) | Curlee gains assignment + port I/O |
 | `fb.c` | ~680 | ~150 (Bresenham, loops) | Curlee gains assignment |
 | `mb2.c` | 116 | ~80 (tag walk) | Curlee gains assignment + bitwise |
 | `libgcc32.c` | 322 | 0 (compiler shim) | never (GCC ABI) |
+
+(`net_stack.c` is gone from this table: its ~700 lines of protocol logic
+migrated to `net_stack.curlee` + the kernel.curlee glue in issue #12, and
+the file is now a ~110-line raw-state shim in the exempt category above.)
 
 ## 4. Migration roadmap (what unblocks what)
 
@@ -90,7 +102,7 @@ The C surface collapses to a thin I/O shim once three Curlee features land
 (tracked as GitHub issues in `w4ffl35/curlee`):
 
 1. **Assignment / affine mutation** — unblocks `fb.c` (blitter loops),
-   `mb2.c` (tag walk), the state machines in `net_stack.c`/`virtio_net.c`.
+   `mb2.c` (tag walk), the state machines in `virtio_net.c`.
 2. **Port I/O (`outb`/`inb`/`outw`/`inw`/`outl`/`inl`)** — unblocks the
    PCI config half of `virtio_net.c`.
    `putc_driver.c` migrated first on this feature (issue #9, now
@@ -100,8 +112,11 @@ The C surface collapses to a thin I/O shim once three Curlee features land
    the globals-write half of the raw-state category above). A
    **runtime-address physical write** (the `phys_read_u*` counterpart) would
    additionally unblock the `vga_text_clear.c` raw memory move.
-3. **Bitwise ops + shifts** — unblocks big-endian packing in `net_stack.c`,
-   checksums, descriptor flags, and alignment math in `mb2.c`.
+3. **Bitwise ops + shifts** — unblocked big-endian packing, checksums,
+   descriptor flags, and alignment math. Landed in the compiler ahead of
+   issue #12, which used it to migrate the whole `net_stack.c` protocol core
+   (byte layout, RFC 1071/793 checksums, the HTTP framing state machine) to
+   `net_stack.curlee` — only the raw-state shim remains in C.
 
 Until then, **do not add new pure logic to C**. If a feature needs pure
 logic, write it as a Curlee module (even if the driver can't yet be

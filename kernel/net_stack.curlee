@@ -1,0 +1,1591 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// net_stack.curlee — Phase 2d-2 TCP/IP stack: PURE protocol core (gh issue #12).
+//
+// This is the Curlee half of the former kernel/net_stack.c (1056 lines of C,
+// now reduced to a raw state/byte-store shim). Everything here is PURE and
+// extern-free:
+//   - big-endian 16/32-bit byte extraction (the ns_wr16/wr32/rd16/rd32
+//     pattern, bitwise — curlee issue #270)
+//   - the IPv4 header byte layout + Internet checksum (RFC 1071)
+//   - the TCP segment byte layout + pseudo-header checksum (RFC 793)
+//   - the fixed wire-shape HTTP request payload (docs/phase2d-wire.md §3:
+//     121-byte header + the 36-byte {"tool":"frame_tick","args":[0,1,2]}
+//     body, no trailing newline)
+//   - the ARP request frame bytes (RFC 826)
+//   - the slirp gateway MAC constant (52:55:0a:00:02:02 — the gateway is
+//     resolved by CONSTANT, the LOCKED 2d-2 behavior) and the full TCP wire
+//     frame composition (Ethernet II + IPv4 + TCP, tcp_frame_byte — what the
+//     C ns_tcp_send_segment staged into the TX buffer)
+//   - the streaming HTTP response state machine (Content-Length framing,
+//     the 256-byte cap + truncation path — wire doc §3.2/§4)
+//
+// WHY PURE (language constraints, verified against the compiler at this
+// workspace's commit sha=a8363761):
+//   - Curlee has NO module-level globals and NO function-static state: a
+//     function-local `let` resets on every call (verified: a counter returns
+//     1, not 2, across calls; codegen emits plain C locals). Cross-call state
+//     therefore cannot live in Curlee — it lives in the C shim
+//     (kernel/net_stack.c) and flows in/out through the net_state_* /
+//     net_resp_* externs declared in kernel.curlee.
+//   - Curlee has NO arrays (the fixed-size array feature, curlee #278, is NOT
+//     in this compiler build — `[T; N]` is rejected). The 512-byte TX frame,
+//     the 256-byte response body and the header scan buffer therefore cannot
+//     be Curlee data. The TX frame is replaced by per-offset byte functions
+//     (this module) staged one byte at a time through net_tx_stage_byte; the
+//     response body stays in a C raw byte store (net_resp_* externs); the
+//     header buffer is eliminated entirely by a streaming per-byte
+//     Content-Length matcher (the json.curlee per-byte state-machine idiom).
+//   - No structs in fn signatures/returns (verified: `-> Pair` is rejected),
+//     so multi-value results are packed into one Int (the json.curlee packed-
+//     state pattern, but with bitwise shifts instead of multiply/divide).
+//
+// VM-testable: this file is extern-free, so `curlee run` can drive the
+// checksums, byte layout and HTTP state machine with the EXACT wire bytes the
+// former C implementation emitted (kernel/net_stack_test.curlee asserts them;
+// the expected constants were captured from the C code with a host harness).
+// kernel/net_glue.curlee (merged after this module) supplies the extern-heavy
+// glue — genuine Curlee net_connect/net_send/net_stack_poll/
+// net_response_len/net_response_byte — and kernel/net_stack.c is reduced to a
+// raw state/byte-store shim (net_state_*/net_resp_*/net_poll_* externs).
+// scripts/run-net-stack-codegen.sh host-tests the glue + this core against a
+// scripted NIC (the json-codegen-run precedent).
+//
+// Bit layout of the HTTP response state (one packed Int; see http_step):
+//   bit 0      hdr_done (1 = header phase over, body phase active)
+//   bit 1      prev_cr (saw '\r', expecting '\n')
+//   bit 2      line_had_content (current header line has non-CRLF bytes)
+//   bits 3..7  cl_match (Content-Length matcher position 0..17:
+//              0..14 = matched chars of "content-length", 15 = after ':' in
+//              the space-skip phase, 16 = accumulating digits, 17 = done)
+//   bits 8..28 content_length + 1 (0 = no Content-Length seen; the +1 makes
+//              the -1 sentinel packable)
+//   bits 29..37 resp_len (body bytes stored so far, 0..256)
+//   bit 38     truncated (Content-Length > 256, or 256-cap hit without
+//              Content-Length satisfied)
+//   bits 39..40 action (http_step return: 0 = keep reading, 1 = body
+//              complete, 2 = truncated — the poll maps 2 to net_stack_poll
+//              result 3). Stored back into the slot but ignored on the next
+//              step.
+//
+// All literals are DECIMAL (hex is only valid inside phys<>(); verified at
+// this compiler commit). Comments give the hex/ASCII form.
+
+// ---------------------------------------------------------------------------
+// Big-endian byte helpers (the ns_wr16/ns_wr32 byte-extraction pattern).
+// ---------------------------------------------------------------------------
+
+// High byte of a 16-bit value (ns_wr16 p[0]).
+fn be16_hi(v: Int) -> Int {
+  return (v >> 8) & 255;
+}
+
+// Low byte of a 16-bit value (ns_wr16 p[1]).
+fn be16_lo(v: Int) -> Int {
+  return v & 255;
+}
+
+// Byte k (0..3, big-endian) of a 32-bit value (ns_wr32 p[k]).
+fn be32_k(v: Int, k: Int) -> Int {
+  if (k == 0) {
+    return (v >> 24) & 255;
+  } else {
+    if (k == 1) {
+      return (v >> 16) & 255;
+    } else {
+      if (k == 2) {
+        return (v >> 8) & 255;
+      } else {
+        return v & 255;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// IPv4 header (RFC 791): the 20 header bytes + the header checksum.
+// Fixed one-shot fields (LOCKED): 0x45 version/IHL, DSCP 0, identification
+// 0x1234 (4660), flags DF + frag 0 (0x4000 = 16384), TTL 64, proto TCP 6,
+// src 10.0.2.15, dst 10.0.2.2. The total-length field (bytes 2..3) is
+// 20 + tcp_len, so the header is a pure function of tcp_len.
+// ---------------------------------------------------------------------------
+
+// Header byte at offset i (0..19) with the checksum field ZEROED — the input
+// to ip_checksum().
+fn ip_byte_ck(i: Int, tcp_len: Int) -> Int {
+  let total: Int = 20 + tcp_len;
+  if (i == 0) {
+    return 69;             // 0x45: v4 + 5 words
+  } else {
+    if (i == 1) {
+      return 0;            // DSCP/ECN
+    } else {
+      if (i == 2) {
+        return (total >> 8) & 255;
+      } else {
+        if (i == 3) {
+          return total & 255;
+        } else {
+          if (i == 4) {
+            return 18;     // 0x1234 identification: high byte
+          } else {
+            if (i == 5) {
+              return 52;   // 0x1234: low byte
+            } else {
+              if (i == 6) {
+                return 64; // 0x4000 flags DF: high byte
+              } else {
+                if (i == 7) {
+                  return 0;
+                } else {
+                  if (i == 8) {
+                    return 64;   // TTL
+                  } else {
+                    if (i == 9) {
+                      return 6;  // proto TCP
+                    } else {
+                      if (i == 10) {
+                        return 0;  // checksum field: zero for the sum
+                      } else {
+                        if (i == 11) {
+                          return 0;
+                        } else {
+                          if (i == 12) {
+                            return 10;   // src IP 10.0.2.15
+                          } else {
+                            if (i == 13) {
+                              return 0;
+                            } else {
+                              if (i == 14) {
+                                return 2;
+                              } else {
+                                if (i == 15) {
+                                  return 15;
+                                } else {
+                                  if (i == 16) {
+                                    return 10;  // dst IP 10.0.2.2
+                                  } else {
+                                    if (i == 17) {
+                                      return 0;
+                                    } else {
+                                      if (i == 18) {
+                                        return 2;
+                                      } else {
+                                        if (i == 19) {
+                                          return 2;
+                                        } else {
+                                          return 0;
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Header byte at offset i (0..19) for the WIRE frame, with the computed
+// checksum ck in bytes 10..11.
+fn ip_byte_frame(i: Int, tcp_len: Int, ck: Int) -> Int {
+  if (i == 10) {
+    return (ck >> 8) & 255;
+  } else {
+    if (i == 11) {
+      return ck & 255;
+    } else {
+      return ip_byte_ck(i, tcp_len);
+    }
+  }
+}
+
+// Internet checksum (RFC 1071) of the 20-byte IPv4 header for a segment of
+// tcp_len bytes. Ones-complement sum of 10 big-endian words, folded per word
+// (exactly like the C ns_checksum), final 16-bit fold, then the bitwise
+// complement: result = 65535 - sum (equivalent to (unsigned short)~sum).
+// Pure and deterministic; VM-asserted in net_stack_test.curlee
+// (ip_checksum(20) == 4236, ip_checksum(177) == 4079 — the C ground truth).
+fn ip_checksum(tcp_len: Int) -> Int {
+  let sum: Int = 0;
+  let i: Int = 0;
+  while (i + 1 < 20) {
+    let hi: Int = ip_byte_ck(i, tcp_len);
+    let lo: Int = ip_byte_ck(i + 1, tcp_len);
+    sum = sum + hi * 256 + lo;
+    if (sum > 65535) {
+      sum = (sum & 65535) + (sum >> 16);
+    }
+    i = i + 2;
+  }
+  while ((sum >> 16) != 0) {
+    sum = (sum & 65535) + (sum >> 16);
+  }
+  return 65535 - (sum & 65535);
+}
+
+// ---------------------------------------------------------------------------
+// Fixed HTTP request payload (docs/phase2d-wire.md §3): the 121-byte request
+// header + the 36-byte JSON body (no trailing newline). The former C code
+// carried these as a string literal + a static const array; Curlee has no
+// strings/arrays, so each byte is a pure function of its offset — the
+// pack.curlee hello_char_at pattern, split per substring to keep every fn
+// small (the Curlee VM bytecode emitter miscompiles deeply-nested if-branches
+// of a LARGE function — json.curlee's documented quirk).
+// ---------------------------------------------------------------------------
+
+// "POST /completion HTTP/1.1\r\n" — 27 bytes.
+fn req_sub0_byte(j: Int) -> Int {
+  if (j == 0) {
+    return 80;   // P
+  } else {
+    if (j == 1) {
+      return 79;   // O
+    } else {
+      if (j == 2) {
+        return 83;   // S
+      } else {
+        if (j == 3) {
+          return 84;   // T
+        } else {
+          if (j == 4) {
+            return 32;   // space
+          } else {
+            if (j == 5) {
+              return 47;   // /
+            } else {
+              if (j == 6) {
+                return 99;   // c
+              } else {
+                if (j == 7) {
+                  return 111;   // o
+                } else {
+                  if (j == 8) {
+                    return 109;   // m
+                  } else {
+                    if (j == 9) {
+                      return 112;   // p
+                    } else {
+                      if (j == 10) {
+                        return 108;   // l
+                      } else {
+                        if (j == 11) {
+                          return 101;   // e
+                        } else {
+                          if (j == 12) {
+                            return 116;   // t
+                          } else {
+                            if (j == 13) {
+                              return 105;   // i
+                            } else {
+                              if (j == 14) {
+                                return 111;   // o
+                              } else {
+                                if (j == 15) {
+                                  return 110;   // n
+                                } else {
+                                  if (j == 16) {
+                                    return 32;   // space
+                                  } else {
+                                    if (j == 17) {
+                                      return 72;   // H
+                                    } else {
+                                      if (j == 18) {
+                                        return 84;   // T
+                                      } else {
+                                        if (j == 19) {
+                                          return 84;   // T
+                                        } else {
+                                          if (j == 20) {
+                                            return 80;   // P
+                                          } else {
+                                            if (j == 21) {
+                                              return 47;   // /
+                                            } else {
+                                              if (j == 22) {
+                                                return 49;   // 1
+                                              } else {
+                                                if (j == 23) {
+                                                  return 46;   // .
+                                                } else {
+                                                  if (j == 24) {
+                                                    return 49;   // 1
+                                                  } else {
+                                                    if (j == 25) {
+                                                      return 13;   // \r
+                                                    } else {
+                                                      if (j == 26) {
+                                                        return 10;   // \n
+                                                      } else {
+                                                        return 0;
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// "Host: 10.0.2.2:8080\r\n" — 21 bytes.
+fn req_sub1_byte(j: Int) -> Int {
+  if (j == 0) {
+    return 72;   // H
+  } else {
+    if (j == 1) {
+      return 111;   // o
+    } else {
+      if (j == 2) {
+        return 115;   // s
+      } else {
+        if (j == 3) {
+          return 116;   // t
+        } else {
+          if (j == 4) {
+            return 58;   // :
+          } else {
+            if (j == 5) {
+              return 32;   // space
+            } else {
+              if (j == 6) {
+                return 49;   // 1
+              } else {
+                if (j == 7) {
+                  return 48;   // 0
+                } else {
+                  if (j == 8) {
+                    return 46;   // .
+                  } else {
+                    if (j == 9) {
+                      return 48;   // 0
+                    } else {
+                      if (j == 10) {
+                        return 46;   // .
+                      } else {
+                        if (j == 11) {
+                          return 50;   // 2
+                        } else {
+                          if (j == 12) {
+                            return 46;   // .
+                          } else {
+                            if (j == 13) {
+                              return 50;   // 2
+                            } else {
+                              if (j == 14) {
+                                return 58;   // :
+                              } else {
+                                if (j == 15) {
+                                  return 56;   // 8
+                                } else {
+                                  if (j == 16) {
+                                    return 48;   // 0
+                                  } else {
+                                    if (j == 17) {
+                                      return 56;   // 8
+                                    } else {
+                                      if (j == 18) {
+                                        return 48;   // 0
+                                      } else {
+                                        if (j == 19) {
+                                          return 13;   // \r
+                                        } else {
+                                          if (j == 20) {
+                                            return 10;   // \n
+                                          } else {
+                                            return 0;
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// "Content-Type: application/json\r\n" — 32 bytes.
+fn req_sub2_byte(j: Int) -> Int {
+  if (j == 0) {
+    return 67;   // C
+  } else {
+    if (j == 1) {
+      return 111;   // o
+    } else {
+      if (j == 2) {
+        return 110;   // n
+      } else {
+        if (j == 3) {
+          return 116;   // t
+        } else {
+          if (j == 4) {
+            return 101;   // e
+          } else {
+            if (j == 5) {
+              return 110;   // n
+            } else {
+              if (j == 6) {
+                return 116;   // t
+              } else {
+                if (j == 7) {
+                  return 45;   // -
+                } else {
+                  if (j == 8) {
+                    return 84;   // T
+                  } else {
+                    if (j == 9) {
+                      return 121;   // y
+                    } else {
+                      if (j == 10) {
+                        return 112;   // p
+                      } else {
+                        if (j == 11) {
+                          return 101;   // e
+                        } else {
+                          if (j == 12) {
+                            return 58;   // :
+                          } else {
+                            if (j == 13) {
+                              return 32;   // space
+                            } else {
+                              if (j == 14) {
+                                return 97;   // a
+                              } else {
+                                if (j == 15) {
+                                  return 112;   // p
+                                } else {
+                                  if (j == 16) {
+                                    return 112;   // p
+                                  } else {
+                                    if (j == 17) {
+                                      return 108;   // l
+                                    } else {
+                                      if (j == 18) {
+                                        return 105;   // i
+                                      } else {
+                                        if (j == 19) {
+                                          return 99;   // c
+                                        } else {
+                                          if (j == 20) {
+                                            return 97;   // a
+                                          } else {
+                                            if (j == 21) {
+                                              return 116;   // t
+                                            } else {
+                                              if (j == 22) {
+                                                return 105;   // i
+                                              } else {
+                                                if (j == 23) {
+                                                  return 111;   // o
+                                                } else {
+                                                  if (j == 24) {
+                                                    return 110;   // n
+                                                  } else {
+                                                    if (j == 25) {
+                                                      return 47;   // /
+                                                    } else {
+                                                      if (j == 26) {
+                                                        return 106;   // j
+                                                      } else {
+                                                        if (j == 27) {
+                                                          return 115;   // s
+                                                        } else {
+                                                          if (j == 28) {
+                                                            return 111;   // o
+                                                          } else {
+                                                            if (j == 29) {
+                                                              return 110;   // n
+                                                            } else {
+                                                              if (j == 30) {
+                                                                return 13;   // \r
+                                                              } else {
+                                                                if (j == 31) {
+                                                                  return 10;   // \n
+                                                                } else {
+                                                                  return 0;
+                                                                }
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// "Content-Length: 36\r\n" — 20 bytes.
+fn req_sub3_byte(j: Int) -> Int {
+  if (j == 0) {
+    return 67;   // C
+  } else {
+    if (j == 1) {
+      return 111;   // o
+    } else {
+      if (j == 2) {
+        return 110;   // n
+      } else {
+        if (j == 3) {
+          return 116;   // t
+        } else {
+          if (j == 4) {
+            return 101;   // e
+          } else {
+            if (j == 5) {
+              return 110;   // n
+            } else {
+              if (j == 6) {
+                return 116;   // t
+              } else {
+                if (j == 7) {
+                  return 45;   // -
+                } else {
+                  if (j == 8) {
+                    return 76;   // L
+                  } else {
+                    if (j == 9) {
+                      return 101;   // e
+                    } else {
+                      if (j == 10) {
+                        return 110;   // n
+                      } else {
+                        if (j == 11) {
+                          return 103;   // g
+                        } else {
+                          if (j == 12) {
+                            return 116;   // t
+                          } else {
+                            if (j == 13) {
+                              return 104;   // h
+                            } else {
+                              if (j == 14) {
+                                return 58;   // :
+                              } else {
+                                if (j == 15) {
+                                  return 32;   // space
+                                } else {
+                                  if (j == 16) {
+                                    return 51;   // 3
+                                  } else {
+                                    if (j == 17) {
+                                      return 54;   // 6
+                                    } else {
+                                      if (j == 18) {
+                                        return 13;   // \r
+                                      } else {
+                                        if (j == 19) {
+                                          return 10;   // \n
+                                        } else {
+                                          return 0;
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// "Connection: close\r\n" — 19 bytes.
+fn req_sub4_byte(j: Int) -> Int {
+  if (j == 0) {
+    return 67;   // C
+  } else {
+    if (j == 1) {
+      return 111;   // o
+    } else {
+      if (j == 2) {
+        return 110;   // n
+      } else {
+        if (j == 3) {
+          return 110;   // n
+        } else {
+          if (j == 4) {
+            return 101;   // e
+          } else {
+            if (j == 5) {
+              return 99;   // c
+            } else {
+              if (j == 6) {
+                return 116;   // t
+              } else {
+                if (j == 7) {
+                  return 105;   // i
+                } else {
+                  if (j == 8) {
+                    return 111;   // o
+                  } else {
+                    if (j == 9) {
+                      return 110;   // n
+                    } else {
+                      if (j == 10) {
+                        return 58;   // :
+                      } else {
+                        if (j == 11) {
+                          return 32;   // space
+                        } else {
+                          if (j == 12) {
+                            return 99;   // c
+                          } else {
+                            if (j == 13) {
+                              return 108;   // l
+                            } else {
+                              if (j == 14) {
+                                return 111;   // o
+                              } else {
+                                if (j == 15) {
+                                  return 115;   // s
+                                } else {
+                                  if (j == 16) {
+                                    return 101;   // e
+                                  } else {
+                                    if (j == 17) {
+                                      return 13;   // \r
+                                    } else {
+                                      if (j == 18) {
+                                        return 10;   // \n
+                                      } else {
+                                        return 0;
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// "\r\n" — the blank line terminating the request header — 2 bytes.
+fn req_sub5_byte(j: Int) -> Int {
+  if (j == 0) {
+    return 13;   // \r
+  } else {
+    if (j == 1) {
+      return 10;   // \n
+    } else {
+      return 0;
+    }
+  }
+}
+
+// The 36-byte wire body: {"tool":"frame_tick","args":[0,1,2]}
+fn req_body_byte(j: Int) -> Int {
+  if (j == 0) {
+    return 123;   // {
+  } else {
+    if (j == 1) {
+      return 34;   // "
+    } else {
+      if (j == 2) {
+        return 116;   // t
+      } else {
+        if (j == 3) {
+          return 111;   // o
+        } else {
+          if (j == 4) {
+            return 111;   // o
+          } else {
+            if (j == 5) {
+              return 108;   // l
+            } else {
+              if (j == 6) {
+                return 34;   // "
+              } else {
+                if (j == 7) {
+                  return 58;   // :
+                } else {
+                  if (j == 8) {
+                    return 34;   // "
+                  } else {
+                    if (j == 9) {
+                      return 102;   // f
+                    } else {
+                      if (j == 10) {
+                        return 114;   // r
+                      } else {
+                        if (j == 11) {
+                          return 97;   // a
+                        } else {
+                          if (j == 12) {
+                            return 109;   // m
+                          } else {
+                            if (j == 13) {
+                              return 101;   // e
+                            } else {
+                              if (j == 14) {
+                                return 95;   // _
+                              } else {
+                                if (j == 15) {
+                                  return 116;   // t
+                                } else {
+                                  if (j == 16) {
+                                    return 105;   // i
+                                  } else {
+                                    if (j == 17) {
+                                      return 99;   // c
+                                    } else {
+                                      if (j == 18) {
+                                        return 107;   // k
+                                      } else {
+                                        if (j == 19) {
+                                          return 34;   // "
+                                        } else {
+                                          if (j == 20) {
+                                            return 44;   // ,
+                                          } else {
+                                            if (j == 21) {
+                                              return 34;   // "
+                                            } else {
+                                              if (j == 22) {
+                                                return 97;   // a
+                                              } else {
+                                                if (j == 23) {
+                                                  return 114;   // r
+                                                } else {
+                                                  if (j == 24) {
+                                                    return 103;   // g
+                                                  } else {
+                                                    if (j == 25) {
+                                                      return 115;   // s
+                                                    } else {
+                                                      if (j == 26) {
+                                                        return 34;   // "
+                                                      } else {
+                                                        if (j == 27) {
+                                                          return 58;   // :
+                                                        } else {
+                                                          if (j == 28) {
+                                                            return 91;   // [
+                                                          } else {
+                                                            if (j == 29) {
+                                                              return 48;   // 0
+                                                            } else {
+                                                              if (j == 30) {
+                                                                return 44;   // ,
+                                                              } else {
+                                                                if (j == 31) {
+                                                                  return 49;   // 1
+                                                                } else {
+                                                                  if (j == 32) {
+                                                                    return 44;   // ,
+                                                                  } else {
+                                                                    if (j == 33) {
+                                                                      return 50;   // 2
+                                                                    } else {
+                                                                      if (j == 34) {
+                                                                        return 93;   // ]
+                                                                      } else {
+                                                                        if (j == 35) {
+                                                                          return 125;   // }
+                                                                        } else {
+                                                                          return 0;
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }
+                                                                }
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Byte i of the fixed 157-byte request payload (121 header + 36 body).
+// Total and total-by-construction: out-of-range returns 0.
+fn req_payload_byte(i: Int) -> Int {
+  if (i < 27) {
+    return req_sub0_byte(i);
+  } else {
+    if (i < 48) {
+      return req_sub1_byte(i - 27);
+    } else {
+      if (i < 80) {
+        return req_sub2_byte(i - 48);
+      } else {
+        if (i < 100) {
+          return req_sub3_byte(i - 80);
+        } else {
+          if (i < 119) {
+            return req_sub4_byte(i - 100);
+          } else {
+            if (i < 121) {
+              return req_sub5_byte(i - 119);
+            } else {
+              if (i < 157) {
+                return req_body_byte(i - 121);
+              } else {
+                return 0;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TCP segment (RFC 793): the 20-byte header bytes + the pseudo-header
+// checksum. The segment is a pure function of (src_port, dst_port, seq, ack,
+// flags, payload_len, ck): header fields + the fixed request payload. `ck` is
+// the checksum value to place in bytes 16..17 (0 during checksum computation,
+// the computed value on the wire) — mirroring the C code which zeroes the
+// checksum field, sums, then writes the result.
+// ---------------------------------------------------------------------------
+
+// Segment byte at offset off (0..19 + payload), with checksum field = ck.
+fn tcp_seg_byte(off: Int, src_port: Int, dst_port: Int, seq: Int, ack: Int,
+                flags: Int, payload_len: Int, ck: Int) -> Int {
+  if (off == 0) {
+    return be16_hi(src_port);
+  } else {
+    if (off == 1) {
+      return be16_lo(src_port);
+    } else {
+      if (off == 2) {
+        return be16_hi(dst_port);
+      } else {
+        if (off == 3) {
+          return be16_lo(dst_port);
+        } else {
+          if (off == 4) {
+            return be32_k(seq, 0);
+          } else {
+            if (off == 5) {
+              return be32_k(seq, 1);
+            } else {
+              if (off == 6) {
+                return be32_k(seq, 2);
+              } else {
+                if (off == 7) {
+                  return be32_k(seq, 3);
+                } else {
+                  if (off == 8) {
+                    return be32_k(ack, 0);
+                  } else {
+                    if (off == 9) {
+                      return be32_k(ack, 1);
+                    } else {
+                      if (off == 10) {
+                        return be32_k(ack, 2);
+                      } else {
+                        if (off == 11) {
+                          return be32_k(ack, 3);
+                        } else {
+                          if (off == 12) {
+                            return 80;   // data offset = 5 (5 << 4)
+                          } else {
+                            if (off == 13) {
+                              return flags;
+                            } else {
+                              if (off == 14) {
+                                return 255;   // window 0xFFFF
+                              } else {
+                                if (off == 15) {
+                                  return 255;
+                                } else {
+                                  if (off == 16) {
+                                    return be16_hi(ck);
+                                  } else {
+                                    if (off == 17) {
+                                      return be16_lo(ck);
+                                    } else {
+                                      if (off == 18) {
+                                        return 0;   // urgent pointer
+                                      } else {
+                                        if (off == 19) {
+                                          return 0;
+                                        } else {
+                                          if (off < 20 + payload_len) {
+                                            return req_payload_byte(off - 20);
+                                          } else {
+                                            return 0;
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Byte i of the checksum input: the 12-byte pseudo-header (src IP, dst IP,
+// 0, proto 6, TCP length) followed by the TCP segment (checksum field = 0).
+fn tcp_check_byte(i: Int, src_port: Int, dst_port: Int, seq: Int, ack: Int,
+                  flags: Int, payload_len: Int) -> Int {
+  let tcp_len: Int = 20 + payload_len;
+  if (i < 4) {
+    if (i == 0) {
+      return 10;   // src IP 10.0.2.15
+    } else {
+      if (i == 1) {
+        return 0;
+      } else {
+        if (i == 2) {
+          return 2;
+        } else {
+          return 15;
+        }
+      }
+    }
+  } else {
+    if (i < 8) {
+      if (i == 4) {
+        return 10;   // dst IP 10.0.2.2
+      } else {
+        if (i == 5) {
+          return 0;
+        } else {
+          if (i == 6) {
+            return 2;
+          } else {
+            return 2;
+          }
+        }
+      }
+    } else {
+      if (i < 10) {
+        if (i == 8) {
+          return 0;   // reserved
+        } else {
+          return 6;   // proto TCP
+        }
+      } else {
+        if (i < 12) {
+          if (i == 10) {
+            return be16_hi(tcp_len);
+          } else {
+            return be16_lo(tcp_len);
+          }
+        } else {
+          return tcp_seg_byte(i - 12, src_port, dst_port, seq, ack, flags,
+                              payload_len, 0);
+        }
+      }
+    }
+  }
+}
+
+// TCP checksum (RFC 793): ones-complement sum over the pseudo-header + the
+// segment (checksum field zeroed), folded per word exactly like the C
+// ns_tcp_checksum, then the 16-bit complement. The odd trailing byte (an odd
+// tcp_len) is zero-padded HIGH like the C code (data[len-1] << 8). Pure and
+// deterministic; VM-asserted (SYN 0xA841, ACK 0x9831, REQ 0xEC58 with the
+// pinned one-shot values — the C ground truth).
+fn tcp_checksum(src_port: Int, dst_port: Int, seq: Int, ack: Int, flags: Int,
+                payload_len: Int) -> Int {
+  let total: Int = 32 + payload_len;   // 12 pseudo + 20 header + payload
+  let sum: Int = 0;
+  let i: Int = 0;
+  while (i + 1 < total) {
+    let hi: Int = tcp_check_byte(i, src_port, dst_port, seq, ack, flags,
+                                 payload_len);
+    let lo: Int = tcp_check_byte(i + 1, src_port, dst_port, seq, ack, flags,
+                                 payload_len);
+    sum = sum + hi * 256 + lo;
+    if (sum > 65535) {
+      sum = (sum & 65535) + (sum >> 16);
+    }
+    i = i + 2;
+  }
+  if ((total & 1) != 0) {
+    let last: Int = tcp_check_byte(total - 1, src_port, dst_port, seq, ack,
+                                   flags, payload_len);
+    sum = sum + last * 256;
+    if (sum > 65535) {
+      sum = (sum & 65535) + (sum >> 16);
+    }
+  }
+  while ((sum >> 16) != 0) {
+    sum = (sum & 65535) + (sum >> 16);
+  }
+  return 65535 - (sum & 65535);
+}
+
+// ---------------------------------------------------------------------------
+// ARP request frame (RFC 826): the 60-byte frame (Ethernet II + 28-byte ARP
+// request + 18 pad bytes). Pure given the 6 sender-MAC bytes (the guest MAC
+// from net_mac_byte, supplied by the caller so this stays VM-testable with a
+// known MAC).
+// ---------------------------------------------------------------------------
+fn arp_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int, m5: Int) -> Int {
+  if (i < 6) {
+    return 255;   // dst = broadcast ff:ff:ff:ff:ff:ff
+  } else {
+    if (i < 12) {
+      if (i == 6) {
+        return m0;
+      } else {
+        if (i == 7) {
+          return m1;
+        } else {
+          if (i == 8) {
+            return m2;
+          } else {
+            if (i == 9) {
+              return m3;
+            } else {
+              if (i == 10) {
+                return m4;
+              } else {
+                return m5;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      if (i == 12) {
+        return 8;   // ethertype ARP 0x0806
+      } else {
+        if (i == 13) {
+          return 6;
+        } else {
+          if (i == 14) {
+            return 0;   // htype Ethernet
+          } else {
+            if (i == 15) {
+              return 1;
+            } else {
+              if (i == 16) {
+                return 8;   // ptype IPv4 0x0800
+              } else {
+                if (i == 17) {
+                  return 0;
+                } else {
+                  if (i == 18) {
+                    return 6;   // hlen
+                  } else {
+                    if (i == 19) {
+                      return 4;   // plen
+                    } else {
+                      if (i == 20) {
+                        return 0;   // op = request
+                      } else {
+                        if (i == 21) {
+                          return 1;
+                        } else {
+                          if (i < 28) {
+                            if (i == 22) {
+                              return m0;
+                            } else {
+                              if (i == 23) {
+                                return m1;
+                              } else {
+                                if (i == 24) {
+                                  return m2;
+                                } else {
+                                  if (i == 25) {
+                                    return m3;
+                                  } else {
+                                    if (i == 26) {
+                                      return m4;
+                                    } else {
+                                      return m5;
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          } else {
+                            if (i < 32) {
+                              if (i == 28) {
+                                return 10;   // spa = 10.0.2.15
+                              } else {
+                                if (i == 29) {
+                                  return 0;
+                                } else {
+                                  if (i == 30) {
+                                    return 2;
+                                  } else {
+                                    return 15;
+                                  }
+                                }
+                              }
+                            } else {
+                              if (i < 38) {
+                                return 0;   // tha = 00:00:00:00:00:00
+                              } else {
+                                if (i < 42) {
+                                  if (i == 38) {
+                                    return 10;   // tpa = 10.0.2.2
+                                  } else {
+                                    if (i == 39) {
+                                      return 0;
+                                    } else {
+                                      if (i == 40) {
+                                        return 2;
+                                      } else {
+                                        return 2;
+                                      }
+                                    }
+                                  }
+                                } else {
+                                  return 0;   // pad to the 60-byte minimum
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Slirp gateway MAC + full TCP wire frame composition (what the C
+// ns_tcp_send_segment built in ns_tx_frame[] and staged one byte at a time).
+// ---------------------------------------------------------------------------
+
+// Slirp user-net virtual gateway MAC (52:55:0a:00:02:02) — byte k (0..5).
+// QEMU's slirp presents the 10.0.2.2 gateway with the FIXED "special" MAC
+// 52:55:<gw-ip> (kernel/virtio_net.c documents the empirical gap: slirp 4.8
+// does NOT answer a bare guest ARP on QEMU 10.0.11, so the LOCKED 2d-2
+// resolution is by CONSTANT). Every TCP segment's Ethernet dst is this MAC.
+fn gw_mac_byte(k: Int) -> Int {
+  if (k == 0) {
+    return 82;   // 0x52
+  } else {
+    if (k == 1) {
+      return 85;   // 0x55
+    } else {
+      if (k == 2) {
+        return 10;   // 0x0A
+      } else {
+        if (k == 3) {
+          return 0;
+        } else {
+          if (k == 4) {
+            return 2;
+          } else {
+            return 2;
+          }
+        }
+      }
+    }
+  }
+}
+
+// Full wire frame byte at offset i (0..53 + payload_len) for a TCP segment:
+//   Ethernet II (dst = slirp gateway MAC, src = guest MAC m0..m5, ethertype
+//   0x0800) + the 20-byte IPv4 header (checksum computed internally from
+//   tcp_len = 20 + payload_len) + the TCP segment (checksum ck supplied by
+//   the caller — it depends on ports/seq/ack/flags/payload and is computed
+//   once via tcp_checksum, mirroring the C which wrote the TCP checksum after
+//   building the header). frame_len = 54 + payload_len — the UNPADDED frame.
+//   The C ns_tcp_send_segment additionally padded frames shorter than the
+//   60-byte Ethernet minimum; use tcp_frame_pad_byte (below) for the exact
+//   wire bytes.
+// Pure and total: out-of-range i returns 0. VM-asserted in
+// net_stack_test.curlee probe 11 (SYN/REQ frame bytes, the C ground truth).
+fn tcp_frame_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int, m5: Int,
+                  src_port: Int, dst_port: Int, seq: Int, ack: Int, flags: Int,
+                  payload_len: Int, ck: Int) -> Int {
+  let tcp_len: Int = 20 + payload_len;
+  let ick: Int = ip_checksum(tcp_len);
+  if (i < 6) {
+    return gw_mac_byte(i);
+  } else {
+    if (i < 12) {
+      if (i == 6) {
+        return m0;
+      } else {
+        if (i == 7) {
+          return m1;
+        } else {
+          if (i == 8) {
+            return m2;
+          } else {
+            if (i == 9) {
+              return m3;
+            } else {
+              if (i == 10) {
+                return m4;
+              } else {
+                return m5;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      if (i < 14) {
+        if (i == 12) {
+          return 8;   // ethertype 0x0800: high byte
+        } else {
+          return 0;
+        }
+      } else {
+        if (i < 34) {
+          return ip_byte_frame(i - 14, tcp_len, ick);
+        } else {
+          return tcp_seg_byte(i - 34, src_port, dst_port, seq, ack, flags,
+                              payload_len, ck);
+        }
+      }
+    }
+  }
+}
+
+// Byte i of the PADDED wire frame — the C ns_tcp_send_segment padded any
+// frame shorter than 60 bytes to the Ethernet minimum and staged
+// 0..send_len-1 (send_len = max(frame_len, 60)). The SYN and ACK frames are
+// 54 bytes -> 6 zero pad bytes (54..59); the REQ frame (211 bytes) is
+// unpadded. send_len is max(54 + payload_len, 60), so staging
+// 0..send_len-1 with tcp_frame_pad_byte gives EXACTLY the C's wire bytes.
+fn tcp_frame_pad_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int,
+                      m5: Int, src_port: Int, dst_port: Int, seq: Int,
+                      ack: Int, flags: Int, payload_len: Int, ck: Int) -> Int {
+  let flen: Int = 54 + payload_len;
+  if (i < flen) {
+    return tcp_frame_byte(i, m0, m1, m2, m3, m4, m5, src_port, dst_port, seq,
+                          ack, flags, payload_len, ck);
+  } else {
+    if (i < 60) {
+      return 0;   // Ethernet padding to the 60-byte minimum
+    } else {
+      return 0;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP response state machine (streaming; wire doc §3.2/§4).
+//
+// The former C code buffered header bytes in a 256-byte scan buffer and
+// parsed Content-Length once at the blank line. Curlee has no arrays, so the
+// equivalent is a per-byte matcher (the json.curlee idiom): "content-length"
+// is matched case-insensitively as the header streams, the digit value is
+// accumulated on the fly, and the C semantics are preserved exactly:
+//   - header phase ends at the first blank line (\r\n\r\n)
+//   - Content-Length: <v> with v > 0 is captured (v == 0 keeps "unseen",
+//     like the C code's `if (v > 0)`); the value SATURATES at 1000000
+//   - at the blank line, a declared Content-Length > 256 flags truncation
+//     (action 2) — the poll maps that to result 3, never a misleading ready
+//   - body phase copies bytes until Content-Length is satisfied (action 1);
+//     a length-less or over-long body hits the 256-byte cap and fails closed
+//     (action 2)
+//   - only Content-Length framing is supported (no chunked decoding — the
+//     documented 2d-2 scope)
+// The one deliberate divergence: the C header buffer dropped bytes beyond
+// 256 (missing a late Content-Length); the streaming matcher scans the whole
+// header. For headers <= 256 bytes (the wire shape) the behavior is
+// byte-identical.
+// ---------------------------------------------------------------------------
+
+// Lowercase byte k (0..13) of "content-length" (the matcher pattern).
+fn cl_name_byte(k: Int) -> Int {
+  if (k == 0) {
+    return 99;   // c
+  } else {
+    if (k == 1) {
+      return 111;   // o
+    } else {
+      if (k == 2) {
+        return 110;   // n
+      } else {
+        if (k == 3) {
+          return 116;   // t
+        } else {
+          if (k == 4) {
+            return 101;   // e
+          } else {
+            if (k == 5) {
+              return 110;   // n
+            } else {
+              if (k == 6) {
+                return 116;   // t
+              } else {
+                if (k == 7) {
+                  return 45;   // -
+                } else {
+                  if (k == 8) {
+                    return 108;   // l
+                  } else {
+                    if (k == 9) {
+                      return 101;   // e
+                    } else {
+                      if (k == 10) {
+                        return 110;   // n
+                      } else {
+                        if (k == 11) {
+                          return 103;   // g
+                        } else {
+                          if (k == 12) {
+                            return 116;   // t
+                          } else {
+                            if (k == 13) {
+                              return 104;   // h
+                            } else {
+                              return 0;
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Pack the HTTP parse state into one Int (see the bit layout in the header).
+fn pack_http(hd: Int, pc: Int, ln: Int, cm: Int, cl: Int, rl: Int, tr: Int,
+             act: Int) -> Int {
+  return hd | (pc << 1) | (ln << 2) | (cm << 3) | ((cl + 1) << 8) |
+         (rl << 29) | (tr << 38) | (act << 39);
+}
+
+// Consume one byte b of the HTTP response stream; return the next packed
+// state (bits 39..40 = action: 0 keep reading, 1 body complete, 2 truncated).
+// Mirrors the C ns_http_byte semantics exactly (see the header comment for
+// the one documented streaming divergence).
+fn http_step(b: Int, st: Int) -> Int {
+  let hd: Int = st & 1;
+  let pc: Int = (st >> 1) & 1;
+  let ln: Int = (st >> 2) & 1;
+  let cm: Int = (st >> 3) & 31;
+  let clv1: Int = (st >> 8) & 2097151;
+  let rl: Int = (st >> 29) & 511;
+  let tr: Int = (st >> 38) & 1;
+  let cl: Int = clv1 - 1;
+  if (hd == 0) {
+    // ---- header phase: advance the Content-Length matcher first ----
+    let ncm: Int = cm;
+    let ncl: Int = cl;
+    if (cm < 15) {
+      let lo: Int = b | 32;   // ASCII lowercase
+      if (cm == 0) {
+        if (lo == 99) {
+          ncm = 1;   // 'c' starts the pattern
+        }
+      } else {
+        if (cm < 14) {
+          let exp: Int = cl_name_byte(cm);
+          if (lo == exp) {
+            ncm = cm + 1;
+          } else {
+            if (lo == 99) {
+              ncm = 1;   // a 'c' can start a fresh match mid-line
+            } else {
+              ncm = 0;
+            }
+          }
+        } else {
+          if (b == 58) {
+            ncm = 15;   // ':' ends the name
+          } else {
+            if (lo == 99) {
+              ncm = 1;
+            } else {
+              ncm = 0;
+            }
+          }
+        }
+      }
+    } else {
+      if (cm == 15) {
+        if (b == 32) {
+          ncm = 15;   // skip spaces after the colon
+        } else {
+          if (b >= 48 && b <= 57) {
+            ncm = 16;
+            ncl = b - 48;
+          } else {
+            ncm = 17;   // no digits: stays "unseen" (-1)
+          }
+        }
+      } else {
+        if (cm == 16) {
+          if (b >= 48 && b <= 57) {
+            let v: Int = ncl * 10 + (b - 48);
+            if (v > 1000000) {
+              ncl = 1000000;   // saturate (C's overflow guard)
+            } else {
+              ncl = v;
+            }
+          } else {
+            if (ncl > 0) {
+              ncm = 17;   // digit run ended: value captured
+            } else {
+              ncl = -1;
+              ncm = 17;
+            }
+          }
+        }
+      }
+    }
+    // ---- line / blank-line tracking (mirror C exactly) ----
+    if (b == 13) {
+      return pack_http(0, 1, ln, ncm, ncl, rl, tr, 0);   // '\r'
+    }
+    if (b == 10 && pc == 1) {
+      if (ln == 0) {
+        // Blank line -> headers done.
+        if (ncl > 256) {
+          return pack_http(1, 0, 0, ncm, ncl, rl, 1, 2);   // truncated
+        }
+        return pack_http(1, 0, 0, ncm, ncl, rl, tr, 0);
+      }
+      return pack_http(0, 0, 0, ncm, ncl, rl, tr, 0);
+    }
+    if (b != 10) {
+      return pack_http(0, 0, 1, ncm, ncl, rl, tr, 0);
+    }
+    return pack_http(0, 0, ln, ncm, ncl, rl, tr, 0);
+  }
+  // ---- body phase ----
+  if (rl < 256) {
+    let nrl: Int = rl + 1;
+    if (cl >= 0 && nrl >= cl) {
+      return pack_http(1, pc, ln, cm, cl, nrl, tr, 1);   // body complete
+    }
+    return pack_http(1, pc, ln, cm, cl, nrl, tr, 0);
+  }
+  return pack_http(1, pc, ln, cm, cl, rl, 1, 2);   // 256-cap fail-closed
+}

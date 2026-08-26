@@ -30,7 +30,6 @@ MAX_LINES=200
 # drivers that predate the policy. They are exempt from the line cap until
 # migration (Curlee gains assignment + bitwise + port I/O).
 GRANDFATHERED=(
-  "net_stack.c"   # 1056 lines — protocol logic, migrate with assignment+bitwise
   "virtio_net.c"  # 798 lines — ring math, migrate with assignment+port I/O
   "fb.c"          # ~680 lines — blitter loops, migrate with assignment
   "mb2.c"         # 116 lines — tag walk, migrate with assignment+bitwise
@@ -74,14 +73,12 @@ for f in "$KERNEL_DIR"/*.c; do
         violations=$((violations + 1))
     fi
     #    - A `static const` array with >32 elements is a data table in C.
-    #      Exempt: the 36-byte wire request in net_stack.c (the LOCKED HTTP
-    #      payload — a wire-shape constant, not a lookup table).
+    #      (The former 36-byte wire request in net_stack.c migrated to
+    #      net_stack.curlee's req_payload_byte in gh issue #12 — no exemption.)
     big_const="$(grep -cE 'static const .*\[[0-9]{2,}\]' "$f" || true)"
     if (( big_const > 0 )); then
-        if [[ "$name" != "net_stack.c" ]]; then
-            echo "  [FAIL] $name: $big_const large static const array(s) — pure-data table belongs in Curlee"
-            violations=$((violations + 1))
-        fi
+        echo "  [FAIL] $name: $big_const large static const array(s) — pure-data table belongs in Curlee"
+        violations=$((violations + 1))
     fi
 
     # 3. C must never call up into Curlee (curlee_* symbols are codegen-emitted
