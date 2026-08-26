@@ -1,0 +1,399 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// net_glue.curlee — Phase 2d-2 one-shot TCP/IP stack GLUE (gh issue #12).
+//
+// The extern-heavy half of the former kernel/net_stack.c: genuine Curlee
+// functions replacing the C net_connect / net_send / net_stack_poll /
+// net_response_len / net_response_byte externs. The protocol byte math lives
+// in kernel/net_stack.curlee (pure, extern-free, VM-verified), the mutable
+// one-shot state + response byte store live in the C raw-state shim
+// (kernel/net_stack.c — net_state_*/net_resp_*/net_poll_*, the vbe_state.c
+// precedent), and THIS module is the only place the two meet (the
+// json_llm_bridge pattern). It is merged into the kernel TU before
+// kernel.curlee (scripts/build-kernel.sh) and is NOT verified standalone —
+// it calls net_stack.curlee's functions, so `curlee check` covers it via the
+// merged file (kernel.curlee's own standalone-verification note applies).
+//
+// Deterministic one-shot flow (LOCKED in issue #6 / docs/phase2d-wire.md §5):
+//   ARP: 1   net_connect() resolves gateway 10.0.2.2 -> MAC (by CONSTANT:
+//            slirp's 52:55:0a:00:02:02 — net_stack.curlee's gw_mac_byte; the
+//            ARP announce is still sent so slirp learns the guest MAC/IP)
+//   TCP: 1   the same call completes the handshake (SYN -> SYN-ACK -> ACK)
+//   SND: 36  net_send() stages + queues the fixed 36-byte HTTP request
+//   RCV: 36  net_stack_poll() advances the stack; response body received
+// Every RX wait is fuel-bounded (2d-1's net_rx_wait) and net_stack_poll()
+// fails closed after net_poll_fuel() > 1000 — the Curlee-side poll loop
+// always terminates (mirroring the kernel's fuel-bounded while loops).
+//
+// Host-side wire proof: scripts/run-net-stack-codegen.sh concatenates this
+// module + net_stack.curlee, codegens to freestanding C and drives the glue
+// on the HOST with a scripted NIC (the json-codegen-run precedent) —
+// replaying the exact SYN-ACK + stub-response segments and asserting the
+// staged TX frames byte-for-byte, so the wire behavior is provable with no
+// NIC and no live gate (the qemu-llm-smoke gate needs host port 8080 free).
+
+// ---------------------------------------------------------------------------
+// Extern surface (declared HERE, once — the merged TU forbids duplicates):
+// Phase 2d-1 VirtIO-net driver (kernel/virtio_net.c) + the 2d-2 raw-state
+// shim (kernel/net_stack.c). kernel.curlee calls these through this module's
+// declarations. All return 0 / no-op with no NIC present or on the PVH stub
+// path.
+// ---------------------------------------------------------------------------
+extern fn net_probe() -> Int;
+extern fn net_init() -> Int;
+extern fn net_link_up() -> Int;
+extern fn net_rx_len() -> Int;
+extern fn net_rx_byte(i: Int) -> Int;
+extern fn net_rx_done() -> Unit;
+extern fn net_tx_stage_byte(i: Int, b: Int) -> Int;
+extern fn net_tx_send(len: Int) -> Int;
+extern fn net_mac_byte(i: Int) -> Int;
+extern fn net_poll_tick() -> Int;
+extern fn net_rx_wait() -> Int;
+extern fn net_arp_request_gateway() -> Int;
+// 2d-2 raw-state shim phase: 0 idle, 1 connected, 2 sent/in-flight,
+// 3 response ready, 4 failed (terminal).
+extern fn net_state_get() -> Int;
+extern fn net_state_reset(port: Int) -> Unit;
+extern fn net_state_connect(my_seq: Int, peer_seq: Int) -> Unit;
+extern fn net_state_sent() -> Unit;
+extern fn net_state_ready() -> Unit;
+extern fn net_state_failed() -> Unit;
+extern fn net_my_seq() -> Int;
+extern fn net_peer_seq() -> Int;
+extern fn net_dst_port() -> Int;
+extern fn net_resp_len() -> Int;              // stored body bytes (0 invalidated)
+extern fn net_resp_len_set(n: Int) -> Unit;   // n < 0 invalidates (truncated)
+extern fn net_resp_byte(i: Int) -> Int;       // byte i of the store (0 if OOB)
+extern fn net_resp_store(b: Int) -> Unit;     // append one body byte (bounded)
+extern fn net_poll_state() -> Int;            // packed http_step state (opaque)
+extern fn net_poll_state_set(st: Int) -> Unit;
+extern fn net_poll_fuel() -> Int;             // C-owned poll counter (bounded)
+
+// (glue) 16-bit big-endian value at byte offset o of the held RX frame.
+fn rx_rd16(o: Int) -> Int {
+  let hi: Int = net_rx_byte(o);
+  let lo: Int = net_rx_byte(o + 1);
+  return hi * 256 + lo;
+}
+
+// (glue) 32-bit big-endian value at byte offset o of the held RX frame.
+fn rx_rd32(o: Int) -> Int {
+  let b0: Int = net_rx_byte(o);
+  let b1: Int = net_rx_byte(o + 1);
+  let b2: Int = net_rx_byte(o + 2);
+  let b3: Int = net_rx_byte(o + 3);
+  return b0 * 16777216 + b1 * 65536 + b2 * 256 + b3;
+}
+
+// (glue) Classify the held RX frame as an IPv4/TCP segment from the gateway
+// to us, addressed to (src_port, dst_port) — the C ns_rx_tcp, ported. Returns
+// -1 when the frame is not such a segment; otherwise packed:
+//   payload_len (bits 16..31) | tcp_hlen (bits 10..15) | tcp_off (bits 0..9)
+// payload_len comes from the IPv4 total-length field (NOT the frame length),
+// so Ethernet padding is never mistaken for body bytes (the 2d-2 review
+// BLOCKER). The frame bytes are extern reads (opaque to the verifier), so
+// this glue is contract-less and exercised by the host wire harness
+// (scripts/run-net-stack-codegen.sh) and the live 2d-4 gate — the VM tests
+// cover the pure byte math it dispatches on.
+fn rx_tcp_parse(len: Int, dst_port: Int, src_port: Int) -> Int {
+  if (len < 54) {
+    return -1;
+  } else {
+    let e_hi: Int = net_rx_byte(12);
+    let e_lo: Int = net_rx_byte(13);
+    if (e_hi == 8 && e_lo == 0) {
+      let proto: Int = net_rx_byte(23);
+      if (proto == 6) {
+        let d0: Int = net_rx_byte(30);
+        let d1: Int = net_rx_byte(31);
+        let d2: Int = net_rx_byte(32);
+        let d3: Int = net_rx_byte(33);
+        if (d0 == 10 && d1 == 0 && d2 == 2 && d3 == 15) {
+          let s0: Int = net_rx_byte(26);
+          let s1: Int = net_rx_byte(27);
+          let s2: Int = net_rx_byte(28);
+          let s3: Int = net_rx_byte(29);
+          if (s0 == 10 && s1 == 0 && s2 == 2 && s3 == 2) {
+            let ip_total: Int = rx_rd16(16);
+            if (ip_total >= 20 && ip_total <= len - 14) {
+              let ih0: Int = net_rx_byte(14);
+              let ip_hl: Int = (ih0 & 15) * 4;
+              let tcp_off: Int = 14 + ip_hl;
+              if (tcp_off + 20 <= len) {
+                let sp: Int = rx_rd16(tcp_off);
+                let dp: Int = rx_rd16(tcp_off + 2);
+                if (sp == dst_port && dp == src_port) {
+                  let th0: Int = net_rx_byte(tcp_off + 12);
+                  let tcp_hlen: Int = (th0 >> 4) * 4;
+                  if (tcp_off + tcp_hlen <= len) {
+                    let payload_len: Int = ip_total - ip_hl - tcp_hlen;
+                    if (payload_len >= 0) {
+                      return (payload_len << 16) | (tcp_hlen << 10) | tcp_off;
+                    } else {
+                      return -1;
+                    }
+                  } else {
+                    return -1;
+                  }
+                } else {
+                  return -1;
+                }
+              } else {
+                return -1;
+              }
+            } else {
+              return -1;
+            }
+          } else {
+            return -1;
+          }
+        } else {
+          return -1;
+        }
+      } else {
+        return -1;
+      }
+    } else {
+      return -1;
+    }
+  }
+}
+
+// Connect to gw:port — ARP announce + TCP handshake, fuel-bounded. 1 =
+// connected (phase 1), 0 = failed / not ready. STRICTLY ONE-SHOT (FIX 4,
+// 2d-2 review): the fixed ephemeral port 49152, initial sequence 0x10000000
+// and IP identification are chosen for a single fresh connection on a
+// freshly-booted NIC; re-connecting on the same boot is unsupported (a
+// non-idle phase returns 1 already-connected / 0 failed-terminal instead).
+fn net_connect(port: Int) -> Int {
+  let st: Int = net_state_get();
+  if (st == 1 || st == 2 || st == 3) {
+    return 1;   // already connected / in flight (one-shot)
+  }
+  if (st == 4) {
+    return 0;   // failed, terminal (no retry)
+  }
+  let up: Int = net_link_up();
+  if (up != 1) {
+    return 0;
+  }
+  net_state_reset(port);
+  // 1. ARP announce (LOCKED): send the gateway ARP request so slirp learns
+  //    our MAC/IP (without it slirp silently drops the handshake — the 2d-4
+  //    empirical finding), then do a bounded wait and drain any reply. The
+  //    gateway MAC itself is resolved by CONSTANT (net_stack.curlee's
+  //    gw_mac_byte — slirp 4.8 does not answer a bare guest ARP on QEMU
+  //    10.0.11, the documented gap in kernel/virtio_net.c).
+  let arp: Int = net_arp_request_gateway();
+  if (arp == 1) {
+    let w0: Int = net_rx_wait();
+    if (w0 > 0) {
+      net_rx_done();
+    }
+  }
+  // 2. TCP handshake: SYN -> SYN-ACK -> ACK. Every segment is composed by
+  //    net_stack.curlee's tcp_frame_pad_byte (the C ns_tcp_send_segment wire
+  //    bytes, padded to the 60-byte Ethernet minimum) and staged one byte at
+  //    a time through 2d-1's TX API.
+  let m0: Int = net_mac_byte(0);
+  let m1: Int = net_mac_byte(1);
+  let m2: Int = net_mac_byte(2);
+  let m3: Int = net_mac_byte(3);
+  let m4: Int = net_mac_byte(4);
+  let m5: Int = net_mac_byte(5);
+  let syn_ck: Int = tcp_checksum(49152, port, 268435456, 0, 2, 0);
+  let i0: Int = 0;
+  while (i0 < 60) {
+    let b0: Int = tcp_frame_pad_byte(i0, m0, m1, m2, m3, m4, m5, 49152, port,
+                                     268435456, 0, 2, 0, syn_ck);
+    let st0: Int = net_tx_stage_byte(i0, b0);
+    i0 = i0 + 1;
+  }
+  let snd1: Int = net_tx_send(60);
+  if (snd1 != 1) {
+    net_state_failed();
+    return 0;
+  }
+  let w1: Int = net_rx_wait();
+  if (w1 == 0) {
+    net_state_failed();
+    return 0;
+  }
+  let len1: Int = net_rx_len();
+  let parsed: Int = rx_tcp_parse(len1, port, 49152);
+  if (parsed < 0) {
+    net_state_failed();
+    net_rx_done();
+    return 0;
+  }
+  let off1: Int = parsed & 1023;
+  // FIX 4 (2d-2 review): this must be a SYN-ACK (both SYN and ACK set) —
+  // slirp's reply to our SYN carries both flags.
+  let fl1: Int = net_rx_byte(off1 + 13);
+  let syn_set: Int = fl1 & 2;
+  let ack_set: Int = fl1 & 16;
+  if (syn_set == 0 || ack_set == 0) {
+    net_state_failed();
+    net_rx_done();
+    return 0;
+  }
+  let peer: Int = rx_rd32(off1 + 4);
+  net_rx_done();
+  // 3. ACK the SYN-ACK (seq my+1, ack peer+1).
+  let ack_seq: Int = peer + 1;
+  let ack_ck: Int = tcp_checksum(49152, port, 268435457, ack_seq, 16, 0);
+  let i1: Int = 0;
+  while (i1 < 60) {
+    let b1: Int = tcp_frame_pad_byte(i1, m0, m1, m2, m3, m4, m5, 49152, port,
+                                     268435457, ack_seq, 16, 0, ack_ck);
+    let st1: Int = net_tx_stage_byte(i1, b1);
+    i1 = i1 + 1;
+  }
+  let snd2: Int = net_tx_send(60);
+  if (snd2 != 1) {
+    net_state_failed();
+    return 0;
+  }
+  net_state_connect(268435456, peer);
+  return 1;
+}
+
+// Send the fixed HTTP request (wire doc: the 36-byte JSON body). One-shot
+// (FIX 4): only valid right after net_connect (phase 1); queues the request
+// and moves the phase to 2 (sent), which is terminal for sending. The
+// 211-byte frame is the C ns_tcp_send_segment REQ wire bytes (tcp_len 177,
+// flags PSH|ACK 0x18, checksum 0xEC58 with the pinned one-shot values).
+fn net_send(buf_len: Int) -> Int {
+  let st: Int = net_state_get();
+  if (st != 1) {
+    return 0;
+  }
+  if (buf_len != 36) {
+    return 0;   // wire doc: the request body is exactly 36 bytes
+  }
+  let port: Int = net_dst_port();
+  let myseq: Int = net_my_seq();
+  let peer: Int = net_peer_seq();
+  let seq: Int = myseq + 1;
+  let ack: Int = peer + 1;
+  let m0: Int = net_mac_byte(0);
+  let m1: Int = net_mac_byte(1);
+  let m2: Int = net_mac_byte(2);
+  let m3: Int = net_mac_byte(3);
+  let m4: Int = net_mac_byte(4);
+  let m5: Int = net_mac_byte(5);
+  let req_ck: Int = tcp_checksum(49152, port, seq, ack, 24, 157);
+  let i2: Int = 0;
+  while (i2 < 211) {
+    let b2: Int = tcp_frame_byte(i2, m0, m1, m2, m3, m4, m5, 49152, port, seq,
+                                 ack, 24, 157, req_ck);
+    let st2: Int = net_tx_stage_byte(i2, b2);
+    i2 = i2 + 1;
+  }
+  let snd3: Int = net_tx_send(211);
+  if (snd3 != 1) {
+    return 0;
+  }
+  net_state_sent();
+  return 1;
+}
+
+// Advance the stack one step (RX service + one state step). Returns:
+//   0 = still reading (call again)
+//   1 = response ready (net_response_len()/net_response_byte() valid)
+//   2 = fuel exhausted / protocol error (failed closed, terminal)
+//   3 = response truncated — Content-Length exceeds the 256-byte cap; the
+//       response store is invalidated (net_resp_len_set(-1)) so the parser
+//       never sees a misleading partial body.
+// Mirrors the C net_stack_poll exactly: only runs in phase 2 (sent), fails
+// closed on fuel, feeds each RX payload byte through net_stack.curlee's
+// http_step, and stores body bytes into the C store as they arrive.
+fn net_stack_poll() -> Int {
+  let st: Int = net_state_get();
+  if (st == 3) {
+    return 1;
+  }
+  if (st == 4) {
+    return 2;
+  }
+  if (st != 2) {
+    return 0;   // nothing to do yet (not connected / not sent)
+  }
+  let fcount: Int = net_poll_fuel();
+  if (fcount > 1000) {
+    net_state_failed();
+    return 2;
+  }
+  let rlen0: Int = net_rx_len();
+  if (rlen0 == 0) {
+    let w: Int = net_rx_wait();
+    if (w == 0) {
+      net_state_failed();
+      return 2;
+    }
+  }
+  let len: Int = net_rx_len();
+  let port: Int = net_dst_port();
+  let parsed: Int = rx_tcp_parse(len, port, 49152);
+  if (parsed < 0) {
+    net_rx_done();
+    return 0;   // not a segment for us: ignore the frame, keep polling
+  }
+  let tcp_off: Int = parsed & 1023;
+  let tcp_hlen: Int = (parsed >> 10) & 63;
+  let payload_len: Int = parsed >> 16;
+  let st0: Int = net_poll_state();
+  let i: Int = 0;
+  let cur: Int = st0;
+  let act: Int = 0;
+  while (i < payload_len && act == 0) {
+    let hd: Int = cur & 1;   // phase BEFORE this byte (1 = body)
+    let b: Int = net_rx_byte(tcp_off + tcp_hlen + i);
+    let ns: Int = http_step(b, cur);
+    let a: Int = (ns >> 39) & 3;
+    if (hd == 1) {
+      if (a != 2) {
+        net_resp_store(b);   // body byte (the completing byte too)
+      }
+    }
+    cur = ns;
+    act = a;
+    i = i + 1;
+  }
+  net_poll_state_set(cur);
+  net_rx_done();
+  if (act == 1) {
+    net_state_ready();
+    return 1;
+  }
+  if (act == 2) {
+    net_resp_len_set(-1);   // invalidate: a truncated body is never "ready"
+    net_state_failed();
+    return 3;
+  }
+  return 0;
+}
+
+// Bytes of the HTTP response body — valid only after net_stack_poll()
+// returned 1 (phase 3). 0 when no response is ready AND when the response
+// was truncated (the store was invalidated, net_resp_len reports 0).
+fn net_response_len() -> Int {
+  let st: Int = net_state_get();
+  if (st == 3) {
+    let n: Int = net_resp_len();
+    return n;
+  }
+  return 0;
+}
+
+// Byte i of the response body (0..net_response_len()-1; 0 if out of range or
+// not ready).
+fn net_response_byte(i: Int) -> Int {
+  let st: Int = net_state_get();
+  if (st == 3) {
+    let b: Int = net_resp_byte(i);
+    return b;
+  }
+  return 0;
+}

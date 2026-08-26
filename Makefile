@@ -36,8 +36,11 @@ JSON_SRC      := kernel/json.curlee
 SERIAL_SRC    := kernel/serial.curlee
 VGA_SETUP_SRC := kernel/vga_setup.curlee
 VBE_SRC       := kernel/vbe.curlee
+NET_STACK_SRC := kernel/net_stack.curlee
+NET_GLUE_SRC  := kernel/net_glue.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
 JSON_TEST     := kernel/json_test.curlee
+NET_STACK_TEST := kernel/net_stack_test.curlee
 BOOT_ASM      := kernel/boot.S
 VGA_CLEAR_C   := kernel/vga_text_clear.c
 FB_C          := kernel/fb.c
@@ -63,7 +66,7 @@ CC := cc
 AS := as
 LD := ld
 
-.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run iso iso-fb qemu run verify clean \
+.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run iso iso-fb qemu run verify clean \
         qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke \
         c-boundary
 
@@ -76,7 +79,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
@@ -112,10 +115,12 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(VBE_STATE_C) $(NE
 	# the only producer, a build-order-dependent accident. Fixed by compiling
 	# the PVH stub object here (2d-4 review, issue #8).
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
-	# Phase 2d-2: TCP/IP stack (kernel/net_stack.c) — same PVH discipline: the
-	# GRUB/ISO path (below) gets the full ARP/IPv4/TCP stack; the PVH path
-	# compiles the 1-byte stubs (every extern returns 0) so the PVH LOAD budget
-	# is untouched and the no-NIC-safe baseline stays green.
+	# Phase 2d-2 (gh issue #12): TCP/IP stack raw-state shim (kernel/net_stack.c)
+	# — the ARP/IPv4/TCP logic moved to net_stack.curlee + the kernel.curlee
+	# glue; this is now only the mutable state + response byte store. Same PVH
+	# discipline: the GRUB/ISO path (below) gets the real 256-byte store; the
+	# PVH path compiles the 1-byte stub so the PVH LOAD budget is untouched and
+	# the no-NIC-safe baseline stays green.
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_STACK_C) -o $(BUILD_DIR)/net_stack.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
@@ -132,7 +137,7 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(VBE_STATE_C) $(NE
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(NET_STACK_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
@@ -141,6 +146,7 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIA
 	$(CURLEE) check $(SERIAL_SRC)
 	$(CURLEE) check $(VGA_SETUP_SRC)
 	$(CURLEE) check $(VBE_SRC)
+	$(CURLEE) check $(NET_STACK_SRC)
 	$(CURLEE) check $(MERGED_SRC)
 	@echo "curlee check: OK (all modules + merged kernel verified)"
 
@@ -170,6 +176,22 @@ json-run: $(JSON_TEST) $(JSON_SRC)
 # (acceptance criterion 1): asserts err=0, tool="frame_tick", args=[0,1,2].
 json-codegen-run:
 	bash scripts/run-json-codegen.sh
+
+# Phase 2d-2 (gh issue #12): the pure TCP/IP protocol core (net_stack.curlee)
+# is VM-runnable; assert the checksums, wire bytes and the HTTP response state
+# machine against the ground truth captured from the former C implementation.
+net-stack-run: $(NET_STACK_TEST) $(NET_STACK_SRC)
+	$(CURLEE) run --fuel 500000 $(NET_STACK_TEST)
+
+# Phase 2d-2 (gh issue #12): the HOST-SIDE wire proof of the one-shot glue —
+# codegens net_stack.curlee + net_glue.curlee and drives net_connect /
+# net_send / net_stack_poll / net_response_len / net_response_byte against a
+# scripted NIC (replayed SYN-ACK + the split stub response), asserting the
+# staged SYN/ACK/REQ frames byte-for-byte against the C ground truth. This is
+# the json-codegen-run precedent: identical wire behavior with no NIC and no
+# live gate (qemu-llm-smoke needs host port 8080 free).
+net-stack-codegen-run:
+	bash scripts/run-net-stack-codegen.sh
 
 # ---------------------------------------------------------------------------
 # GRUB ISO (VirtualBox path)
@@ -208,9 +230,11 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_CLEAR_C) $(FB_C) $
 	# so option 2 is ACTIVE: full rings (2 RX x 2048 + 2 TX x 2048, depth 256)
 	# and the NIC runs (this is where qemu-net-smoke boots; see the target).
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
-	# Phase 2d-2: TCP/IP stack — GRUB path compiles WITHOUT JOE_PVH_BOOT, so the
-	# full ARP/IPv4/TCP one-shot runs here (this is where qemu-net-smoke and
-	# the future qemu-llm-smoke boot; the NIC is unreachable on the PVH path).
+	# Phase 2d-2 (gh issue #12): TCP/IP stack raw-state shim — GRUB path
+	# compiles WITHOUT JOE_PVH_BOOT, so the real 256-byte response store + full
+	# state are linked here (this is where qemu-net-smoke and qemu-llm-smoke
+	# boot; the NIC is unreachable on the PVH path). The protocol logic itself
+	# is Curlee (net_stack.curlee merged into kernel.c + the kernel.curlee glue).
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_STACK_C) -o $(BUILD_DIR)/net_stack.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(LIBGCC32_C) -o $(BUILD_DIR)/libgcc32.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
@@ -287,9 +311,11 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	# NIC is compiled IN so the no-NIC-safe path is exercised on the existing
 	# smoke gates (net_probe finds nothing, all externs return 0).
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
-	# Phase 2d-2: TCP/IP stack, PVH option-1 stubs (JOE_PVH_BOOT) — compiled IN
-	# so the extern surface is exercised on the no-NIC-safe smoke gates (every
-	# extern returns 0, boot continues to VGA + serial + halt).
+	# Phase 2d-2 (gh issue #12): TCP/IP stack raw-state shim, PVH option-1
+	# stubs (JOE_PVH_BOOT) — compiled IN so the shim extern surface is linked
+	# on the no-NIC-safe smoke gates (every extern returns 0 / no-ops, the
+	# Curlee glue's net_link_up() gate keeps the whole round-trip a no-op,
+	# boot continues to VGA + serial + halt).
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_STACK_C) -o $(BUILD_DIR)/net_stack.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
@@ -460,21 +486,26 @@ run: qemu
 # ---------------------------------------------------------------------------
 # Verify (all acceptance gates)
 # ---------------------------------------------------------------------------
-verify: check pack-run canvas-run json-run json-codegen-run c-boundary kernel
+verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run c-boundary kernel
 	@echo "=== Verification gates ==="
 	@test -s $(KERNEL_ELF) || (echo "FAIL: kernel.elf missing"; exit 1)
 	@objdump -f $(KERNEL_ELF) | grep -q 'start address 0x' && echo "PASS: ELF entry set"
 	@nm $(KERNEL_ELF) | grep -q ' _start$$' && echo "PASS: _start present"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_main$$' && echo "PASS: curlee_main present"
 	@readelf -S $(KERNEL_ELF) | grep -q '\.note\.Xen' && echo "PASS: PVH note (qemu -kernel)"
-	# Phase 2d-2: the stack's extern surface must be linked into the kernel
-	# (the Curlee codegen references them 1:1; a missing symbol fails at link
-	# time, but this gate makes the wiring explicit).
-	@nm $(KERNEL_ELF) | grep -q ' net_connect$$' && echo "PASS: net_connect linked"
-	@nm $(KERNEL_ELF) | grep -q ' net_send$$' && echo "PASS: net_send linked"
-	@nm $(KERNEL_ELF) | grep -q ' net_stack_poll$$' && echo "PASS: net_stack_poll linked"
-	@nm $(KERNEL_ELF) | grep -q ' net_response_len$$' && echo "PASS: net_response_len linked"
-	@nm $(KERNEL_ELF) | grep -q ' net_response_byte$$' && echo "PASS: net_response_byte linked"
+	# Phase 2d-2 (gh issue #12): the one-shot stack glue is now GENUINE Curlee
+	# (codegen'd as curlee_net_connect & co — the C externs were removed) and
+	# the raw-state shim's extern window must be linked into the kernel (the
+	# Curlee codegen references the shim symbols 1:1; a missing symbol fails at
+	# link time, but this gate makes the wiring explicit).
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_connect$$' && echo "PASS: curlee_net_connect linked (Curlee glue)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_send$$' && echo "PASS: curlee_net_send linked (Curlee glue)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_stack_poll$$' && echo "PASS: curlee_net_stack_poll linked (Curlee glue)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_response_len$$' && echo "PASS: curlee_net_response_len linked (Curlee glue)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_response_byte$$' && echo "PASS: curlee_net_response_byte linked (Curlee glue)"
+	@nm $(KERNEL_ELF) | grep -q ' net_state_get$$' && echo "PASS: net_state_get linked (state shim)"
+	@nm $(KERNEL_ELF) | grep -q ' net_resp_store$$' && echo "PASS: net_resp_store linked (state shim)"
+	@nm $(KERNEL_ELF) | grep -q ' net_poll_fuel$$' && echo "PASS: net_poll_fuel linked (state shim)"
 	# Phase 2d-4: the tool-queue producer API the LLM bridge drives
 	# (fb_tool_enqueue(2, arg) — the 2d-3 contract, wired into the 2b ring).
 	@nm $(KERNEL_ELF) | grep -q ' fb_tool_enqueue$$' && echo "PASS: fb_tool_enqueue linked"

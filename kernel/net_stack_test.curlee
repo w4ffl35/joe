@@ -1,0 +1,636 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// net_stack_test.curlee — VM assertion suite for the pure TCP/IP protocol core
+// (kernel/net_stack.curlee, gh issue #12).
+//
+// `curlee run --fuel 500000 kernel/net_stack_test.curlee` runs the full check
+// pipeline (lex -> parse -> resolve -> type-check -> verify) then executes the
+// program on the deterministic VM. It returns 0 iff every assertion holds.
+// Each probe returns a UNIQUE non-zero code so a failure pinpoints the
+// section.
+//
+// The expected constants are the GROUND TRUTH captured from the former C
+// implementation (kernel/net_stack.c): a host harness replicated its pure
+// protocol functions (ns_checksum / ns_ip_build / ns_tcp_checksum /
+// ns_tcp_send_segment) with stubbed net_* externs and dumped the exact wire
+// frames. Every checksum and every payload byte asserted here matches what
+// the C code put on the wire, byte-for-byte:
+//   ip_checksum(20)  = 4236  (0x108C — SYN/ACK IP header)
+//   ip_checksum(177) = 4079  (0x0FEF — HTTP request IP header)
+//   tcp SYN (49152, 8080, 0x10000000, 0, 0x02, 0)     = 43073 (0xA841)
+//   tcp ACK (49152, 8080, 0x10000001, 0x10000001, 0x10, 0)   = 38961 (0x9831)
+//   tcp REQ (49152, 8080, 0x10000001, 0x10000001, 0x18, 157) = 60504 (0xEC58)
+//   request payload (157 B: 121 header + 36 body)      sum = 12462
+//   stub response    (126 B: 90 header + 36 body)      sum = 10131
+//   full wire frame (probe 11, tcp_frame_byte): slirp gw MAC dst
+//     52:55:0a:00:02:02, src MAC 02:00:00:00:00:01, ethertype 0x0800,
+//     IP total 40 (SYN) / 197 (REQ), IP checksum bytes on the wire 0x10 0x8C
+//     (SYN) / 0x0F 0xEF (REQ), TCP checksum bytes 0xA8 0x41 / 0xEC 0x58, and
+//     the REQ body spans frame bytes 54..210 ('P'..'}'; '{' at byte 175).
+// The request payload and the stub response are ALSO the exact byte sequences
+// the 2d-4 smoke gate (make qemu-llm-smoke, scripts/run-llm-smoke.sh) expects
+// on the wire, so this suite is the host-side proof of the kernel's wire
+// behavior without a NIC.
+//
+// SCOPE NOTE (mirrors json_test.curlee): the suite imports ONLY the pure core
+// (kernel/net_stack.curlee is extern-free). The extern-heavy glue
+// (net_connect / net_send / net_stack_poll / net_response_len /
+// net_response_byte + the net_state_*/net_resp_* extern window) lives in
+// kernel/net_glue.curlee and is exercised by the host wire harness
+// (scripts/run-net-stack-codegen.sh, `make net-stack-codegen-run`) plus the
+// live 2d-4 gate — the VM cannot run externs (verified: importing a module
+// with an extern declaration is rejected).
+//
+// Layout: this file lives in kernel/ so `import net_stack` resolves to the
+// sibling kernel/net_stack.curlee (the json_test pattern).
+//
+// Verifier quirks honored (docs/phase2-architecture.md §1 + net_stack.curlee
+// header): call results are bound to `let`s before use; Bool comparisons use
+// explicit `!= 0`/`== 0` on Ints (no `==` on Bools); hex literals are NOT
+// valid outside phys<>(), so all constants are decimal.
+
+import net_stack as ns;
+
+// ---------------------------------------------------------------------------
+// Byte-source helpers for the tests (the stub response reuses the module's
+// wire bytes — the response's Content-Type/Content-Length/Connection/blank
+// lines and body are byte-identical to the request's tail substrings).
+// ---------------------------------------------------------------------------
+
+// "HTTP/1.1 200 OK\r\n" — the stub status line (17 bytes).
+fn resp_status_byte(j: Int) -> Int {
+  if (j == 0) {
+    return 72;   // H
+  } else {
+    if (j == 1) {
+      return 84;   // T
+    } else {
+      if (j == 2) {
+        return 84;   // T
+      } else {
+        if (j == 3) {
+          return 80;   // P
+        } else {
+          if (j == 4) {
+            return 47;   // /
+          } else {
+            if (j == 5) {
+              return 49;   // 1
+            } else {
+              if (j == 6) {
+                return 46;   // .
+              } else {
+                if (j == 7) {
+                  return 49;   // 1
+                } else {
+                  if (j == 8) {
+                    return 32;   // space
+                  } else {
+                    if (j == 9) {
+                      return 50;   // 2
+                    } else {
+                      if (j == 10) {
+                        return 48;   // 0
+                      } else {
+                        if (j == 11) {
+                          return 48;   // 0
+                        } else {
+                          if (j == 12) {
+                            return 32;   // space
+                          } else {
+                            if (j == 13) {
+                              return 79;   // O
+                            } else {
+                              if (j == 14) {
+                                return 75;   // K
+                              } else {
+                                if (j == 15) {
+                                  return 13;   // \r
+                                } else {
+                                  if (j == 16) {
+                                    return 10;   // \n
+                                  } else {
+                                    return 0;
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// "Content-Length: 300\r\n" — the truncation-test header line (21 bytes:
+// 16 name/colon/space + 3 digits + CRLF).
+fn cl300_byte(j: Int) -> Int {
+  if (j == 0) {
+    return 67;   // C
+  } else {
+    if (j == 1) {
+      return 111;   // o
+    } else {
+      if (j == 2) {
+        return 110;   // n
+      } else {
+        if (j == 3) {
+          return 116;   // t
+        } else {
+          if (j == 4) {
+            return 101;   // e
+          } else {
+            if (j == 5) {
+              return 110;   // n
+            } else {
+              if (j == 6) {
+                return 116;   // t
+              } else {
+                if (j == 7) {
+                  return 45;   // -
+                } else {
+                  if (j == 8) {
+                    return 76;   // L
+                  } else {
+                    if (j == 9) {
+                      return 101;   // e
+                    } else {
+                      if (j == 10) {
+                        return 110;   // n
+                      } else {
+                        if (j == 11) {
+                          return 103;   // g
+                        } else {
+                          if (j == 12) {
+                            return 116;   // t
+                          } else {
+                            if (j == 13) {
+                              return 104;   // h
+                            } else {
+                              if (j == 14) {
+                                return 58;   // :
+                              } else {
+                                if (j == 15) {
+                                  return 32;   // space
+                                } else {
+                                  if (j == 16) {
+                                    return 51;   // 3
+                                  } else {
+                                    if (j == 17) {
+                                      return 48;   // 0
+                                    } else {
+                                      if (j == 18) {
+                                        return 48;   // 0
+                                      } else {
+                                        if (j == 19) {
+                                          return 13;   // \r
+                                        } else {
+                                          if (j == 20) {
+                                            return 10;   // \n
+                                          } else {
+                                            return 0;
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Byte i of the full stub response (126 bytes: status + Content-Type +
+// Content-Length: 36 + Connection: close + blank line + the 36-byte body).
+fn stub_resp_byte(i: Int) -> Int {
+  if (i < 17) {
+    return resp_status_byte(i);
+  } else {
+    if (i < 49) {
+      return ns.req_sub2_byte(i - 17);   // Content-Type line
+    } else {
+      if (i < 69) {
+        return ns.req_sub3_byte(i - 49);   // Content-Length: 36 line
+      } else {
+        if (i < 88) {
+          return ns.req_sub4_byte(i - 69);   // Connection line
+        } else {
+          if (i < 90) {
+            return ns.req_sub5_byte(i - 88);   // blank line
+          } else {
+            if (i < 126) {
+              return ns.req_body_byte(i - 90);   // the 36-byte envelope
+            } else {
+              return 0;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Byte i of the truncation response: status + "Content-Length: 300\r\n"
+// (21 bytes) + blank line + body of 'x' (120).
+fn trunc_resp_byte(i: Int) -> Int {
+  if (i < 17) {
+    return resp_status_byte(i);
+  } else {
+    if (i < 38) {
+      return cl300_byte(i - 17);
+    } else {
+      if (i < 40) {
+        if (i == 38) {
+          return 13;   // \r
+        } else {
+          return 10;   // \n
+        }
+      } else {
+        return 120;   // 'x'
+      }
+    }
+  }
+}
+
+// Byte i of the length-less response: status + blank line + body of 'x'
+// (no Content-Length at all — the C parser's length-less fail-closed path).
+fn nolen_resp_byte(i: Int) -> Int {
+  if (i < 17) {
+    return resp_status_byte(i);
+  } else {
+    if (i < 19) {
+      if (i == 17) {
+        return 13;   // \r
+      } else {
+        return 10;   // \n
+      }
+    } else {
+      return 120;   // 'x'
+    }
+  }
+}
+
+// Feed n bytes of `src(i)` through the HTTP state machine (bounded while
+// loop, not recursion — the VM runs while loops fine, see probe_while).
+fn feed(n: Int, st0: Int, src: Int) -> Int {
+  let cur: Int = st0;
+  let i: Int = 0;
+  while (i < n) {
+    let b: Int = 0;
+    if (src == 1) {
+      b = stub_resp_byte(i);
+    } else {
+      if (src == 2) {
+        b = trunc_resp_byte(i);
+      } else {
+        b = nolen_resp_byte(i);
+      }
+    }
+    cur = ns.http_step(b, cur);
+    i = i + 1;
+  }
+  return cur;
+}
+
+// ---------------------------------------------------------------------------
+// Probes
+// ---------------------------------------------------------------------------
+
+// Probe 1: big-endian byte helpers.
+fn probe_be() -> Int {
+  let h: Int = ns.be16_hi(4660);   // 0x1234
+  if (h != 18) { return 1; }
+  let l: Int = ns.be16_lo(4660);
+  if (l != 52) { return 2; }
+  let k0: Int = ns.be32_k(305419896, 0);   // 0x12345678
+  if (k0 != 18) { return 3; }
+  let k1: Int = ns.be32_k(305419896, 1);
+  if (k1 != 52) { return 4; }
+  let k2: Int = ns.be32_k(305419896, 2);
+  if (k2 != 86) { return 5; }
+  let k3: Int = ns.be32_k(305419896, 3);
+  if (k3 != 120) { return 6; }
+  return 0;
+}
+
+// Probe 2: IP header checksum (the C ground truth).
+fn probe_ip_checksum() -> Int {
+  let c20: Int = ns.ip_checksum(20);
+  if (c20 != 4236) { return 7; }
+  let c177: Int = ns.ip_checksum(177);
+  if (c177 != 4079) { return 8; }
+  return 0;
+}
+
+// Probe 3: TCP checksums (SYN / ACK / REQ — the C ground truth).
+fn probe_tcp_checksum() -> Int {
+  let syn: Int = ns.tcp_checksum(49152, 8080, 268435456, 0, 2, 0);
+  if (syn != 43073) { return 9; }
+  let ack: Int = ns.tcp_checksum(49152, 8080, 268435457, 268435457, 16, 0);
+  if (ack != 38961) { return 10; }
+  let req: Int = ns.tcp_checksum(49152, 8080, 268435457, 268435457, 24, 157);
+  if (req != 60504) { return 11; }
+  return 0;
+}
+
+// Probe 4: request payload bytes — key boundaries + the full-byte sum.
+fn probe_payload() -> Int {
+  if (ns.req_payload_byte(0) != 80) { return 12; }    // 'P'
+  if (ns.req_payload_byte(26) != 10) { return 13; }   // '\n' end of status line
+  if (ns.req_payload_byte(27) != 72) { return 14; }   // 'H' Host
+  if (ns.req_payload_byte(47) != 10) { return 15; }   // '\n' end of Host
+  if (ns.req_payload_byte(48) != 67) { return 16; }   // 'C' Content-Type
+  if (ns.req_payload_byte(79) != 10) { return 17; }   // '\n' end of C-T
+  if (ns.req_payload_byte(80) != 67) { return 18; }   // 'C' Content-Length
+  if (ns.req_payload_byte(99) != 10) { return 19; }   // '\n' end of C-L
+  if (ns.req_payload_byte(100) != 67) { return 20; }  // 'C' Connection
+  if (ns.req_payload_byte(118) != 10) { return 21; }  // '\n' end of Conn
+  if (ns.req_payload_byte(119) != 13) { return 22; }  // '\r' blank line
+  if (ns.req_payload_byte(120) != 10) { return 23; }  // '\n' blank line
+  if (ns.req_payload_byte(121) != 123) { return 24; } // '{' body start
+  if (ns.req_payload_byte(156) != 125) { return 25; } // '}' body end
+  let sum: Int = 0;
+  let i: Int = 0;
+  while (i < 157) {
+    let b: Int = ns.req_payload_byte(i);
+    sum = sum + b;
+    i = i + 1;
+  }
+  if (sum != 12462) { return 26; }
+  return 0;
+}
+
+// Probe 5: the SYN segment wire bytes (frame offsets 34..53 = TCP header).
+// Pinned one-shot values: src 49152, dst 8080, seq 0x10000000, ack 0,
+// flags 0x02, checksum 0xA841.
+fn probe_syn_segment() -> Int {
+  let s0: Int = ns.tcp_seg_byte(0, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s0 != 192) { return 27; }   // 0xC0
+  let s1: Int = ns.tcp_seg_byte(1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s1 != 0) { return 28; }
+  let s2: Int = ns.tcp_seg_byte(2, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s2 != 31) { return 29; }   // 0x1F
+  let s3: Int = ns.tcp_seg_byte(3, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s3 != 144) { return 30; }   // 0x90
+  let s4: Int = ns.tcp_seg_byte(4, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s4 != 16) { return 31; }   // 0x10 (seq high byte)
+  let s5: Int = ns.tcp_seg_byte(5, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s5 != 0) { return 32; }
+  let s12: Int = ns.tcp_seg_byte(12, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s12 != 80) { return 33; }   // data offset 5
+  let s13: Int = ns.tcp_seg_byte(13, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s13 != 2) { return 34; }   // flags SYN
+  let s14: Int = ns.tcp_seg_byte(14, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s14 != 255) { return 35; }   // window 0xFFFF
+  let s16: Int = ns.tcp_seg_byte(16, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s16 != 168) { return 36; }   // checksum 0xA8
+  let s17: Int = ns.tcp_seg_byte(17, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s17 != 65) { return 37; }   // 0x41
+  let s18: Int = ns.tcp_seg_byte(18, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s18 != 0) { return 38; }
+  return 0;
+}
+
+// Probe 6: the ARP request frame bytes (guest MAC 02:00:00:00:00:01).
+fn probe_arp() -> Int {
+  if (ns.arp_byte(0, 2, 0, 0, 0, 0, 1) != 255) { return 39; }
+  if (ns.arp_byte(5, 2, 0, 0, 0, 0, 1) != 255) { return 40; }
+  if (ns.arp_byte(6, 2, 0, 0, 0, 0, 1) != 2) { return 41; }
+  if (ns.arp_byte(11, 2, 0, 0, 0, 0, 1) != 1) { return 42; }
+  if (ns.arp_byte(12, 2, 0, 0, 0, 0, 1) != 8) { return 43; }
+  if (ns.arp_byte(13, 2, 0, 0, 0, 0, 1) != 6) { return 44; }
+  if (ns.arp_byte(15, 2, 0, 0, 0, 0, 1) != 1) { return 45; }
+  if (ns.arp_byte(16, 2, 0, 0, 0, 0, 1) != 8) { return 46; }
+  if (ns.arp_byte(18, 2, 0, 0, 0, 0, 1) != 6) { return 47; }
+  if (ns.arp_byte(19, 2, 0, 0, 0, 0, 1) != 4) { return 48; }
+  if (ns.arp_byte(21, 2, 0, 0, 0, 0, 1) != 1) { return 49; }
+  if (ns.arp_byte(22, 2, 0, 0, 0, 0, 1) != 2) { return 50; }
+  if (ns.arp_byte(28, 2, 0, 0, 0, 0, 1) != 10) { return 51; }
+  if (ns.arp_byte(31, 2, 0, 0, 0, 0, 1) != 15) { return 52; }
+  if (ns.arp_byte(32, 2, 0, 0, 0, 0, 1) != 0) { return 53; }
+  if (ns.arp_byte(38, 2, 0, 0, 0, 0, 1) != 10) { return 54; }
+  if (ns.arp_byte(41, 2, 0, 0, 0, 0, 1) != 2) { return 55; }
+  if (ns.arp_byte(42, 2, 0, 0, 0, 0, 1) != 0) { return 56; }
+  if (ns.arp_byte(59, 2, 0, 0, 0, 0, 1) != 0) { return 57; }
+  return 0;
+}
+
+// Probe 7: the HTTP happy path — the FULL stub response (126 bytes) through
+// the state machine: header done, Content-Length 36 captured, body completes
+// at 36 bytes (action 1).
+fn probe_http_happy() -> Int {
+  let st: Int = feed(126, 0, 1);
+  let act: Int = (st >> 39) & 3;
+  if (act != 1) { return 58; }
+  let hd: Int = st & 1;
+  if (hd != 1) { return 59; }
+  let rl: Int = (st >> 29) & 511;
+  if (rl != 36) { return 60; }
+  let clv1: Int = (st >> 8) & 2097151;
+  let cl: Int = clv1 - 1;
+  if (cl != 36) { return 61; }
+  // Mid-stream check: before the body, the header phase ends at byte 89
+  // (the blank line); the first body byte is at 90.
+  let st90: Int = feed(90, 0, 1);
+  let hd90: Int = st90 & 1;
+  if (hd90 != 1) { return 62; }
+  let rl90: Int = (st90 >> 29) & 511;
+  if (rl90 != 0) { return 63; }
+  return 0;
+}
+
+// Probe 8: truncation — "Content-Length: 300" > the 256-byte cap: action 2 at
+// the blank line (the poll maps it to net_stack_poll result 3). The header is
+// 40 bytes (17 status + 21 Content-Length + 2 blank); byte 39 ('\n' of the
+// blank line) is where the truncation fires.
+fn probe_http_truncated() -> Int {
+  let st: Int = feed(40, 0, 2);
+  let act: Int = (st >> 39) & 3;
+  if (act != 2) { return 64; }
+  let tr: Int = (st >> 38) & 1;
+  if (tr != 1) { return 65; }
+  let clv1: Int = (st >> 8) & 2097151;
+  let cl: Int = clv1 - 1;
+  if (cl != 300) { return 66; }
+  return 0;
+}
+
+// Probe 9: length-less body — no Content-Length header, 257 'x' body bytes
+// (276 total with the 19-byte header): the 256-byte cap is reached on the
+// 256th stored byte and the NEXT byte fails closed (action 2), never a
+// misleading ready.
+fn probe_http_nolen() -> Int {
+  let st: Int = feed(276, 0, 3);
+  let act: Int = (st >> 39) & 3;
+  if (act != 2) { return 67; }
+  let rl: Int = (st >> 29) & 511;
+  if (rl != 256) { return 68; }
+  let tr: Int = (st >> 38) & 1;
+  if (tr != 1) { return 69; }
+  return 0;
+}
+
+// Probe 10: case-insensitive Content-Length ("content-length: 36" lowercase)
+// — the C scan lowercased with | 32; the matcher must too. After the blank
+// line, two body bytes ('A','B') are stored: the header is done, the value 36
+// is captured, and the body is still reading (action 0 — the C semantics:
+// Content-Length not yet satisfied).
+fn probe_http_lowercase() -> Int {
+  // Byte source: status + "content-length: 36\r\n" + blank + "AB"
+  let i: Int = 0;
+  let cur: Int = 0;
+  while (i < 17) {
+    cur = ns.http_step(resp_status_byte(i), cur);
+    i = i + 1;
+  }
+  // "content-length: 36\r\n" lowercase (the req_sub3 bytes lowercased).
+  let low: Int = 0;
+  let j: Int = 0;
+  while (j < 20) {
+    let b: Int = ns.req_sub3_byte(j);
+    let c: Int = 0;
+    if (b >= 65 && b <= 90) {
+      c = b + 32;
+    } else {
+      c = b;
+    }
+    cur = ns.http_step(c, cur);
+    j = j + 1;
+  }
+  let k: Int = 0;
+  while (k < 2) {
+    if (k == 0) {
+      cur = ns.http_step(13, cur);
+    } else {
+      cur = ns.http_step(10, cur);
+    }
+    k = k + 1;
+  }
+  cur = ns.http_step(65, cur);
+  cur = ns.http_step(66, cur);
+  let act: Int = (cur >> 39) & 3;
+  if (act != 0) { return 70; }
+  let clv1: Int = (cur >> 8) & 2097151;
+  let cl: Int = clv1 - 1;
+  if (cl != 36) { return 71; }
+  let rl: Int = (cur >> 29) & 511;
+  if (rl != 2) { return 72; }
+  return 0;
+}
+
+// Probe 11: the slirp gateway MAC constant + the FULL TCP wire frame
+// (Ethernet II + IPv4 + TCP) — the SYN and REQ frames byte-for-byte with
+// guest MAC 02:00:00:00:00:01 (the C ground truth: gw MAC 52:55:0a:00:02:02,
+// src MAC 02:00:00:00:00:01, ethertype 0x0800, IP total 40/197, IP checksum
+// 0x108C/0x0FEF, TCP checksum 0xA841/0xEC58, body '{'..'}' at 54..210).
+fn probe_frame() -> Int {
+  if (ns.gw_mac_byte(0) != 82) { return 73; }
+  if (ns.gw_mac_byte(1) != 85) { return 74; }
+  if (ns.gw_mac_byte(2) != 10) { return 75; }
+  if (ns.gw_mac_byte(3) != 0) { return 76; }
+  if (ns.gw_mac_byte(4) != 2) { return 77; }
+  if (ns.gw_mac_byte(5) != 2) { return 78; }
+  // SYN frame (payload 0, tcp_len 20): unpadded frame is 54 bytes.
+  let s0: Int = ns.tcp_frame_byte(0, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s0 != 82) { return 79; }   // dst = gw MAC 0x52
+  let s5: Int = ns.tcp_frame_byte(5, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s5 != 2) { return 80; }    // gw MAC 0x02 (last byte)
+  let s6: Int = ns.tcp_frame_byte(6, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s6 != 2) { return 81; }    // src = guest MAC
+  let s11: Int = ns.tcp_frame_byte(11, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s11 != 1) { return 82; }
+  let s12: Int = ns.tcp_frame_byte(12, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s12 != 8) { return 83; }   // ethertype 0x0800
+  let s16: Int = ns.tcp_frame_byte(16, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s16 != 0) { return 84; }   // IP total 40: high byte
+  let s17: Int = ns.tcp_frame_byte(17, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s17 != 40) { return 85; }  // IP total 40: low byte
+  let s24: Int = ns.tcp_frame_byte(24, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s24 != 16) { return 86; }  // IP checksum 0x108C: high byte
+  let s25: Int = ns.tcp_frame_byte(25, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s25 != 140) { return 87; } // 0x8C
+  let s50: Int = ns.tcp_frame_byte(50, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s50 != 168) { return 88; } // TCP checksum 0xA841
+  let s51: Int = ns.tcp_frame_byte(51, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s51 != 65) { return 89; }
+  let s53: Int = ns.tcp_frame_byte(53, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s53 != 0) { return 90; }   // urgent pointer lo
+  let s54: Int = ns.tcp_frame_byte(54, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (s54 != 0) { return 91; }   // unpadded SYN frame is 54 bytes; 54 = OOB
+  // The PADDED wire variant: the C ns_tcp_send_segment padded 54 -> 60.
+  let p54: Int = ns.tcp_frame_pad_byte(54, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (p54 != 0) { return 92; }   // pad byte
+  let p59: Int = ns.tcp_frame_pad_byte(59, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435456, 0, 2, 0, 43073);
+  if (p59 != 0) { return 93; }   // last pad byte
+  // REQ frame (payload 157, tcp_len 177): 211 bytes, no padding.
+  let r16: Int = ns.tcp_frame_byte(16, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435457, 268435457, 24, 157, 60504);
+  if (r16 != 0) { return 94; }   // IP total 197: high byte
+  let r17: Int = ns.tcp_frame_byte(17, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435457, 268435457, 24, 157, 60504);
+  if (r17 != 197) { return 95; } // 0x00C5
+  let r24: Int = ns.tcp_frame_byte(24, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435457, 268435457, 24, 157, 60504);
+  if (r24 != 15) { return 96; }  // IP checksum 0x0FEF
+  let r25: Int = ns.tcp_frame_byte(25, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435457, 268435457, 24, 157, 60504);
+  if (r25 != 239) { return 97; }
+  let r50: Int = ns.tcp_frame_byte(50, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435457, 268435457, 24, 157, 60504);
+  if (r50 != 236) { return 98; } // TCP checksum 0xEC58
+  let r51: Int = ns.tcp_frame_byte(51, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435457, 268435457, 24, 157, 60504);
+  if (r51 != 88) { return 99; }
+  let r54: Int = ns.tcp_frame_byte(54, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435457, 268435457, 24, 157, 60504);
+  if (r54 != 80) { return 100; }  // 'P' — first payload byte ("POST ...")
+  let r175: Int = ns.tcp_frame_byte(175, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435457, 268435457, 24, 157, 60504);
+  if (r175 != 123) { return 101; } // '{' — JSON body starts at payload offset 121
+  let r210: Int = ns.tcp_frame_byte(210, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435457, 268435457, 24, 157, 60504);
+  if (r210 != 125) { return 102; } // '}' — last payload byte
+  let r211: Int = ns.tcp_frame_byte(211, 2, 0, 0, 0, 0, 1, 49152, 8080, 268435457, 268435457, 24, 157, 60504);
+  if (r211 != 0) { return 103; }  // 211 = OOB (frame is 211 bytes)
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// main — run every probe, return the first failure.
+// ---------------------------------------------------------------------------
+fn main() -> Int {
+  let r1: Int = probe_be();
+  if (r1 != 0) { return r1; }
+  let r2: Int = probe_ip_checksum();
+  if (r2 != 0) { return r2; }
+  let r3: Int = probe_tcp_checksum();
+  if (r3 != 0) { return r3; }
+  let r4: Int = probe_payload();
+  if (r4 != 0) { return r4; }
+  let r5: Int = probe_syn_segment();
+  if (r5 != 0) { return r5; }
+  let r6: Int = probe_arp();
+  if (r6 != 0) { return r6; }
+  let r7: Int = probe_http_happy();
+  if (r7 != 0) { return r7; }
+  let r8: Int = probe_http_truncated();
+  if (r8 != 0) { return r8; }
+  let r9: Int = probe_http_nolen();
+  if (r9 != 0) { return r9; }
+  let r10: Int = probe_http_lowercase();
+  if (r10 != 0) { return r10; }
+  let r11: Int = probe_frame();
+  if (r11 != 0) { return r11; }
+  return 0;
+}

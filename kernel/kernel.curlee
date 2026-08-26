@@ -92,35 +92,14 @@ extern fn fb_tool_enqueue(kind: Int, arg: Int) -> Int;
 extern fn fb_tool_drained() -> Int;
 extern fn fb_tool_pending() -> Int;
 
-// Phase 2d-1 — VirtIO-net driver (kernel/virtio_net.c). The first six are the
-// LOCKED 2d-1 extern surface (docs/phase2d-wire.md §6); the byte-buffer window
-// (net_rx_byte / net_tx_stage_byte / net_mac_byte / net_poll_tick) plus the
-// deterministic smoke helpers (net_rx_wait / net_arp_request_gateway) are the
-// C API 2d-2 will consume (kernel/net.h). All return 0 with no NIC present.
-extern fn net_probe() -> Int;
-extern fn net_init() -> Int;
-extern fn net_link_up() -> Int;
-extern fn net_rx_len() -> Int;
-extern fn net_rx_byte(i: Int) -> Int;
-extern fn net_rx_done() -> Unit;
-extern fn net_tx_stage_byte(i: Int, b: Int) -> Int;
-extern fn net_tx_send(len: Int) -> Int;
-extern fn net_mac_byte(i: Int) -> Int;
-extern fn net_poll_tick() -> Int;
-extern fn net_rx_wait() -> Int;
-extern fn net_arp_request_gateway() -> Int;
-
-// Phase 2d-2 — TCP/IP stack (kernel/net_stack.c). The LOCKED 2d-2 extern
-// surface (docs/phase2d-wire.md §6): ARP + IPv4 + one-shot TCP to the host
-// LLM server. All return 0 with no NIC present / on the PVH stub path.
-extern fn net_connect(port: Int) -> Int;      // 1 = TCP connected to gw:port
-extern fn net_send(buf_len: Int) -> Int;      // 1 = request queued (buffer pre-staged)
-extern fn net_stack_poll() -> Int;            // advance stack; 0 = still reading,
-                                              // 1 = response ready, 2 = fuel
-                                              // exhausted / protocol error,
-                                              // 3 = truncated (body > 256 B)
-extern fn net_response_len() -> Int;          // bytes of the HTTP response body
-extern fn net_response_byte(i: Int) -> Int;   // byte at index i (0..len-1)
+// Phase 2d-1/2d-2 — VirtIO-net + TCP/IP stack extern surface. Declared in
+// kernel/net_glue.curlee (merged in before this file by
+// scripts/build-kernel.sh — the merged TU forbids duplicate externs, so they
+// live exactly once, next to the one-shot glue that consumes them:
+// net_connect / net_send / net_stack_poll / net_response_len /
+// net_response_byte are genuine Curlee functions there, gh issue #12). The
+// pure protocol core is kernel/net_stack.curlee (extern-free); the C shim is
+// kernel/net_stack.c (raw state + response byte store only).
 
 // ===========================================================================
 // Phase 2 declarative render scene (called per-frame by fb_run_loop's C loop)
@@ -431,6 +410,17 @@ fn net_bringup(pm: cap phys.mem) -> Unit {
   return;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2d-2: the one-shot TCP/IP stack GLUE lives in kernel/net_glue.curlee
+// (gh issue #12) — genuine Curlee net_connect / net_send / net_stack_poll /
+// net_response_len / net_response_byte replacing the C externs, plus the
+// whole 2d-1 + 2d-2 extern surface declared there exactly once (the merged
+// TU forbids duplicate externs). The pure protocol byte math is
+// kernel/net_stack.curlee; the raw state + response store is the
+// kernel/net_stack.c shim. The round-trip below calls the glue functions
+// exactly as it called the old C externs.
+// ---------------------------------------------------------------------------
+
 // Phase 2d-2: the TCP/IP stack round-trip (docs/phase2d-wire.md §5). Gated on
 // the NIC bring-up succeeding (NET: 1..3), so the no-NIC-safe baseline stays
 // green — with no virtio-net device every net_* extern returns 0 and this
@@ -443,15 +433,16 @@ fn net_bringup(pm: cap phys.mem) -> Unit {
 //   RCV: 36 net_stack_poll() received the response body (<= 256 B)
 //
 // Fuel discipline: net_connect() and the response poll are bounded by the
-// C-side stack (net_rx_wait from 2d-1 + the net_stack_poll fuel counter) —
-// the poll loop uses the extern call in the CONDITION, exactly like the
-// Phase 2b `while (fb_loop_frame() < 4)` loop: each iteration re-evaluates
-// net_stack_poll(), which fails closed (returns 2 — not 0) once its C-owned
-// fuel counter is exhausted, so the loop provably terminates.
+// C-side shim (net_rx_wait from 2d-1 + the net_poll_fuel counter) — the poll
+// loop uses the glue call in the CONDITION, exactly like the Phase 2b
+// `while (fb_loop_frame() < 4)` loop: each iteration re-evaluates
+// net_stack_poll() (kernel/net_glue.curlee, gh issue #12), which fails
+// closed (returns 2 — not 0) once its C-owned fuel counter is exhausted, so
+// the loop provably terminates.
 // Phase 2d-3: the pure JSON/tool-call parser bridge (kernel/json.curlee, merged
-// in). Reads the received response body byte-by-byte through the 2d-2 externs
-// (net_response_len / net_response_byte), drives the pure state machine
-// (json_step), then:
+// in). Reads the received response body byte-by-byte through the 2d-2 glue
+// (net_response_len / net_response_byte — genuine Curlee, net_glue.curlee),
+// drives the pure state machine (json_step), then:
 //   - on parse_error == 0: emits "JSON: 1" and enqueues the tool call
 //     (fb_tool_enqueue(2, arg) — kind 2 = "LLM tool call", the 2d-3 contract),
 //   - on parse_error != 0: emits "JSON: E<code>" and NEVER enqueues.
