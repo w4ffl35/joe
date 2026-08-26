@@ -33,6 +33,7 @@ MODULES=(
   "$ROOT/kernel/glyphs.curlee"
   "$ROOT/kernel/assets.curlee"
   "$ROOT/kernel/json.curlee"
+  "$ROOT/kernel/serial.curlee"
   "$ROOT/kernel/kernel.curlee"
 )
 
@@ -55,7 +56,7 @@ done
   echo "// and re-run the merge. When the Curlee codegen import bug is fixed,"
   echo "// this script is deleted and kernel.curlee imports the modules."
   echo "//"
-  echo "// Modules (in dependency order): canvas, glyphs, assets, json, kernel."
+  echo "// Modules (in dependency order): canvas, glyphs, assets, json, serial, kernel."
   echo
   for f in "${MODULES[@]}"; do
     echo "// ==== $(basename "$f") ===="

@@ -28,7 +28,12 @@
 //   - Minimal footprint: no libc, no malloc, no String/Vec; the C driver owns
 //     mutable blitter state; Curlee owns pure math + declarative scenes.
 
-extern fn curlee_putc(c: Int) -> Unit;
+// NOTE: there is NO `extern fn curlee_putc` here — since issue #9 the COM1
+// serial driver is a genuine Curlee function (`putc` in serial.curlee, merged
+// in below). The codegen emits it as the static symbol `curlee_putc`, the
+// same weak-hook name the runtime's rt.c reserves; the extern declaration was
+// removed because a C extern and a static definition of the same identifier
+// cannot coexist in one translation unit.
 extern fn curlee_halt() -> Unit;
 
 // Provided by kernel/fb.c — linear framebuffer software blitter.
@@ -119,31 +124,33 @@ extern fn net_response_byte(i: Int) -> Int;   // byte at index i (0..len-1)
 // Phase 2 declarative render scene (called per-frame by fb_run_loop's C loop)
 // ===========================================================================
 
-// Serial fallback: emit the message via the weak curlee_putc hook so the
-// boot is observable (the QEMU smoke path overrides it to write to COM1).
-fn serial_hello() -> Unit {
-  curlee_putc(72);   // H
-  curlee_putc(101);  // e
-  curlee_putc(108);  // l
-  curlee_putc(108);  // l
-  curlee_putc(111);  // o
-  curlee_putc(32);   // space
-  curlee_putc(87);   // W
-  curlee_putc(111);  // o
-  curlee_putc(114);  // r
-  curlee_putc(108);  // l
-  curlee_putc(100);  // d
-  curlee_putc(32);   // space
-  curlee_putc(102);  // f
-  curlee_putc(114);  // r
-  curlee_putc(111);  // o
-  curlee_putc(109);  // m
-  curlee_putc(32);   // space
-  curlee_putc(74);   // J
-  curlee_putc(79);   // O
-  curlee_putc(69);   // E
-  curlee_putc(33);   // !
-  curlee_putc(10);   // newline
+// Serial fallback: emit the message via the ported COM1 driver — serial.curlee's
+// `putc` (codegen'd as the static `curlee_putc` symbol, the runtime's weak-hook
+// name) — so the boot is observable. QEMU captures it with `-serial file:...`
+// / `-serial stdio`.
+fn serial_hello(pm: cap phys.mem) -> Unit {
+  putc(pm, 72);   // H
+  putc(pm, 101);  // e
+  putc(pm, 108);  // l
+  putc(pm, 108);  // l
+  putc(pm, 111);  // o
+  putc(pm, 32);   // space
+  putc(pm, 87);   // W
+  putc(pm, 111);  // o
+  putc(pm, 114);  // r
+  putc(pm, 108);  // l
+  putc(pm, 100);  // d
+  putc(pm, 32);   // space
+  putc(pm, 102);  // f
+  putc(pm, 114);  // r
+  putc(pm, 111);  // o
+  putc(pm, 109);  // m
+  putc(pm, 32);   // space
+  putc(pm, 74);   // J
+  putc(pm, 79);   // O
+  putc(pm, 69);   // E
+  putc(pm, 33);   // !
+  putc(pm, 10);   // newline
   return;
 }
 
@@ -238,25 +245,25 @@ fn draw_glyph(ch: Int, x: Int, y: Int, scale: Int, color: Int) -> Unit {
 // (make qemu-fb-smoke): "FB: 1" proves fb_ready()==1 — the multiboot2
 // framebuffer tag captured by the 32-bit boot stub was parsed and the linear
 // framebuffer is active. The gate greps the serial log for "FB:".
-fn serial_fb_marker() -> Unit {
-  curlee_putc(70);   // F
-  curlee_putc(66);   // B
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
-  curlee_putc(49);   // 1 (fb_ready() == 1)
-  curlee_putc(10);   // newline
+fn serial_fb_marker(pm: cap phys.mem) -> Unit {
+  putc(pm, 70);   // F
+  putc(pm, 66);   // B
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 49);   // 1 (fb_ready() == 1)
+  putc(pm, 10);   // newline
   return;
 }
 
 // Serial per-frame marker for the Phase 2b loop gate (make qemu-loop-smoke):
 // "FR:<n>" proves the loop advanced past frame 1. `n` must be a single digit
 // (the loop is fuel-bounded well under 10), so the marker is 6 chars + \n.
-fn serial_frame_marker(n: Int) -> Unit {
-  curlee_putc(70);   // F
-  curlee_putc(82);   // R
-  curlee_putc(58);   // :
-  curlee_putc(48 + n);   // digit n (0..9)
-  curlee_putc(10);   // newline
+fn serial_frame_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 70);   // F
+  putc(pm, 82);   // R
+  putc(pm, 58);   // :
+  putc(pm, 48 + n);   // digit n (0..9)
+  putc(pm, 10);   // newline
   return;
 }
 
@@ -264,15 +271,15 @@ fn serial_frame_marker(n: Int) -> Unit {
 // performed a REAL back-buffer flip (ring_active == 1) during the loop. The
 // marker is emitted after the loop when fb_ring_active() reports the ring
 // flipped at least once. Grepped by the qemu-fb-smoke gate alongside "FB:".
-fn serial_ring_marker() -> Unit {
-  curlee_putc(82);   // R
-  curlee_putc(73);   // I
-  curlee_putc(78);   // N
-  curlee_putc(71);   // G
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
-  curlee_putc(49);   // 1 (ring active)
-  curlee_putc(10);   // newline
+fn serial_ring_marker(pm: cap phys.mem) -> Unit {
+  putc(pm, 82);   // R
+  putc(pm, 73);   // I
+  putc(pm, 78);   // N
+  putc(pm, 71);   // G
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 49);   // 1 (ring active)
+  putc(pm, 10);   // newline
   return;
 }
 
@@ -280,30 +287,30 @@ fn serial_ring_marker() -> Unit {
 // VirtIO-net bring-up step n passed (1 = PCI found, 2 = device ready, 3 =
 // link up). `n` is a single digit (1..3), so the marker is 6 chars + \n.
 // Grepped in order by the qemu-net-smoke gate.
-fn serial_net_marker(n: Int) -> Unit {
-  curlee_putc(78);   // N
-  curlee_putc(69);   // E
-  curlee_putc(84);   // T
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
-  curlee_putc(48 + n);   // digit n (1..3)
-  curlee_putc(10);   // newline
+fn serial_net_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 78);   // N
+  putc(pm, 69);   // E
+  putc(pm, 84);   // T
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 48 + n);   // digit n (1..3)
+  putc(pm, 10);   // newline
   return;
 }
 
 // Phase 2d-1 RX marker: "RX: <len>" reports the received frame length (the
 // slirp ARP reply, 42-60 bytes — two digits max). No modulo (rejected by the
 // compiler): split tens/ones with division + subtraction.
-fn serial_rx_marker(len: Int) -> Unit {
-  curlee_putc(82);   // R
-  curlee_putc(88);   // X
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
+fn serial_rx_marker(pm: cap phys.mem, len: Int) -> Unit {
+  putc(pm, 82);   // R
+  putc(pm, 88);   // X
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
   let tens: Int = len / 10;
   let ones: Int = len - tens * 10;
-  curlee_putc(48 + tens);
-  curlee_putc(48 + ones);
-  curlee_putc(10);   // newline
+  putc(pm, 48 + tens);
+  putc(pm, 48 + ones);
+  putc(pm, 10);   // newline
   return;
 }
 
@@ -313,53 +320,53 @@ fn serial_rx_marker(len: Int) -> Unit {
 //   SND: 36 net_send() queued the fixed 36-byte HTTP request
 //   RCV: 36 net_stack_poll() finished receiving the response body
 // `n` is a single digit (0..9) and `len` up to two digits (36 max).
-fn serial_arp_marker(n: Int) -> Unit {
-  curlee_putc(65);   // A
-  curlee_putc(82);   // R
-  curlee_putc(80);   // P
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
-  curlee_putc(48 + n);
-  curlee_putc(10);   // newline
+fn serial_arp_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 65);   // A
+  putc(pm, 82);   // R
+  putc(pm, 80);   // P
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 48 + n);
+  putc(pm, 10);   // newline
   return;
 }
 
-fn serial_tcp_marker(n: Int) -> Unit {
-  curlee_putc(84);   // T
-  curlee_putc(67);   // C
-  curlee_putc(80);   // P
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
-  curlee_putc(48 + n);
-  curlee_putc(10);   // newline
+fn serial_tcp_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 84);   // T
+  putc(pm, 67);   // C
+  putc(pm, 80);   // P
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 48 + n);
+  putc(pm, 10);   // newline
   return;
 }
 
-fn serial_snd_marker(len: Int) -> Unit {
-  curlee_putc(83);   // S
-  curlee_putc(78);   // N
-  curlee_putc(68);   // D
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
+fn serial_snd_marker(pm: cap phys.mem, len: Int) -> Unit {
+  putc(pm, 83);   // S
+  putc(pm, 78);   // N
+  putc(pm, 68);   // D
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
   let tens: Int = len / 10;
   let ones: Int = len - tens * 10;
-  curlee_putc(48 + tens);
-  curlee_putc(48 + ones);
-  curlee_putc(10);   // newline
+  putc(pm, 48 + tens);
+  putc(pm, 48 + ones);
+  putc(pm, 10);   // newline
   return;
 }
 
-fn serial_rcv_marker(len: Int) -> Unit {
-  curlee_putc(82);   // R
-  curlee_putc(67);   // C
-  curlee_putc(86);   // V
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
+fn serial_rcv_marker(pm: cap phys.mem, len: Int) -> Unit {
+  putc(pm, 82);   // R
+  putc(pm, 67);   // C
+  putc(pm, 86);   // V
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
   let tens: Int = len / 10;
   let ones: Int = len - tens * 10;
-  curlee_putc(48 + tens);
-  curlee_putc(48 + ones);
-  curlee_putc(10);   // newline
+  putc(pm, 48 + tens);
+  putc(pm, 48 + ones);
+  putc(pm, 10);   // newline
   return;
 }
 
@@ -370,26 +377,26 @@ fn serial_rcv_marker(len: Int) -> Unit {
 //   LLM: 1   the acknowledgment frame was rendered (the serial marker is the
 //            gate's ack; the visual "LLM OK" frame is a bonus on the fb path)
 // `n` is a single digit (0..9), so each marker is 6-7 chars + \n.
-fn serial_tool_marker(n: Int) -> Unit {
-  curlee_putc(84);   // T
-  curlee_putc(79);   // O
-  curlee_putc(79);   // O
-  curlee_putc(76);   // L
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
-  curlee_putc(48 + n);
-  curlee_putc(10);   // newline
+fn serial_tool_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 84);   // T
+  putc(pm, 79);   // O
+  putc(pm, 79);   // O
+  putc(pm, 76);   // L
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 48 + n);
+  putc(pm, 10);   // newline
   return;
 }
 
-fn serial_llm_marker(n: Int) -> Unit {
-  curlee_putc(76);   // L
-  curlee_putc(76);   // L
-  curlee_putc(77);   // M
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
-  curlee_putc(48 + n);
-  curlee_putc(10);   // newline
+fn serial_llm_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 76);   // L
+  putc(pm, 76);   // L
+  putc(pm, 77);   // M
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 48 + n);
+  putc(pm, 10);   // newline
   return;
 }
 
@@ -398,22 +405,22 @@ fn serial_llm_marker(n: Int) -> Unit {
 // delivering the first RX frame). Every step is gated on the previous step's
 // return, so a missing NIC emits nothing and existing gates (which boot
 // WITHOUT -netdev) stay green — acceptance criterion 6 (no-NIC-safe).
-fn net_bringup() -> Unit {
+fn net_bringup(pm: cap phys.mem) -> Unit {
   let p: Int = net_probe();
   if (p == 1) {
-    serial_net_marker(1);
+    serial_net_marker(pm, 1);
     let i: Int = net_init();
     if (i == 1) {
-      serial_net_marker(2);
+      serial_net_marker(pm, 2);
       let l: Int = net_link_up();
       if (l == 1) {
-        serial_net_marker(3);
+        serial_net_marker(pm, 3);
         // Deterministic frame source (LOCKED): guest ARPs the gateway, slirp
         // answers automatically — the first RX frame, no host-side injection.
         let sent: Int = net_arp_request_gateway();
         let rlen: Int = net_rx_wait();
         if (rlen > 0) {
-          serial_rx_marker(rlen);
+          serial_rx_marker(pm, rlen);
           net_rx_done();
         }
       }
@@ -435,9 +442,8 @@ fn net_bringup() -> Unit {
 //
 // Fuel discipline: net_connect() and the response poll are bounded by the
 // C-side stack (net_rx_wait from 2d-1 + the net_stack_poll fuel counter) —
-// Curlee has no assignment statements (immutable `let` bindings), so the
-// poll loop uses the extern call in the CONDITION, exactly like the Phase 2b
-// `while (fb_loop_frame() < 4)` loop: each iteration re-evaluates
+// the poll loop uses the extern call in the CONDITION, exactly like the
+// Phase 2b `while (fb_loop_frame() < 4)` loop: each iteration re-evaluates
 // net_stack_poll(), which fails closed (returns 2 — not 0) once its C-owned
 // fuel counter is exhausted, so the loop provably terminates.
 // Phase 2d-3: the pure JSON/tool-call parser bridge (kernel/json.curlee, merged
@@ -459,8 +465,8 @@ fn net_bringup() -> Unit {
 // is 0 on the current PVH stubs), so the codegen harness is the CI-visible
 // full-happy-path proof.
 //
-// The feed loop is a bounded recursion over an immutable index (Curlee has no
-// assignment — the established extern-loop pattern, e.g. the `while
+// The feed loop is a bounded recursion over an immutable index (no mutable
+// counter needed — the established extern-loop pattern, e.g. the `while
 // (net_stack_poll() == 0)` poll). json_step ignores bytes once the state
 // freezes in the error phase, so the loop provably terminates at len.
 fn json_feed(i: Int, rlen: Int, st: Int) -> Int {
@@ -474,47 +480,47 @@ fn json_feed(i: Int, rlen: Int, st: Int) -> Int {
 }
 
 // Serial marker "JSON: E<code>" — a single digit 0..9.
-fn serial_json_err(code: Int) -> Unit {
-  curlee_putc(74);   // J
-  curlee_putc(83);   // S
-  curlee_putc(79);   // O
-  curlee_putc(78);   // N
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
-  curlee_putc(69);   // E
-  curlee_putc(48 + code);
-  curlee_putc(10);   // newline
+fn serial_json_err(pm: cap phys.mem, code: Int) -> Unit {
+  putc(pm, 74);   // J
+  putc(pm, 83);   // S
+  putc(pm, 79);   // O
+  putc(pm, 78);   // N
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 69);   // E
+  putc(pm, 48 + code);
+  putc(pm, 10);   // newline
   return;
 }
 
 // Serial marker "JSON: 1" — parser OK.
-fn serial_json_ok() -> Unit {
-  curlee_putc(74);   // J
-  curlee_putc(83);   // S
-  curlee_putc(79);   // O
-  curlee_putc(78);   // N
-  curlee_putc(58);   // :
-  curlee_putc(32);   // space
-  curlee_putc(49);   // 1
-  curlee_putc(10);   // newline
+fn serial_json_ok(pm: cap phys.mem) -> Unit {
+  putc(pm, 74);   // J
+  putc(pm, 83);   // S
+  putc(pm, 79);   // O
+  putc(pm, 78);   // N
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 49);   // 1
+  putc(pm, 10);   // newline
   return;
 }
 
 // The 2d-3 bridge: parse the received body and feed the tool-call queue.
 // Gated on a response being ready (net_response_len > 0), so the no-NIC /
 // no-response baseline emits nothing and existing gates stay green.
-fn json_llm_bridge() -> Unit {
+fn json_llm_bridge(pm: cap phys.mem) -> Unit {
   let rlen: Int = net_response_len();
   if (rlen > 0) {
     let over: Int = json_check_len(rlen);
     if (over == 1) {
-      serial_json_err(1);         // response > 256 bytes
+      serial_json_err(pm, 1);         // response > 256 bytes
     } else {
       let st0: Int = json_start();
       let st: Int = json_feed(0, rlen, st0);
       let err: Int = json_end(st);
       if (err == 0) {
-        serial_json_ok();
+        serial_json_ok(pm);
         // Enqueue the parsed tool call (kind 2 = "LLM tool call", arg = the
         // parsed value). The 2d-4 gate asserts "TOOL: 2" (the enqueue
         // SUCCEEDED — proving the bridge reached the 2b tool-call queue),
@@ -522,32 +528,32 @@ fn json_llm_bridge() -> Unit {
         let arg: Int = json_arg_value(st);
         let enq: Int = fb_tool_enqueue(2, arg);
         if (enq == 1) {
-          serial_tool_marker(2);
+          serial_tool_marker(pm, 2);
           // 2d-4 ack: the round-trip is complete — the parsed tool call is in
           // the 2b queue. Emit the "LLM: 1" ack marker (the gate's proof the
           // acknowledgment step ran). The visual "LLM OK" frame on the fb
           // path is a bonus (issue #3's "renders an acknowledgment frame");
           // the serial marker is the deterministic gate.
-          serial_llm_marker(1);
+          serial_llm_marker(pm, 1);
         }
       } else {
-        serial_json_err(err);
+        serial_json_err(pm, err);
       }
     }
   }
   return;
 }
 
-fn net_llm_roundtrip() -> Unit {
+fn net_llm_roundtrip(pm: cap phys.mem) -> Unit {
   let up: Int = net_link_up();
   if (up == 1) {
     let conn: Int = net_connect(8080);
     if (conn == 1) {
-      serial_arp_marker(1);
-      serial_tcp_marker(1);
+      serial_arp_marker(pm, 1);
+      serial_tcp_marker(pm, 1);
       let sent: Int = net_send(36);
       if (sent == 1) {
-        serial_snd_marker(36);
+        serial_snd_marker(pm, 36);
         // Poll until the response body is ready or the stack fails closed.
         // net_stack_poll(): 0 = still reading, 1 = response ready, 2 = fuel
         // exhausted / protocol error, 3 = truncated (Content-Length > 256).
@@ -558,7 +564,7 @@ fn net_llm_roundtrip() -> Unit {
         }
         let rlen: Int = net_response_len();
         if (rlen > 0) {
-          serial_rcv_marker(rlen);
+          serial_rcv_marker(pm, rlen);
         }
       }
     }
@@ -650,16 +656,16 @@ fn main(pm: cap phys.mem) -> Unit {
   // it on any boot path. With no virtio-net device, net_probe() finds
   // nothing and the whole sequence is a safe no-op (existing gates stay
   // green — acceptance criterion 6).
-  net_bringup();
+  net_bringup(pm);
   // Phase 2d-2: the TCP/IP stack round-trip (ARP -> TCP -> send -> receive).
   // Gated on link-up, so with no NIC (or on the PVH stub path) every extern
   // returns 0 and the whole sequence is a safe no-op — existing gates stay
   // green. The marker sequence (ARP: 1, TCP: 1, SND: 36, RCV: <len>) is
   // asserted by the 2d-4 qemu-llm-smoke gate against a host stub server.
-  net_llm_roundtrip();
+  net_llm_roundtrip(pm);
   // Phase 2d-3: parse the received response (if any) and feed the tool-call
   // queue. Gated on net_response_len > 0, so the no-NIC baseline emits nothing.
-  json_llm_bridge();
+  json_llm_bridge(pm);
   fb_init();
   if (fb_ready() == 1) {
     // The linear framebuffer is active. Two sub-paths, distinguished by
@@ -685,7 +691,7 @@ fn main(pm: cap phys.mem) -> Unit {
       // FB: 1 marker proves fb_ready()==1 and the renderer ran under
       // `qemu -kernel` (make qemu-pvh-fb-smoke greps for it).
       render_frame(pm, 0);
-      serial_fb_marker();
+      serial_fb_marker(pm);
     } else {
       // GRUB path: the 60 FPS ring loop.
       fb_loop_init();
@@ -695,7 +701,7 @@ fn main(pm: cap phys.mem) -> Unit {
         // let fb_run_loop advance the counter and drain the ring.
         let f: Int = fb_loop_frame();
         render_frame(pm, f);
-        serial_frame_marker(f);
+        serial_frame_marker(pm, f);
         // Producer: enqueue a "frame-tick" intent (kind 1, arg = the frame
         // number). The slot for this frame comes from tool_queue_slot
         // (division-free wrap). kind 1 is the reserved "frame tick" intent
@@ -713,9 +719,9 @@ fn main(pm: cap phys.mem) -> Unit {
       // can prove the Phase 2c flip ran (grep "RING: 1" alongside "FB:").
       let ring_on: Int = fb_ring_active();
       if (ring_on == 1) {
-        serial_ring_marker();
+        serial_ring_marker(pm);
       }
-      serial_fb_marker();
+      serial_fb_marker(pm);
     }
   } else {
     // No trusted framebuffer (text-mode ISO, no VBE device): VGA text +
@@ -772,7 +778,7 @@ fn main(pm: cap phys.mem) -> Unit {
     let c22: Phys<U16> = phys<U16>(0xB802C);
     c22.write(vga_cell(32, 15));  // (space)
   }
-  serial_hello();
+  serial_hello(pm);
   curlee_halt();
   return;
 }

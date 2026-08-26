@@ -73,7 +73,7 @@ kernel/
   canvas_test.curlee     # VM-runnable assertions over the pure modules
   pack.curlee            # pure cell/pixel helpers (VM-testable, verified)
   boot.S                 # multiboot2 64-bit entry (GRUB ISO path)
-  putc_driver.c          # COM1 serial override of weak curlee_putc
+  serial.curlee          # COM1 serial driver (ported from putc_driver.c, issue #9)
   vga_setup.c            # VGA text-mode-3 programming (QEMU display path)
   fb.c                   # linear-FB software blitter (pixel/fill/line/text/blit)
 ```

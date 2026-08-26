@@ -56,7 +56,7 @@
 #include <stdint.h>
 
 // ---------------------------------------------------------------------------
-// Port I/O — freestanding, no libc sys/io.h. Mirrors kernel/putc_driver.c and
+// Port I/O — freestanding, no libc sys/io.h. Mirrors kernel/serial.curlee and
 // kernel/vbe.c. This is the ONLY section of the driver that touches I/O ports.
 // ---------------------------------------------------------------------------
 static inline void outb(unsigned short port, unsigned char v)
