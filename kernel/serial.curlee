@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// serial.curlee — COM1 (serial port 0x3F8) UART driver, ported from the
+// former kernel/putc_driver.c (deleted in issue #9).
+//
+// putc implements the weak-hook contract of the Curlee freestanding runtime:
+// runtime/rt.c declares `curlee_putc` weak and no-op so linking always
+// succeeds; the codegen emits this file's `putc` as the static symbol
+// `curlee_putc`, which every serial marker in kernel.curlee calls. QEMU
+// captures the output with `-serial file:...` / `-serial stdio`, giving an
+// observable, deterministic boot check: "Hello world from JOE" in the log.
+//
+// COM1 UART registers (x86 I/O ports):
+//   DATA 0x3F8 — transmit-holding register (write the byte to send)
+//   LSR  0x3FD — line-status register; bit 5 (mask 32) = THR empty
+//
+// The busy-wait re-reads the LSR on EVERY iteration (unlike the minimal
+// compile-check audit probe tests/audit/joeos_02) so the loop actually waits
+// for the UART to drain. Port reads are opaque to the verifier (no axioms),
+// so the loop needs no contract: the legacy single-pass mode checks the body
+// once with the loop condition assumed (joeos_02 probe, issue #274).
+//
+// Design laws honored:
+//   - Single address space, Ring 0: port I/O is direct x86 in/out asm
+//     (curlee_port_inb/curlee_port_outb prologue helpers).
+//   - Deterministic verification: `curlee check serial.curlee` runs standalone
+//     and the merged kernel re-verifies it (`make check`).
+//   - Minimal footprint: no libc, no String/Vec; a 12-line driver.
+
+fn putc(pm: cap phys.mem, c: Int) -> Unit {
+  unsafe {
+    // Wait for the transmit-holding register to be empty (LSR bit 5 = 32).
+    let lsr: U8 = port_inb(0x3FD);        // COM1 LSR (opaque read)
+    while ((lsr & 32) == 0) {
+      lsr = port_inb(0x3FD);              // re-read every iteration
+    }
+    port_outb(0x3F8, c);                  // COM1 DATA: transmit the byte
+  }
+  return;
+}

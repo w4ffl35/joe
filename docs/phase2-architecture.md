@@ -38,10 +38,11 @@ The existing Phase 1 code already embodies the pattern that Phase 2 scales up:
 │   • calls extern fb_* primitives (no Phys needed in Curlee)│
 ├────────────────────────────────────────────────────────────┤
 │ C driver layer (imperative, owns mutable state)            │
-│   fb.c  putc_driver.c  vga_setup.c                         │
+│   fb.c  vga_setup.c                                        │
 │   • owns fb_addr/pitch/width/height, glyph tables,         │
 │     frame buffer + ring state                              │
 │   • the ONLY layer that touches (volatile) framebuffer     │
+│     (COM1 serial moved to Curlee: serial.curlee, issue #9) │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -75,8 +76,8 @@ joeos/
 │   ├── canvas_test.curlee          # NEW: VM test — imports the 3 modules, asserts math
 │   ├── json_test.curlee            # NEW (2d-3): VM test — imports json, asserts phases
 │   ├── pack.curlee                 # (existing, kept)
+│   ├── serial.curlee               # NEW (issue #9): COM1 putc, ported from putc_driver.c
 │   ├── fb.c                        # EXTENDED: pixel/fill_rect/line/text/blit primitives
-│   ├── putc_driver.c               # (existing)
 │   ├── vga_setup.c                 # (existing)
 │   └── boot.S                      # (existing)
 ```
@@ -201,7 +202,9 @@ Contains: extern declarations, the declarative `render_frame`, and `main`. It do
 modules + the merged file.
 
 ```curlee
-extern fn curlee_putc(c: Int) -> Unit;
+// NOTE: no `extern fn curlee_putc` — since issue #9 the COM1 driver is a real
+// Curlee function (`putc` in serial.curlee), codegen'd as the static symbol
+// `curlee_putc` (the runtime weak-hook name).
 extern fn curlee_halt() -> Unit;
 
 // fb.c blitter surface (extended in this phase)
