@@ -86,8 +86,8 @@ for f in "$KERNEL_DIR"/*.c; do
 
     # 3. C must never call up into Curlee (curlee_* symbols are codegen-emitted
     #    with static linkage; a C call to one is a layering violation).
-    #    Only match NON-comment lines (grep -v strips // comments; vbe.c
-    #    mentions fb_ready only in its header comment).
+    #    Only match NON-comment lines (grep -v strips // comments; the former
+    #    vbe.c mentioned fb_ready only in its header comment).
     if grep -vE '^\s*//' "$f" | grep -qE '\b(curlee_|fb_init|fb_ready|fb_get_|fb_asset_|fb_ring_|fb_loop_|json_|vga_cell|render_frame|draw_glyph)\s*\('; then
         # Whitelist: these extern-implementation shims legitimately DEFINE the
         # symbols (fb_* in fb.c) rather than call them. net_* files only define

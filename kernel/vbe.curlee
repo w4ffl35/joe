@@ -1,0 +1,148 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// vbe.curlee — Bochs VBE (QEMU stdvga / VirtualBox) linear-framebuffer
+// probe, ported from the former kernel/vbe.c (deleted in gh issue #11).
+//
+// Phase 2f: the QEMU `-kernel` (PVH) path has no multiboot2 info structure,
+// so kernel/mb2.c cannot find a framebuffer tag and fb_ready() stays 0 there
+// (VGA text + serial fallback only). This module probes the Bochs VBE
+// controller — the I/O-port interface (0x1CE/0x1CF) that QEMU's stdvga and
+// VirtualBox's VGA both implement — to:
+//
+//   (a) confirm a VBE device is present (ID register returns the Bochs
+//       family 0xB0Cx; QEMU stdvga returns 0xB0C5),
+//   (b) set a 640x480x32 linear-framebuffer mode directly from the kernel
+//       (the Bochs VBE extension is designed for exactly this — no BIOS
+//       call, no real-mode thunk),
+//   (c) validate the mode was accepted by reading the registers back.
+//
+// On success it fills the SAME framebuffer globals (fb_addr/pitch/width/
+// height) that kernel/mb2.c fills from the multiboot2 tag, so the blitter
+// (kernel/fb.c) is unchanged and fb_ready() returns 1.
+//
+// Trust model (matches kernel/mb2.c): fb_ready() must return 1 only for a
+// VALIDATED framebuffer. Validation here is: Bochs VBE ID present AND the
+// 32bpp LFB mode-set was accepted (register readback matches) AND the LFB
+// base passes a 32-bit MMIO-range sanity gate. Only then do we touch the
+// LFB — no hardcoded/unvalidated LFB writes (an unmapped LFB faults the VM,
+// docs/phase2e-architecture.md §7 finding 4).
+//
+// Port note — what stayed in C (and why): the whole probe (port I/O, mode
+// programming, readback validation) ports directly — the same
+// port_outw/port_inw pattern as kernel/serial.curlee and
+// kernel/vga_setup.curlee. The framebuffer globals it fills are C-visible
+// .data state owned by kernel/fb.c (still C — the blitter), and Curlee has
+// no global variables and no way to address C globals, so the four stores
+// stay as a raw state shim in kernel/vbe_state.c (`vbe_state_set`) — the
+// second pillar of the C boundary policy (docs/c-boundary-policy.md §1:
+// "No logic in C — only I/O touches and raw memory moves."). Everything else
+// is genuine Curlee below.
+//
+// Port note — the C original's `goto validated`: Curlee has no goto, so the
+// shared validated tail is factored into `vbe_validated_fill` and reached
+// from BOTH the already-correct fast path (step 2) and the programmed +
+// readback path (step 4) — the fast path is preserved exactly (re-running
+// the full disable/enable sequence on an already-active mode is not
+// reliably idempotent on QEMU stdvga). The C original read its step-4
+// `xres`/`yres` at the validated label even when the fast path jumped there
+// (the goto skipped their initialization — indeterminate reads, latent UB);
+// the port fills the PROVEN constants 640/480 instead, which is exactly what
+// the fast path's own cx/cy/cb check and the readback gate establish —
+// behavior-preserving and strictly more defined.
+//
+// Hex literals: only valid inside phys()/port/write() positions in the
+// current compiler (verified empirically with `curlee check`, gh issue #11),
+// so every mask/constant used in a comparison is decimal with the hex value
+// in a comment.
+//
+// Design laws honored:
+//   - Single address space, Ring 0: port I/O is direct x86 in/out asm
+//     (curlee_port_outw/curlee_port_inw prologue helpers).
+//   - Deterministic verification: `curlee check vbe.curlee` runs standalone
+//     and the merged kernel re-verifies it (`make check`).
+//   - Minimal footprint: no libc, no String/Vec; a flat register sequence.
+
+// Provided by kernel/vbe_state.c: fills the framebuffer globals
+// fb_addr/fb_pitch/fb_width/fb_height (C-visible .data owned by kernel/fb.c;
+// Curlee cannot address C globals — the one justified C residual, above).
+extern fn vbe_state_set(addr: Int, pitch: Int, width: Int, height: Int) -> Unit;
+
+// The shared validated tail (the C original's `validated:` label): the LFB
+// base is the documented QEMU stdvga VBE LFB (0xFD000000 — verified on the
+// GRUB path, the multiboot2 tag reports exactly this; VirtualBox uses the
+// same class of address). Sanity gate: the base must be in the 32-bit MMIO
+// range [0x100000, 0x100000000). Then fill the framebuffer globals the
+// blitter reads. 32bpp: pitch = width * 4 — the same relationship the
+// multiboot2 tag reports. Returns 1 (the C original returned 1 after the
+// same tail).
+fn vbe_validated_fill() -> Int {
+  let lfb: Int = 4244635648;   // 0xFD000000 (QEMU stdvga VBE LFB base)
+  if (lfb < 1048576 || lfb >= 4294967296) {   // 0x100000 .. 0x100000000
+    return 0;
+  }
+  vbe_state_set(lfb, 2560, 640, 480);   // 640 * 4 bytes per row
+  return 1;
+}
+
+// Probe the Bochs VBE controller and, on success, fill the framebuffer
+// globals. Returns 1 when a validated 32bpp linear framebuffer is active.
+fn vbe_probe(pm: cap phys.mem) -> Int {
+  unsafe {
+    // 1. Presence: the Bochs VBE ID register must return a 0xB0Cx family
+    //    value (QEMU stdvga returns 0xB0C5). Anything else means no VBE
+    //    device on the legacy ports (e.g. `-vga none`).
+    port_outw(0x1CE, 0x0);            // index register: ID (0x0)
+    let id: U16 = port_inw(0x1CF);    // data register: ID value
+    if ((id & 65520) != 45248) {      // (id & 0xFFF0) != 0xB0C0
+      return 0;
+    }
+
+    // 2. Read the CURRENT mode. If it already matches 640x480x32 with the
+    //    LFB enabled, skip re-programming (true idempotence — re-running the
+    //    full disable/enable sequence on an already-active mode is not
+    //    reliably idempotent on QEMU stdvga). The C original's `goto
+    //    validated` is expressed as an early return through the shared tail.
+    port_outw(0x1CE, 0x4);            // index register: ENABLE (0x4)
+    let en: U16 = port_inw(0x1CF);
+    if ((en & 65) == 65) {            // ENABLED | LFB_ENABLED (0x41 = 0x01 | 0x40)
+      port_outw(0x1CE, 0x1);          // index register: XRES (0x1)
+      let cx: U16 = port_inw(0x1CF);
+      port_outw(0x1CE, 0x2);          // index register: YRES (0x2)
+      let cy: U16 = port_inw(0x1CF);
+      port_outw(0x1CE, 0x3);          // index register: BPP (0x3)
+      let cb: U16 = port_inw(0x1CF);
+      if (cx == 640 && cy == 480 && cb == 32) {
+        return vbe_validated_fill();
+      }
+    }
+
+    // 3. Program the mode: disable, set 640x480x32, re-enable with the LFB
+    //    bit set (ENABLED | LFB_ENABLED = 0x41 = 65).
+    port_outw(0x1CE, 0x4);            // index register: ENABLE (0x4)
+    port_outw(0x1CF, 0x0);            // DISABLED (0x00)
+    port_outw(0x1CE, 0x1);            // index register: XRES (0x1)
+    port_outw(0x1CF, 640);
+    port_outw(0x1CE, 0x2);            // index register: YRES (0x2)
+    port_outw(0x1CF, 480);
+    port_outw(0x1CE, 0x3);            // index register: BPP (0x3)
+    port_outw(0x1CF, 32);
+    port_outw(0x1CE, 0x4);            // index register: ENABLE (0x4)
+    port_outw(0x1CF, 65);             // ENABLED | LFB_ENABLED (0x41)
+
+    // 4. Validate by readback: the controller must report the exact mode we
+    //    requested. QEMU stdvga clamps/refuses unsupported modes, so any
+    //    mismatch means there is no usable LFB.
+    port_outw(0x1CE, 0x1);            // index register: XRES (0x1)
+    let xres: U16 = port_inw(0x1CF);
+    port_outw(0x1CE, 0x2);            // index register: YRES (0x2)
+    let yres: U16 = port_inw(0x1CF);
+    port_outw(0x1CE, 0x3);            // index register: BPP (0x3)
+    let bpp: U16 = port_inw(0x1CF);
+    if (xres != 640 || yres != 480 || bpp != 32) {
+      return 0;
+    }
+    // Fall through to the shared validated tail (step 5) when the readback
+    // matches — the C original's `validated:` label.
+  }
+  return vbe_validated_fill();
+}

@@ -153,11 +153,14 @@ static unsigned int fb_target_stride = 0;
 // the framebuffer globals above. Returns 1 on a usable 32bpp framebuffer tag.
 int mb2_parse(void);
 
-// kernel/vbe.c — Phase 2f Bochs VBE probe (QEMU stdvga / VirtualBox) used on
-// the PVH path, where there is no multiboot2 info structure. Returns 1 when a
-// validated 32bpp linear framebuffer was set up via the Bochs VBE I/O
-// interface (ports 0x1CE/0x1CF). Same framebuffer globals as mb2_parse().
-int vbe_probe(void);
+// Phase 2f Bochs VBE probe (QEMU stdvga / VirtualBox) used on the PVH path,
+// where there is no multiboot2 info structure. PORTED TO CURLEE in gh issue
+// #11 (kernel/vbe.curlee, `vbe_probe`) — C can no longer call it: the codegen
+// emits it as a static `curlee_vbe_probe` symbol and the C boundary policy
+// forbids C calling up (docs/c-boundary-policy.md §2). Curlee main now drives
+// the probe itself and calls fb_wire_draw_target() after it (see fb_init).
+// The probe fills the SAME framebuffer globals as mb2_parse() via the raw
+// state shim kernel/vbe_state.c (`vbe_state_set`).
 
 // Weak defaults so the QEMU PVH path (which links crt0.S, not boot.S) still
 // links; boot.S's strong .data definition overrides this when present.
@@ -244,42 +247,56 @@ long long fb_ring_slot(void)
 //       %ebx into mb2_info_addr; mb2_parse() walks the structure and finds
 //       the framebuffer tag (type 8) — the single source of truth.
 //   (b) Bochs VBE probe (QEMU `-kernel` PVH path, Phase 2f): no multiboot2
-//       info exists, so vbe_probe() programs 640x480x32 via the Bochs VBE
-//       I/O interface (ports 0x1CE/0x1CF) and fills the same framebuffer
-//       globals. Only a VALIDATED framebuffer (VBE ID present + mode
-//       readback matches + address range gate) is accepted.
+//       info exists, so the Curlee `vbe_probe` (kernel/vbe.curlee, gh issue
+//       #11) programs 640x480x32 via the Bochs VBE I/O interface (ports
+//       0x1CE/0x1CF) and fills the same framebuffer globals. Only a
+//       VALIDATED framebuffer (VBE ID present + mode readback matches +
+//       address range gate) is accepted.
 // When neither source yields a framebuffer, fb_ready() stays 0 and the
 // kernel falls back to VGA text + serial (all gates green).
+//
+// Wire the draw target to the visible framebuffer. Before the frame ring
+// activates, the draw target IS the visible framebuffer (single-buffer 2a/2e
+// behavior exactly); fb_present() re-points fb_draw_target at the ring back
+// buffers on the GRUB path (where the ring is compiled in).
+//
+// Phase 2f: this MUST run on the PVH path too. The previous #ifndef
+// JOE_PVH_BOOT guard compiled this block OUT under qemu -kernel, so even
+// when vbe_probe() validated an LFB and filled fb_addr, fb_draw_target
+// stayed 0 (zero-filled .bss) and every blitter primitive silently no-oped —
+// the exact "probe works but nothing draws / fb_ready() reads 0" symptom.
+// Gating on fb_addr != 0 (not the build macro) covers both paths: GRUB
+// (multiboot2 tag) and PVH (VBE probe) both land here, and the GRUB ring
+// flip behavior is unchanged (ring_active gates the flip).
+//
+// gh issue #11: fb_init() calls this once after mb2_parse(); Curlee main
+// calls it AGAIN after the Curlee vbe_probe fills the globals on the PVH
+// path (fb_init's own call ran while fb_addr was still 0, so the draw target
+// would otherwise stay unwired).
+void fb_wire_draw_target(void)
+{
+    if (fb_addr != 0)
+    {
+        fb_draw_target = (volatile unsigned int*)(unsigned long)fb_addr;
+        fb_target_stride = fb_pitch;
+    }
+}
+
+// gh issue #11: fb_init() no longer calls vbe_probe() — it moved to Curlee,
+// and the codegen emits it as a static `curlee_vbe_probe` symbol the C layer
+// must not call (C boundary policy). Curlee main runs fb_init() first (the
+// multiboot2 tag always wins on the GRUB path), then calls vbe_probe(pm)
+// itself when fb_ready()==0 AND the PVH build marker reads 0 (the former
+// #ifdef JOE_PVH_BOOT gate, expressed via fb_asset_region_w()), then calls
+// fb_wire_draw_target() to re-point the draw target once the probe filled
+// the globals.
 void fb_init(void)
 {
     if (mb2_parse())
     {
         /* GRUB multiboot2 framebuffer tag is the single source of truth. */
     }
-#ifdef JOE_PVH_BOOT
-    else if (vbe_probe())
-    {
-        /* Bochs VBE probe validated a 32bpp LFB (PVH path, Phase 2f). */
-    }
-#endif
-    // Target indirection: before the frame ring activates, the draw target
-    // IS the visible framebuffer (single-buffer 2a/2e behavior exactly).
-    // fb_present() re-points fb_draw_target at the ring back buffers on the
-    // GRUB path (where the ring is compiled in).
-    //
-    // Phase 2f: this MUST run on the PVH path too. The previous #ifndef
-    // JOE_PVH_BOOT guard compiled this block OUT under qemu -kernel, so even
-    // when vbe_probe() validated an LFB and filled fb_addr, fb_draw_target
-    // stayed 0 (zero-filled .bss) and every blitter primitive silently
-    // no-oped — the exact "probe works but nothing draws / fb_ready() reads
-    // 0" symptom. Gating on fb_addr != 0 (not the build macro) covers both
-    // paths: GRUB (multiboot2 tag) and PVH (VBE probe) both land here, and
-    // the GRUB ring flip behavior is unchanged (ring_active gates the flip).
-    if (fb_addr != 0)
-    {
-        fb_draw_target = (volatile unsigned int*)(unsigned long)fb_addr;
-        fb_target_stride = fb_pitch;
-    }
+    fb_wire_draw_target();
 }
 
 // ---------------------------------------------------------------------------
