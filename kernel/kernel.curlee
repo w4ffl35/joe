@@ -87,9 +87,6 @@ extern fn fb_tool_enqueue(kind: Int, arg: Int) -> Int;
 extern fn fb_tool_drained() -> Int;
 extern fn fb_tool_pending() -> Int;
 
-// Provided by kernel/vga_setup.c: programs VGA text mode 3 (QEMU fallback).
-extern fn vga_text_setup() -> Unit;
-
 // Phase 2d-1 — VirtIO-net driver (kernel/virtio_net.c). The first six are the
 // LOCKED 2d-1 extern surface (docs/phase2d-wire.md §6); the byte-buffer window
 // (net_rx_byte / net_tx_stage_byte / net_mac_byte / net_poll_tick) plus the
@@ -725,8 +722,12 @@ fn main(pm: cap phys.mem) -> Unit {
     }
   } else {
     // No trusted framebuffer (text-mode ISO, no VBE device): VGA text +
-    // serial fallback keeps the Phase 1 gates green.
-    vga_text_setup();
+    // serial fallback keeps the Phase 1 gates green. vga_text_setup is a
+    // genuine Curlee function (kernel/vga_setup.curlee, ported from the
+    // deleted kernel/vga_setup.c in issue #10): it programs the VGA CRT
+    // controller for text mode 3, then delegates the 0xB8000 buffer clear
+    // to the vga_clear_text_buffer raw-memory-move extern.
+    vga_text_setup(pm);
   }
   unsafe {
     // Row 0, columns 0..22 (2 bytes per cell, base 0xB8000).

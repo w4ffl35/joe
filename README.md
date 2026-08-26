@@ -41,7 +41,8 @@ to the screen, with serial output for verification.
   (which supports x86-64 ELF kernels) enters the kernel in long mode.
 - **Display**: the kernel renders "Hello World from JOE" to the VGA text
   buffer (`Phys<U16>` writes at `0xB8000`, attribute 0x0F), after programming
-  VGA text mode 3 (`vga_setup.c`). Under QEMU this renders perfectly.
+  VGA text mode 3 (`vga_setup.curlee`, ported from the deleted
+  `vga_setup.c`, issue #10). Under QEMU this renders perfectly.
   A framebuffer renderer (`fb.c`, 5x7 glyphs as 32bpp pixels) is included and
   is selected when a real linear framebuffer is available; it is not yet
   reachable because the multiboot2 framebuffer address (passed in registers
@@ -74,7 +75,8 @@ kernel/
   pack.curlee            # pure cell/pixel helpers (VM-testable, verified)
   boot.S                 # multiboot2 64-bit entry (GRUB ISO path)
   serial.curlee          # COM1 serial driver (ported from putc_driver.c, issue #9)
-  vga_setup.c            # VGA text-mode-3 programming (QEMU display path)
+  vga_setup.curlee       # VGA text-mode-3 register programming (ported from vga_setup.c, issue #10)
+  vga_text_clear.c       # 0xB8000 text-buffer clear (raw memory move — see c-boundary-policy.md)
   fb.c                   # linear-FB software blitter (pixel/fill/line/text/blit)
 ```
 
