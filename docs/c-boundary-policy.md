@@ -49,8 +49,12 @@ The network protocol logic in `net_stack.c` followed in issue #12 — the full
 ARP/IPv4/TCP byte layout, the RFC 1071/793 checksums and the HTTP framing
 state machine are now `net_stack.curlee` (pure, VM-verified against the C
 ground truth) plus the kernel.curlee glue. The multiboot2 parser in `mb2.c`
-is the *same class of code* and should migrate as the language gains
-assignment (see §4).
+was the *same class of code* and migrated in issue #15 as the language gained
+assignment + bitwise ops + the runtime-address `phys_read_u*` reads (curlee
+issues #268/#270/#279): the tag walk is now `mb2.curlee`, host-verified
+against scripted physical memory (`make mb2-codegen-run`), with only the
+raw-state shim (`mb2_state.c`: the info-addr getter, the four global stores,
+and the raw volatile reads) left in C (see §3).
 
 ## 2. What "no logic" means concretely (review checklist)
 
@@ -59,7 +63,7 @@ A C file **violates** the policy if it contains:
 - **Protocol/format logic** — big-endian header packing, checksums, length
   framing, field parsing. (`net_stack.c`'s ARP/IPv4/TCP byte layout was the
   canonical violation — migrated to `net_stack.curlee` in issue #12;
-  `mb2.c`'s tag walk is a parser.)
+  `mb2.c`'s tag walk was a parser — migrated to `mb2.curlee` in issue #15.)
 - **Pure data tables** — glyph bitmaps, lookup tables, color palettes.
   (`fb.c` carried a 5x7 glyph table duplicate until 2026-08 — deleted; the
   authoritative copy is `glyphs.curlee`.)
@@ -89,12 +93,16 @@ The current offenders (grandfathered, tracked for migration):
 |---|---|---|---|
 | `virtio_net.c` | 798 | ~300 (ring math) | Curlee gains assignment + port I/O |
 | `fb.c` | ~680 | ~150 (Bresenham, loops) | Curlee gains assignment |
-| `mb2.c` | 116 | ~80 (tag walk) | Curlee gains assignment + bitwise |
 | `libgcc32.c` | 322 | 0 (compiler shim) | never (GCC ABI) |
 
 (`net_stack.c` is gone from this table: its ~700 lines of protocol logic
 migrated to `net_stack.curlee` + the kernel.curlee glue in issue #12, and
-the file is now a ~110-line raw-state shim in the exempt category above.)
+the file is now a ~110-line raw-state shim in the exempt category above.
+`mb2.c` is gone too: its 116-line tag walk migrated to `mb2.curlee` in issue
+#15, leaving a ~50-line raw-state shim (`mb2_state.c` — the info-addr
+getter, the four framebuffer-global stores, and the runtime-address
+`phys_read_u8/u32` raw volatile loads, curlee issue #279) in the exempt
+category above.)
 
 ## 4. Migration roadmap (what unblocks what)
 
@@ -102,7 +110,8 @@ The C surface collapses to a thin I/O shim once three Curlee features land
 (tracked as GitHub issues in `w4ffl35/curlee`):
 
 1. **Assignment / affine mutation** — unblocks `fb.c` (blitter loops),
-   `mb2.c` (tag walk), the state machines in `virtio_net.c`.
+   the state machines in `virtio_net.c`. (The `mb2.c` tag walk used this —
+   the mutable cursor in `mb2.curlee`, issue #15.)
 2. **Port I/O (`outb`/`inb`/`outw`/`inw`/`outl`/`inl`)** — unblocks the
    PCI config half of `virtio_net.c`.
    `putc_driver.c` migrated first on this feature (issue #9, now
@@ -116,7 +125,17 @@ The C surface collapses to a thin I/O shim once three Curlee features land
    descriptor flags, and alignment math. Landed in the compiler ahead of
    issue #12, which used it to migrate the whole `net_stack.c` protocol core
    (byte layout, RFC 1071/793 checksums, the HTTP framing state machine) to
-   `net_stack.curlee` — only the raw-state shim remains in C.
+   `net_stack.curlee` — only the raw-state shim remains in C. Issue #15 used
+   it for the `(size + 7) & ~7` tag-alignment math in `mb2.curlee`.
+4. **Runtime-address physical reads (`phys_read_u8/u16/u32/u64`, curlee issue
+   #279)** — the last piece that unblocked the `mb2.c` tag walk: the
+   multiboot2 info structure lives at a RUNTIME address captured by the boot
+   stub, which a compile-time-literal `Phys<T>` cannot address. `mb2.curlee`
+   (issue #15) calls them inside `unsafe` with `cap phys.mem`, exactly like
+   the `Phys<T>` reads; the definitions are raw volatile loads in
+   `mb2_state.c` (the current toolchain runtime does not carry the symbols).
+   A **runtime-address physical write** counterpart would additionally unblock
+   the `vga_text_clear.c` raw memory move.
 
 Until then, **do not add new pure logic to C**. If a feature needs pure
 logic, write it as a Curlee module (even if the driver can't yet be

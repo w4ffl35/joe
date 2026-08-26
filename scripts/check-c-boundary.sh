@@ -32,7 +32,6 @@ MAX_LINES=200
 GRANDFATHERED=(
   "virtio_net.c"  # 798 lines — ring math, migrate with assignment+port I/O
   "fb.c"          # ~680 lines — blitter loops, migrate with assignment
-  "mb2.c"         # 116 lines — tag walk, migrate with assignment+bitwise
   "libgcc32.c"    # 322 lines — GCC ABI shim, NEVER migrates
 )
 

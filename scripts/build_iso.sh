@@ -9,8 +9,9 @@
 #       (0xB8000) path. Phase 1 / VirtualBox compatibility.
 #     fb: GRUB enables gfxterm + a linear framebuffer (VBE 640x480x32) and
 #       passes the framebuffer info via the multiboot2 info structure (which
-#       the kernel's boot.S now saves; mb2.c parses it — Phase 2e). The
-#       kernel's software renderer draws the demo scene.
+#       the kernel's boot.S now saves; mb2.curlee's mb2_parse walks it —
+#       Phase 2e / gh issue #15). The kernel's software renderer draws the
+#       demo scene.
 #
 # The kernel ELF must contain a multiboot2 header (kernel/boot.S provides it
 # via the GRUB-path link in the Makefile). grub-mkrescue wraps the ELF and a
@@ -49,7 +50,8 @@ if [[ "$mode" == "fb" ]]; then
     # Framebuffer mode (Phase 2e): GRUB enables gfxterm + a VBE linear
     # framebuffer (640x480x32) and includes the framebuffer tag in the
     # multiboot2 info structure passed via %ebx. The kernel's boot.S saves it,
-    # mb2.c parses it, and the software renderer draws the demo scene.
+    # mb2.curlee's mb2_parse walks it (gh issue #15), and the software
+    # renderer draws the demo scene.
     cat > "$workdir/boot/grub/grub.cfg" <<'EOF'
 set timeout=0
 set default=0

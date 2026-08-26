@@ -17,7 +17,8 @@
 // Freestanding: no libc.
 
 // Framebuffer state owned by kernel/fb.c (non-static .data globals so the
-// GRUB multiboot2 parser kernel/mb2.c and this shim can fill them).
+// GRUB multiboot2 parser kernel/mb2.curlee (via kernel/mb2_state.c) and this
+// shim can fill them).
 extern unsigned int fb_addr;
 extern unsigned int fb_pitch;
 extern unsigned int fb_width;
