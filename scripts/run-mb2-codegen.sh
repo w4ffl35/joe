@@ -27,7 +27,7 @@
 #          byte/word reads — the same shape as the kernel's volatile loads),
 #        - mb2_state_set records the (addr, pitch, width, height) the parser
 #          extracted,
-#      then drives curlee_main() across 11 scenarios and asserts BOTH the
+#      then drives curlee_main() across 12 scenarios and asserts BOTH the
 #      return value AND the recorded state against the C ground truth.
 #
 # Scenarios (each mirrors a C mb2_parse code path):
@@ -48,6 +48,12 @@
 #      original truncated the u64 to the u32 fb_addr global and would have
 #      returned 1 with an unusable fb_addr = 0 for this tag; the port is
 #      strictly saner, see kernel/mb2.curlee's port notes).
+#  12. info addr NEGATIVE (a u64 with bit 63 set, cast to signed Int by
+#      mb2_info_addr_get): rc 0 — the C original's UNSIGNED `>= 0x100000000ULL`
+#      rejects it, and the Curlee gate must too (`base < 0`), BEFORE any
+#      physical read (a wild dereference at (uintptr_t)-1). The hardened
+#      phys_read_u8/u32 mocks FAIL the run if a negative-address read ever
+#      happens, so this case proves the gate — not the mock.
 #
 # The boot gates then prove the real shim (kernel/mb2_state.c) + boot.S's
 # mb2_info_addr + the live GRUB tag produce the same result in the VM.
@@ -117,6 +123,7 @@ static void put_u64(unsigned long addr, unsigned long v)
 static long long current_addr = 0;
 static int state_called = 0;
 static unsigned int state_addr, state_pitch, state_width, state_height;
+static int failures = 0;
 
 long long mb2_info_addr_get(void)
 {
@@ -133,15 +140,28 @@ void mb2_state_set(unsigned int addr, unsigned int pitch, unsigned int width,
     state_height = height;
 }
 
+/* A NEGATIVE address is a WILD DEREFERENCE in the kernel ((uintptr_t)-1):
+ * the mb2_parse trust gate (base < 0, matching the C original's unsigned
+ * >= 0x100000000ULL) must reject it BEFORE any read. If a read still
+ * arrives with addr < 0, that is a trust-gate regression — fail the run. */
+static void wild_read_fail(int64_t addr)
+{
+    printf("MB2-CODEGEN: FAIL wild read at negative addr %lld "
+           "(trust gate must reject before any read)\n", addr);
+    failures++;
+}
+
 uint8_t phys_read_u8(int64_t addr)
 {
-    if (addr < 0 || (unsigned long)addr >= MEM_SIZE) { return 0; }
+    if (addr < 0) { wild_read_fail(addr); return 0; }
+    if ((unsigned long)addr >= MEM_SIZE) { return 0; }
     return mem[(unsigned long)addr];
 }
 
 uint32_t phys_read_u32(int64_t addr)
 {
-    if (addr < 0 || (unsigned long)addr + 3 >= MEM_SIZE) { return 0; }
+    if (addr < 0) { wild_read_fail(addr); return 0; }
+    if ((unsigned long)addr + 3 >= MEM_SIZE) { return 0; }
     return (uint32_t)mem[(unsigned long)addr]
          | ((uint32_t)mem[(unsigned long)addr + 1] << 8)
          | ((uint32_t)mem[(unsigned long)addr + 2] << 16)
@@ -152,7 +172,6 @@ uint32_t phys_read_u32(int64_t addr)
 long long curlee_main(void);
 
 /* ---- scenario bookkeeping ---- */
-static int failures = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("MB2-CODEGEN: FAIL %s\n", msg); failures++; } } while (0)
 
 /* Reset the scripted memory + recorded state for a fresh scenario. */
@@ -291,9 +310,18 @@ int main(void)
     put_fb_tag(0x80008, 0x100000000ULL, 32);
     run_case("fb_addr_hi", 0x80000, 40, 0, 0, 0, 0, 0, 0);
 
+    /* 12. Info addr NEGATIVE (a u64 with bit 63 set — e.g. a corrupted
+     * global — cast to signed Int by mb2_info_addr_get): the C original's
+     * UNSIGNED `mb2_info_addr >= 0x100000000ULL` rejects it, and the Curlee
+     * gate must too (base < 0), BEFORE any physical read. The hardened
+     * phys_read_* mocks above fail the run on a negative-address read, so
+     * this case proves the trust gate, not the mock. */
+    reset_mem();
+    run_case("negative_addr", -1LL, 0, 0, 0, 0, 0, 0, 0);
+
     if (failures == 0)
     {
-        printf("MB2-CODEGEN: PASS all 11 scenarios (return contract + extracted "
+        printf("MB2-CODEGEN: PASS all 12 scenarios (return contract + extracted "
                "framebuffer state identical to kernel/mb2.c)\n");
         return 0;
     }

@@ -208,10 +208,11 @@ net-stack-codegen-run:
 # gates (qemu-fb-smoke / qemu-loop-smoke) prove the live path; this harness
 # proves the SAME parser contract deterministically with no QEMU: it codegens
 # mb2.curlee and drives curlee mb2_parse against scripted physical memory
-# across 11 scenarios (happy path, every trust gate, malformed tags, the
-# 8-byte alignment math), asserting BOTH the return value AND the extracted
-# framebuffer state — identical to the C ground truth (the json-codegen-run /
-# net-stack-codegen-run precedent).
+# across 12 scenarios (happy path, every trust gate — incl. the negative
+# info-addr case the C original's unsigned >= 4 GiB gate rejects — malformed
+# tags, the 8-byte alignment math), asserting BOTH the return value AND the
+# extracted framebuffer state — identical to the C ground truth (the
+# json-codegen-run / net-stack-codegen-run precedent).
 mb2-codegen-run:
 	bash scripts/run-mb2-codegen.sh
 

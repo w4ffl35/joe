@@ -92,7 +92,7 @@ The current offenders (grandfathered, tracked for migration):
 | File | Lines | Pure-logic estimate | Migrate when |
 |---|---|---|---|
 | `virtio_net.c` | 798 | ~300 (ring math) | Curlee gains assignment + port I/O |
-| `fb.c` | ~680 | ~150 (Bresenham, loops) | Curlee gains assignment |
+| `fb.c` | 664 | ~150 (Bresenham, loops) | Curlee gains assignment |
 | `libgcc32.c` | 322 | 0 (compiler shim) | never (GCC ABI) |
 
 (`net_stack.c` is gone from this table: its ~700 lines of protocol logic
