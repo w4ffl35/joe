@@ -35,13 +35,14 @@ ASSETS_SRC    := kernel/assets.curlee
 JSON_SRC      := kernel/json.curlee
 SERIAL_SRC    := kernel/serial.curlee
 VGA_SETUP_SRC := kernel/vga_setup.curlee
+VBE_SRC       := kernel/vbe.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
 JSON_TEST     := kernel/json_test.curlee
 BOOT_ASM      := kernel/boot.S
 VGA_CLEAR_C   := kernel/vga_text_clear.c
 FB_C          := kernel/fb.c
 MB2_C         := kernel/mb2.c
-VBE_C         := kernel/vbe.c
+VBE_STATE_C   := kernel/vbe_state.c
 NET_C         := kernel/virtio_net.c
 NET_H         := kernel/net.h
 NET_STACK_C   := kernel/net_stack.c
@@ -75,11 +76,11 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
-$(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H)
+$(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(VBE_STATE_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel.o
@@ -91,10 +92,15 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $
 	# ring/asset region, which is where the framebuffer flip actually runs.
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
-	# Phase 2f: Bochs VBE probe (kernel/vbe.c) — PVH-only. The GRUB/ISO path
-	# (kernel-grub.elf) does NOT link it (dead code there: the multiboot2 tag
-	# always wins; see the kernel-grub.elf rule below).
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_C) -o $(BUILD_DIR)/vbe.o
+	# Phase 2f: Bochs VBE probe — ported to Curlee in gh issue #11
+	# (kernel/vbe.curlee, merged into kernel.c above). The only C residual is
+	# the framebuffer-state shim (kernel/vbe_state.c, `vbe_state_set`) that
+	# the Curlee probe calls to fill the C-visible globals. Linked into every
+	# ELF because curlee_main references curlee_vbe_probe -> vbe_state_set in
+	# ALL builds (the probe is only CALLED on the PVH path, but the symbol
+	# must resolve; on the GRUB/ISO path it is dead code — the multiboot2 tag
+	# always wins, and the PVH-build gate in main keeps the call unreached).
+	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_STATE_C) -o $(BUILD_DIR)/vbe_state.o
 	# Phase 2d-1: VirtIO-net driver (kernel/virtio_net.c). PVH path — option 1
 	# ACTIVE (JOE_PVH_BOOT): 1-byte ring/buffer stubs, every extern returns 0,
 	# net_probe() is a safe no-op (the PVH machine has no legacy PCI config
@@ -115,7 +121,7 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
 	  $(BUILD_DIR)/kernel.o $(BUILD_DIR)/vga_text_clear.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe_state.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
 	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 	@echo "Built $@"
@@ -126,7 +132,7 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
@@ -134,6 +140,7 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIA
 	$(CURLEE) check $(JSON_SRC)
 	$(CURLEE) check $(SERIAL_SRC)
 	$(CURLEE) check $(VGA_SETUP_SRC)
+	$(CURLEE) check $(VBE_SRC)
 	$(CURLEE) check $(MERGED_SRC)
 	@echo "curlee check: OK (all modules + merged kernel verified)"
 
@@ -184,13 +191,19 @@ iso: $(ISO)
 # Int math is implemented by libgcc32.o's __muldi3/__divdi3/... helpers).
 #
 # The 64-bit PVH/QEMU path (kernel.elf via crt0.S) is completely unchanged.
-$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(LIBGCC32_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H) $(LINKER_GRUB)
+$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(VBE_STATE_C) $(LIBGCC32_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H) $(LINKER_GRUB)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel-grub.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_CLEAR_C) -o $(BUILD_DIR)/vga_text_clear.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
+	# gh issue #11: the merged kernel.c now contains the Curlee vbe_probe
+	# (kernel/vbe.curlee), and curlee_main references it -> vbe_state_set, so
+	# the framebuffer-state shim must link here too (dead code at runtime on
+	# the GRUB path — main's PVH-build gate keeps vbe_probe unreached, but
+	# the symbol must resolve).
+	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_STATE_C) -o $(BUILD_DIR)/vbe_state.o
 	# Phase 2d-1: VirtIO-net driver — GRUB/ISO path compiles WITHOUT JOE_PVH_BOOT,
 	# so option 2 is ACTIVE: full rings (2 RX x 2048 + 2 TX x 2048, depth 256)
 	# and the NIC runs (this is where qemu-net-smoke boots; see the target).
@@ -207,7 +220,7 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_CLEAR_C) $(FB_C) $
 	$(AS) --32 $(BOOT_ASM) -o $(BUILD_DIR)/boot.o
 	$(LD) -m elf_i386 -nostdlib -static -T $(LINKER_GRUB) \
 	  $(BUILD_DIR)/kernel-grub.o $(BUILD_DIR)/vga_text_clear.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe_state.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
 	  $(BUILD_DIR)/libgcc32.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/boot.o \
 	  -o $@
 	@echo "Built $@ (GRUB multiboot2, 32-bit entry)"
@@ -257,8 +270,9 @@ qemu-gui: $(KERNEL_ELF)
 # gate: it proves the whole pipeline (merge -> verify -> codegen -> compile ->
 # assemble -> link -> PVH boot -> curlee_main -> display + serial).
 # The PVH smoke kernel: built like kernel.elf (JOE_PVH_BOOT, crt0.S +
-# linker.ld, vbe.c linked) but with its own objects so the smoke gates never
-# clobber the dev-loop build. Shared by qemu-smoke and qemu-pvh-fb-smoke.
+# linker.ld, vbe.curlee merged + vbe_state.c linked) but with its own objects
+# so the smoke gates never clobber the dev-loop build. Shared by qemu-smoke
+# and qemu-pvh-fb-smoke.
 $(BUILD_DIR)/kernel-smoke.elf: check
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel-smoke.c $(MERGED_SRC)
@@ -266,8 +280,9 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_CLEAR_C) -o $(BUILD_DIR)/vga_text_clear.o
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
-	# Phase 2f: vbe.c is PVH-only (see the kernel.elf rule).
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_C) -o $(BUILD_DIR)/vbe.o
+	# Phase 2f: the probe is Curlee (merged into kernel-smoke.c); only the
+	# framebuffer-state shim is C (see the kernel.elf rule).
+	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_STATE_C) -o $(BUILD_DIR)/vbe_state.o
 	# Phase 2d-1: VirtIO-net driver, PVH option-1 stubs (JOE_PVH_BOOT) — the
 	# NIC is compiled IN so the no-NIC-safe path is exercised on the existing
 	# smoke gates (net_probe finds nothing, all externs return 0).
@@ -280,7 +295,7 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
 	  $(BUILD_DIR)/kernel-smoke.o $(BUILD_DIR)/vga_text_clear.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
+	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe_state.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
 	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 
@@ -297,12 +312,12 @@ qemu-smoke: $(BUILD_DIR)/kernel-smoke.elf
 	  || (echo "FAIL: expected message not in serial log"; exit 1)
 
 # Phase 2f acceptance gate: boot the PVH kernel (qemu -kernel, kernel-smoke.elf
-# built exactly like kernel.elf with JOE_PVH_BOOT + vbe.c) with a std VGA
-# device and assert the serial log contains "FB: 1". This proves the Bochs VBE
-# probe validated a linear framebuffer on the PVH path (no multiboot2 info, no
-# ISO), fb_ready() returned 1, and the single-frame demo render ran before
-# halt. Mirror of the qemu-smoke pattern: timeout, -display none, -serial
-# file:, grep.
+# built exactly like kernel.elf with JOE_PVH_BOOT + the Curlee vbe_probe from
+# kernel/vbe.curlee) with a std VGA device and assert the serial log contains
+# "FB: 1". This proves the Bochs VBE probe validated a linear framebuffer on
+# the PVH path (no multiboot2 info, no ISO), fb_ready() returned 1, and the
+# single-frame demo render ran before halt. Mirror of the qemu-smoke pattern:
+# timeout, -display none, -serial file:, grep.
 qemu-pvh-fb-smoke: $(BUILD_DIR)/kernel-smoke.elf
 	rm -f $(BUILD_DIR)/serial-pvh-fb.log
 	@timeout 20 qemu-system-x86_64 -display none -no-reboot \
@@ -463,6 +478,11 @@ verify: check pack-run canvas-run json-run json-codegen-run c-boundary kernel
 	# Phase 2d-4: the tool-queue producer API the LLM bridge drives
 	# (fb_tool_enqueue(2, arg) — the 2d-3 contract, wired into the 2b ring).
 	@nm $(KERNEL_ELF) | grep -q ' fb_tool_enqueue$$' && echo "PASS: fb_tool_enqueue linked"
+	# Phase 2f (gh issue #11): the Curlee Bochs VBE probe (kernel/vbe.curlee)
+	# fills the framebuffer globals through the C state shim — the shim must be
+	# linked (the codegen references it 1:1; a missing symbol fails at link
+	# time, but this gate makes the wiring explicit).
+	@nm $(KERNEL_ELF) | grep -q ' vbe_state_set$$' && echo "PASS: vbe_state_set linked (VBE probe state shim)"
 	@echo "All verification gates passed."
 
 clean:

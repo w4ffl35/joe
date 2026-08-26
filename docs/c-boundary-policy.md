@@ -14,10 +14,12 @@ Curlee into the pure, verified Curlee layer.
 C exists for exactly two reasons in JOE:
 
 1. **I/O ports** — `outb`/`inb`/`outw`/`inw`/`outl`/`inl` and the inline-asm
-   wrappers (`vbe.c`, `virtio_net.c`). `putc_driver.c` was the first
-   migration (COM1 driver → `serial.curlee`, issue #9); `vga_setup.c` was
-   the second: the 24-write VGA text-mode-3 register sequence is now a
-   genuine Curlee function (`vga_setup.curlee`, issue #10).
+   wrappers (`virtio_net.c`). `putc_driver.c` was the first migration (COM1
+   driver → `serial.curlee`, issue #9); `vga_setup.c` was the second: the
+   24-write VGA text-mode-3 register sequence is now a genuine Curlee
+   function (`vga_setup.curlee`, issue #10); `vbe.c` was the third: the
+   whole Bochs VBE probe (ports 0x1CE/0x1CF) is now a genuine Curlee
+   function (`vbe.curlee`, issue #11).
 2. **Raw memory moves** — volatile framebuffer writes, ring DMA, and the
    mutable driver *state* (frame counter, ring indices) that the Curlee layer
    does not express yet (assignment exists — issue #268 — but these drivers
@@ -26,7 +28,11 @@ C exists for exactly two reasons in JOE:
    literals and there is no runtime-address physical **write** builtin (only
    the `phys_read_u*` reads of curlee issue #279), so a sequential
    2000-cell clear is not expressible as a bounded Curlee loop
-   (`vga_text_clear.c` stays in C for this reason).
+   (`vga_text_clear.c` stays in C for this reason). The framebuffer globals
+   the VBE probe fills (`fb_addr/pitch/width/height`) are C-visible `.data`
+   state owned by `fb.c`, and Curlee has no globals, so those four stores
+   stay in C as a raw state shim (`vbe_state.c`, issue #11) — same class as
+   `vga_text_clear.c`'s memory move.
 
 Everything else — parsers, protocol logic, checksums, layout math, glyph
 tables, geometry — belongs in the **pure, verified Curlee layer**
@@ -85,13 +91,15 @@ The C surface collapses to a thin I/O shim once three Curlee features land
 
 1. **Assignment / affine mutation** — unblocks `fb.c` (blitter loops),
    `mb2.c` (tag walk), the state machines in `net_stack.c`/`virtio_net.c`.
-2. **Port I/O (`outb`/`inb`/`outw`/`inw`/`outl`/`inl`)** — unblocks
-   `vbe.c` and the PCI config half of `virtio_net.c`.
+2. **Port I/O (`outb`/`inb`/`outw`/`inw`/`outl`/`inl`)** — unblocks the
+   PCI config half of `virtio_net.c`.
    `putc_driver.c` migrated first on this feature (issue #9, now
    `serial.curlee`); `vga_setup.c`'s register sequence followed (issue #10,
-   now `vga_setup.curlee`). A **runtime-address physical write** (the
-   `phys_read_u*` counterpart) would additionally unblock the
-   `vga_text_clear.c` raw memory move.
+   now `vga_setup.curlee`); `vbe.c`'s Bochs VBE probe followed (issue #11,
+   now `vbe.curlee` — its only C residual is the `vbe_state_set` state shim,
+   the globals-write half of the raw-state category above). A
+   **runtime-address physical write** (the `phys_read_u*` counterpart) would
+   additionally unblock the `vga_text_clear.c` raw memory move.
 3. **Bitwise ops + shifts** — unblocks big-endian packing in `net_stack.c`,
    checksums, descriptor flags, and alignment math in `mb2.c`.
 

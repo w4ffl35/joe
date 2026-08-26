@@ -38,6 +38,11 @@ extern fn curlee_halt() -> Unit;
 
 // Provided by kernel/fb.c — linear framebuffer software blitter.
 extern fn fb_init() -> Unit;
+// gh issue #11: re-wires the draw target after the Curlee vbe_probe
+// (kernel/vbe.curlee) fills the framebuffer globals on the PVH path —
+// fb_init()'s own wiring ran while fb_addr was still 0. Same gate as
+// fb_init's: wires only when fb_addr != 0.
+extern fn fb_wire_draw_target() -> Unit;
 extern fn fb_ready() -> Int;
 extern fn fb_clear(color: Int) -> Unit;
 extern fn fb_pixel(x: Int, y: Int, color: Int) -> Unit;
@@ -664,6 +669,26 @@ fn main(pm: cap phys.mem) -> Unit {
   // queue. Gated on net_response_len > 0, so the no-NIC baseline emits nothing.
   json_llm_bridge(pm);
   fb_init();
+  // Phase 2f Bochs VBE probe — ported to Curlee in gh issue #11
+  // (kernel/vbe.curlee). fb_init() no longer calls it: the codegen emits
+  // vbe_probe as a static `curlee_vbe_probe` symbol and the C boundary policy
+  // forbids C calling up, so main drives the probe here. Gated exactly like
+  // the former `#ifdef JOE_PVH_BOOT` in fb.c's fb_init: it only runs when
+  // fb_init found no multiboot2 framebuffer (fb_ready()==0 — the multiboot2
+  // tag always wins on the GRUB path) AND this is the PVH build
+  // (fb_asset_region_w() reads 0 on PVH builds, 128 on the GRUB build — the
+  // same discriminator used below). On success the probe fills the
+  // framebuffer globals via the vbe_state_set shim; main then re-wires the
+  // draw target (fb_init's wiring ran while fb_addr was still 0).
+  if (fb_ready() == 0) {
+    let pvh_build: Int = fb_asset_region_w();
+    if (pvh_build == 0) {
+      let vbe_ok: Int = vbe_probe(pm);
+      if (vbe_ok == 1) {
+        fb_wire_draw_target();
+      }
+    }
+  }
   if (fb_ready() == 1) {
     // The linear framebuffer is active. Two sub-paths, distinguished by
     // whether the frame ring/asset region are compiled in:
@@ -676,7 +701,8 @@ fn main(pm: cap phys.mem) -> Unit {
     //     deterministic 60 FPS loop (see fb.c fb_run_loop) — the loop renders
     //     N frames, then returns to halt.
     // (b) PVH path (kernel.elf, qemu -kernel): no multiboot2 info; the
-    //     framebuffer comes from the Phase 2f Bochs VBE probe (kernel/vbe.c).
+    //     framebuffer comes from the Phase 2f Bochs VBE probe
+    //     (kernel/vbe.curlee, ported from vbe.c in gh issue #11).
     //     The frame ring/asset region are compiled OUT (JOE_PVH_BOOT — QEMU's
     //     PVH loader rejects a large BSS, see fb.c), so fb_asset_region_w()
     //     reads 0 and fb_present() is a single-buffer no-op. Render ONE frame
