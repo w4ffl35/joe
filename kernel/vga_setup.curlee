@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// vga_setup.curlee — explicit VGA text-mode-3 programming for reliable text
+// rendering under VirtualBox (and QEMU). Ported from the former
+// kernel/vga_setup.c (deleted in issue #10); the 24-write CRT register
+// sequence is now a genuine Curlee function.
+//
+// Problem: after GRUB (multiboot2) hands off, the VGA is left in whatever
+// mode/font state GRUB used. QEMU's VGA emulation happens to render standard
+// PC-437 bytes at 0xB8000 correctly; VirtualBox's VGA emulation maps the
+// text plane through a Unicode font that GRUB's state doesn't match, so
+// "Hello" can appear as "Fcjjm" (a per-glyph offset) etc.
+//
+// Fix: program the VGA CRT Controller (MISC/SEQ/CRTC) for standard 80x25
+// text mode 3 before writing to the 0xB8000 text buffer, and reset the
+// sequencer font plane so VirtualBox uses its default PC-437 text font.
+// This is the same sequence OS kernels run on every boot and is harmless on
+// QEMU.
+//
+// Port note — what stayed in C (and why): the 24 register writes are pure
+// constant-port outb calls (curlee issue #269) and port directly. The
+// 0xB8000 text-buffer clear (2000 sequential 16-bit cells) does NOT port:
+// Curlee's Phys<T> addresses must be compile-time literals (a computed
+// address like 0xB8000 + i*2 is rejected), and the language has no
+// runtime-address physical WRITE builtin (only the phys_read_u8/u16/u32/u64
+// reads of curlee issue #279). A bounded Curlee loop therefore cannot
+// advance its write address; 2000 unrolled literal writes are rejected by
+// the issue scope and would blow QEMU's PVH LOAD budget. The clear stays as
+// a raw memory move in kernel/vga_text_clear.c — the second pillar of the C
+// boundary policy (docs/c-boundary-policy.md §1).
+//
+// Design laws honored:
+//   - Single address space, Ring 0: port I/O is direct x86 out asm
+//     (the curlee_port_outb prologue helper).
+//   - Deterministic verification: `curlee check vga_setup.curlee` runs
+//     standalone and the merged kernel re-verifies it (`make check`).
+//   - Minimal footprint: no libc, no String/Vec; a flat register sequence.
+
+// Provided by kernel/vga_text_clear.c: blanks the 0xB8000 text buffer to
+// blank cells (raw memory move — C boundary policy, see header above).
+extern fn vga_clear_text_buffer() -> Unit;
+
+// Program the VGA CRT Controller (MISC/SEQ/CRTC) for standard 80x25 text
+// mode 3. Mirrors the former kernel/vga_setup.c 1:1 — every outb below is
+// the same (port, value) pair the C emitted, in the same order. The text
+// buffer clear is delegated to vga_clear_text_buffer (see header note).
+fn vga_text_setup(pm: cap phys.mem) -> Unit {
+  unsafe {
+    // 1. MISC: color text mode, 28 MHz, page enabled.
+    port_outb(0x3C2, 0x63);
+
+    // 2. Sequencer: reset + enable 8x8/9x16 text font planes.
+    port_outb(0x3C4, 0x00); port_outb(0x3C5, 0x03); // synchronous reset
+    port_outb(0x3C4, 0x01); port_outb(0x3C5, 0x01); // clocking mode: 8 dots
+    port_outb(0x3C4, 0x02); port_outb(0x3C5, 0x0F); // plane mask: all 4
+    port_outb(0x3C4, 0x03); port_outb(0x3C5, 0x00); // char map select A
+    port_outb(0x3C4, 0x04); port_outb(0x3C5, 0x0E); // memory mode: even/odd
+
+    // 3. CRTC (80x25, 9x16 cells) — standard mode-3 timing.
+    port_outb(0x3D4, 0x00); port_outb(0x3D5, 0x5F); // h total
+    port_outb(0x3D4, 0x01); port_outb(0x3D5, 0x4F); // h displayed
+    port_outb(0x3D4, 0x02); port_outb(0x3D5, 0x50); // h blank start
+    port_outb(0x3D4, 0x03); port_outb(0x3D5, 0x82); // h blank end
+    port_outb(0x3D4, 0x04); port_outb(0x3D5, 0x55); // h sync start
+    port_outb(0x3D4, 0x05); port_outb(0x3D5, 0x81); // h sync end
+    port_outb(0x3D4, 0x06); port_outb(0x3D5, 0xBF); // v total
+    port_outb(0x3D4, 0x07); port_outb(0x3D5, 0x1F); // overflow
+    port_outb(0x3D4, 0x08); port_outb(0x3D5, 0x00); // preset row scan
+    port_outb(0x3D4, 0x09); port_outb(0x3D5, 0x4F); // max scan line
+    port_outb(0x3D4, 0x0A); port_outb(0x3D5, 0x0C); // cursor start
+    port_outb(0x3D4, 0x0B); port_outb(0x3D5, 0x0E); // cursor end
+    port_outb(0x3D4, 0x0C); port_outb(0x3D5, 0x00); // start addr high
+    port_outb(0x3D4, 0x0D); port_outb(0x3D5, 0x00); // start addr low
+    port_outb(0x3D4, 0x0E); port_outb(0x3D5, 0x00); // cursor loc high
+    port_outb(0x3D4, 0x0F); port_outb(0x3D5, 0x00); // cursor loc low
+    port_outb(0x3D4, 0x10); port_outb(0x3D5, 0x9C); // v sync start
+    port_outb(0x3D4, 0x11); port_outb(0x3D5, 0x8E); // v sync end
+    port_outb(0x3D4, 0x12); port_outb(0x3D5, 0x8F); // v displayed
+    port_outb(0x3D4, 0x13); port_outb(0x3D5, 0x28); // offset (line length)
+    port_outb(0x3D4, 0x14); port_outb(0x3D5, 0x40); // underline
+    port_outb(0x3D4, 0x15); port_outb(0x3D5, 0x96); // v blank start
+    port_outb(0x3D4, 0x16); port_outb(0x3D5, 0xB9); // v blank end
+    port_outb(0x3D4, 0x17); port_outb(0x3D5, 0xA3); // mode control
+  }
+  vga_clear_text_buffer();
+  return;
+}

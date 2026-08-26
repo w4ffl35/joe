@@ -14,12 +14,19 @@ Curlee into the pure, verified Curlee layer.
 C exists for exactly two reasons in JOE:
 
 1. **I/O ports** — `outb`/`inb`/`outw`/`inw`/`outl`/`inl` and the inline-asm
-   wrappers (`vga_setup.c`, `vbe.c`, `virtio_net.c`). `putc_driver.c` was the
-   first migration: the COM1 driver is now Curlee (`serial.curlee`, issue #9).
+   wrappers (`vbe.c`, `virtio_net.c`). `putc_driver.c` was the first
+   migration (COM1 driver → `serial.curlee`, issue #9); `vga_setup.c` was
+   the second: the 24-write VGA text-mode-3 register sequence is now a
+   genuine Curlee function (`vga_setup.curlee`, issue #10).
 2. **Raw memory moves** — volatile framebuffer writes, ring DMA, and the
    mutable driver *state* (frame counter, ring indices) that the Curlee layer
    does not express yet (assignment exists — issue #268 — but these drivers
-   are not yet migrated).
+   are not yet migrated). The 0xB8000 text-buffer clear is a raw memory move
+   that *cannot* migrate: Curlee `Phys<T>` addresses must be compile-time
+   literals and there is no runtime-address physical **write** builtin (only
+   the `phys_read_u*` reads of curlee issue #279), so a sequential
+   2000-cell clear is not expressible as a bounded Curlee loop
+   (`vga_text_clear.c` stays in C for this reason).
 
 Everything else — parsers, protocol logic, checksums, layout math, glyph
 tables, geometry — belongs in the **pure, verified Curlee layer**
@@ -57,7 +64,7 @@ A C file **satisfies** the policy if it is:
 
 | Cap | Value | Why |
 |---|---|---|
-| Max lines per `.c` file | **200** | `vga_setup.c` (73) proves drivers are small (`putc_driver.c`'s 43 lines are gone — ported to `serial.curlee`, issue #9) |
+| Max lines per `.c` file | **200** | `vga_text_clear.c` (35) proves drivers are small (`putc_driver.c`'s 43 and `vga_setup.c`'s 73 lines are gone — ported to `serial.curlee` and `vga_setup.curlee`, issues #9/#10) |
 | Max pure-logic lines per `.c` file | **0** | Pure logic belongs in Curlee, period |
 | Max new `.c`/`.h` files added per feature | **1** | A new device should be one driver + Curlee modules |
 
@@ -79,9 +86,12 @@ The C surface collapses to a thin I/O shim once three Curlee features land
 1. **Assignment / affine mutation** — unblocks `fb.c` (blitter loops),
    `mb2.c` (tag walk), the state machines in `net_stack.c`/`virtio_net.c`.
 2. **Port I/O (`outb`/`inb`/`outw`/`inw`/`outl`/`inl`)** — unblocks
-   `vga_setup.c`, `vbe.c`, and the PCI config half of `virtio_net.c`.
-   `putc_driver.c` was the first to migrate on this feature (issue #9, now
-   `serial.curlee`).
+   `vbe.c` and the PCI config half of `virtio_net.c`.
+   `putc_driver.c` migrated first on this feature (issue #9, now
+   `serial.curlee`); `vga_setup.c`'s register sequence followed (issue #10,
+   now `vga_setup.curlee`). A **runtime-address physical write** (the
+   `phys_read_u*` counterpart) would additionally unblock the
+   `vga_text_clear.c` raw memory move.
 3. **Bitwise ops + shifts** — unblocks big-endian packing in `net_stack.c`,
    checksums, descriptor flags, and alignment math in `mb2.c`.
 

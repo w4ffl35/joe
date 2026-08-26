@@ -34,10 +34,11 @@ GLYPHS_SRC    := kernel/glyphs.curlee
 ASSETS_SRC    := kernel/assets.curlee
 JSON_SRC      := kernel/json.curlee
 SERIAL_SRC    := kernel/serial.curlee
+VGA_SETUP_SRC := kernel/vga_setup.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
 JSON_TEST     := kernel/json_test.curlee
 BOOT_ASM      := kernel/boot.S
-VGA_SETUP_C   := kernel/vga_setup.c
+VGA_CLEAR_C   := kernel/vga_text_clear.c
 FB_C          := kernel/fb.c
 MB2_C         := kernel/mb2.c
 VBE_C         := kernel/vbe.c
@@ -74,15 +75,15 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
-$(KERNEL_ELF): $(MERGED_SRC) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H)
+$(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel.o
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_SETUP_C) -o $(BUILD_DIR)/vga_setup.o
+	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_CLEAR_C) -o $(BUILD_DIR)/vga_text_clear.o
 	# PVH path (qemu -kernel): compile-time-empty frame ring/asset region
 	# (JOE_PVH_BOOT) so the image stays within QEMU's PVH LOAD budget (a large
 	# BSS silently breaks the PVH entry — see kernel/fb.c header). The GRUB/ISO
@@ -113,7 +114,7 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
-	  $(BUILD_DIR)/kernel.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
+	  $(BUILD_DIR)/kernel.o $(BUILD_DIR)/vga_text_clear.o $(BUILD_DIR)/fb.o \
 	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
 	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
@@ -125,13 +126,14 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(VBE_C) $(NET_C) $
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
 	$(CURLEE) check $(ASSETS_SRC)
 	$(CURLEE) check $(JSON_SRC)
 	$(CURLEE) check $(SERIAL_SRC)
+	$(CURLEE) check $(VGA_SETUP_SRC)
 	$(CURLEE) check $(MERGED_SRC)
 	@echo "curlee check: OK (all modules + merged kernel verified)"
 
@@ -182,11 +184,11 @@ iso: $(ISO)
 # Int math is implemented by libgcc32.o's __muldi3/__divdi3/... helpers).
 #
 # The 64-bit PVH/QEMU path (kernel.elf via crt0.S) is completely unchanged.
-$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_SETUP_C) $(FB_C) $(MB2_C) $(LIBGCC32_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H) $(LINKER_GRUB)
+$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_CLEAR_C) $(FB_C) $(MB2_C) $(LIBGCC32_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H) $(LINKER_GRUB)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel-grub.o
-	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_SETUP_C) -o $(BUILD_DIR)/vga_setup.o
+	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_CLEAR_C) -o $(BUILD_DIR)/vga_text_clear.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
 	# Phase 2d-1: VirtIO-net driver — GRUB/ISO path compiles WITHOUT JOE_PVH_BOOT,
@@ -204,7 +206,7 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_SETUP_C) $(FB_C) $
 	# the multiboot2 handoff already provides flat 32-bit segments, paging off).
 	$(AS) --32 $(BOOT_ASM) -o $(BUILD_DIR)/boot.o
 	$(LD) -m elf_i386 -nostdlib -static -T $(LINKER_GRUB) \
-	  $(BUILD_DIR)/kernel-grub.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
+	  $(BUILD_DIR)/kernel-grub.o $(BUILD_DIR)/vga_text_clear.o $(BUILD_DIR)/fb.o \
 	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
 	  $(BUILD_DIR)/libgcc32.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/boot.o \
 	  -o $@
@@ -261,7 +263,7 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel-smoke.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel-smoke.c -o $(BUILD_DIR)/kernel-smoke.o
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_SETUP_C) -o $(BUILD_DIR)/vga_setup.o
+	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_CLEAR_C) -o $(BUILD_DIR)/vga_text_clear.o
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_C) -o $(BUILD_DIR)/mb2.o
 	# Phase 2f: vbe.c is PVH-only (see the kernel.elf rule).
@@ -277,7 +279,7 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
-	  $(BUILD_DIR)/kernel-smoke.o $(BUILD_DIR)/vga_setup.o $(BUILD_DIR)/fb.o \
+	  $(BUILD_DIR)/kernel-smoke.o $(BUILD_DIR)/vga_text_clear.o $(BUILD_DIR)/fb.o \
 	  $(BUILD_DIR)/mb2.o $(BUILD_DIR)/vbe.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
 	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
