@@ -74,23 +74,30 @@
 // Provided by kernel/mb2_state.c:
 //   - mb2_info_addr_get() reads the .data global `mb2_info_addr` that
 //     kernel/boot.S fills from %ebx on the GRUB path (0 on the PVH path via
-//     kernel/fb.c's weak default).
-//   - mb2_state_set() fills the framebuffer globals fb_addr/fb_pitch/
-//     fb_width/fb_height (C-visible .data owned by kernel/fb.c; Curlee has
-//     no globals and no way to address C globals — the vbe_state.c pattern).
+//     the shim's weak default). This is the ONE remaining C residual of the
+//     mb2 port (gh issue #20): the value is written by 32-bit assembly
+//     (boot.S) BEFORE curlee_main runs, via a strong .data definition that
+//     overrides the weak default — a C-level linkage requirement (Curlee
+//     statics are file-local in the codegen, so boot.S cannot write one).
 //   - phys_read_u8()/phys_read_u32() — runtime-address physical reads,
-//     now Curlee COMPILER BUILTINS (inline volatile loads — the C shim's
-//     definitions in mb2_state.c were deleted); raw volatile loads, opaque
-//     to the verifier. They require `unsafe` + `cap phys.mem` (see the
-//     mb2_parse body below).
+//     Curlee COMPILER BUILTINS (inline volatile loads); raw volatile loads,
+//     opaque to the verifier. They require `unsafe` + `cap phys.mem` (see
+//     the mb2_parse body below).
 extern fn mb2_info_addr_get() -> Int;
-extern fn mb2_state_set(addr: U32, pitch: U32, width: U32, height: U32) -> Unit;
 
-// Scratch for laundering opaque MMIO reads before the mb2_state_set call (see
+// gh issue #20: the framebuffer state setter is a genuine Curlee function in
+// kernel/fb.curlee (fb_state_set — merged in before this module), replacing
+// the deleted mb2_state.c mb2_state_set extern. The state itself is Curlee
+// statics in fb.curlee, read by the blitter directly.
+
+// Scratch for laundering opaque MMIO reads before the fb_state_set call (see
 // the framebuffer-tag branch of mb2_parse): the rebuilt verifier rejects
 // passing a DIRECT phys_read result as a call argument ("cannot prove call
 // contract on opaque MMIO read argument"), but a store->load round-trip
-// through a static yields a fresh symbolic value it accepts.
+// through a static yields a fresh symbolic value it accepts. The U32 values
+// are widened with `+ 0` into Int at the read site (a bare U value does not
+// widen in a `let` — the virtio_net.curlee idiom) because fb_state_set's
+// parameters are Int.
 static mb2_tag_scratch: [U32; 4] = [0; 4];
 
 // Parse the multiboot2 info structure at mb2_info_addr and fill the
@@ -143,11 +150,11 @@ fn mb2_parse(pm: cap phys.mem) -> Int {
             mb2_tag_scratch[1] = pitch;
             mb2_tag_scratch[2] = width;
             mb2_tag_scratch[3] = height;
-            let a0: U32 = mb2_tag_scratch[0];
-            let a1: U32 = mb2_tag_scratch[1];
-            let a2: U32 = mb2_tag_scratch[2];
-            let a3: U32 = mb2_tag_scratch[3];
-            mb2_state_set(a0, a1, a2, a3);
+            let a0: Int = mb2_tag_scratch[0] + 0;   // U32 -> Int widening
+            let a1: Int = mb2_tag_scratch[1] + 0;
+            let a2: Int = mb2_tag_scratch[2] + 0;
+            let a3: Int = mb2_tag_scratch[3] + 0;
+            fb_state_set(a0, a1, a2, a3);
             return 1;
           }
           return 0;   // framebuffer tag present but not usable

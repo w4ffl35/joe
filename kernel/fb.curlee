@@ -29,6 +29,14 @@
 // PVH 1-byte stubs) and the build discriminator (fb_pvh_build); everything
 // else lives here.
 //
+// REVISION (gh issue #20): the framebuffer state (fb_addr/fb_pitch/
+// fb_width/fb_height) also moved here — the four C-visible .data globals in
+// kernel/fb.c + the four fb_*_get externs + the vbe_state.c / mb2_state.c
+// setter shims are GONE. This module owns the state as Curlee statics, fills
+// it through fb_state_set (called by mb2.curlee / vbe.curlee), and reads it
+// directly in the blitter; kernel/fb.c is now ONLY the two large
+// PVH-conditional buffers + the build-geometry getters.
+//
 // The runtime-address phys builtins REQUIRE an `unsafe { }` block AND a
 // `cap phys.mem` parameter in the enclosing function (belt-and-suspenders —
 // the mb2.curlee precedent). The capability is dropped by codegen (the
@@ -54,7 +62,7 @@
 //     contract-less (every value it consumes is opaque extern state), with
 //     all non-linear address math hidden in contract-less helpers (the
 //     established canvas/net_glue pattern).
-//   - Minimal footprint: no libc, no malloc, no String/Vec; the only static
+//   - Minimal footprint: no libc, no malloc, no String/Vec; the static
 //     arrays here are the 8-slot tool ring (128 bytes) — the two large
 //     PVH-conditional buffers stay in the C shim for the budget reason above.
 
@@ -62,13 +70,14 @@
 // Extern window into the C build-geometry shim (kernel/fb.c). Every symbol is
 // defined 1:1 in C; the codegen emits direct calls. Declared HERE, once —
 // the merged TU forbids duplicate externs (net_glue.curlee's note).
+//
+// gh issue #20: the framebuffer globals (fb_addr/fb_pitch/fb_width/fb_height)
+// are GONE from C — they are Curlee statics below (fb_addr/fb_pitch/
+// fb_width/fb_height), filled by this module's fb_state_set (called by
+// kernel/mb2.curlee's mb2_parse and kernel/vbe.curlee's vbe_probe; the
+// vbe_state.c / mb2_state.c setter shims were deleted). The four
+// fb_*_get externs are deleted with them.
 // ---------------------------------------------------------------------------
-
-// Framebuffer globals (filled by mb2_state.c / vbe_state.c — C state shims).
-extern fn fb_addr_get() -> Int;
-extern fn fb_pitch_get() -> Int;
-extern fn fb_width_get() -> Int;
-extern fn fb_height_get() -> Int;
 
 // Compile-time build geometry:
 //   - fb_pvh_build(): 1 on the PVH build (the large buffers compile to 1-byte
@@ -85,6 +94,19 @@ extern fn fb_frame_ring_slot_base(slot: Int) -> Int;
 // Mutable blitter state (Curlee statics — the toolchain's static + [T; N]
 // arrays, gh issue #13 revision).
 // ---------------------------------------------------------------------------
+
+// Framebuffer state (gh issue #20): the boot-discovered framebuffer geometry,
+// formerly C-visible .data globals in kernel/fb.c (fb_addr/fb_pitch/
+// fb_width/fb_height) filled through the vbe_state.c / mb2_state.c setter
+// shims. Both setter shims are deleted — this module owns the state as
+// Curlee statics, mb2.curlee / vbe.curlee fill it through fb_state_set, and
+// the blitter reads it directly. Zero until the multiboot2 framebuffer tag
+// (GRUB path) or the Bochs VBE probe (PVH path) is parsed (same semantics as
+// the C zero-initialized globals).
+static fb_addr: Int = 0;
+static fb_pitch: Int = 0;
+static fb_width: Int = 0;
+static fb_height: Int = 0;
 
 // The 8-slot tool-call ring: parallel kind/arg arrays (8 slots x 2 Ints =
 // 128 bytes — the tool_queue_slots()==8 / tool_slot_bytes()==16 geometry
@@ -108,6 +130,22 @@ static ring_active: Int = 0;
 static ring_slot: Int = 0;
 static fb_draw_target: Int = 0;
 static fb_target_stride: Int = 0;
+
+// Fill the framebuffer state from a validated 32bpp linear-framebuffer
+// source (gh issue #20). Called by kernel/mb2.curlee's mb2_parse (multiboot2
+// framebuffer tag, GRUB path) and kernel/vbe.curlee's vbe_probe (Bochs VBE
+// LFB, PVH path) — the C setter shims (vbe_state.c / mb2_state.c's
+// mb2_state_set) are deleted; this is the single owner of the four values.
+// Contract-less: the callers pass only values their own validation gates have
+// already established (the multiboot2 trust chain / the VBE readback gate),
+// so no contract is provable here (the verifier treats the args as opaque).
+fn fb_state_set(addr: Int, pitch: Int, width: Int, height: Int) -> Unit {
+  fb_addr = addr;
+  fb_pitch = pitch;
+  fb_width = width;
+  fb_height = height;
+  return;
+}
 
 // ---------------------------------------------------------------------------
 // Contract-less address/math helpers (non-linear arithmetic is rejected by
@@ -156,7 +194,7 @@ fn fb_isign(a: Int) -> Int {
 // ---------------------------------------------------------------------------
 
 fn fb_ready() -> Int {
-  let a: Int = fb_addr_get();
+  let a: Int = fb_addr;
   if (a != 0) {
     return 1;
   } else {
@@ -165,11 +203,11 @@ fn fb_ready() -> Int {
 }
 
 fn fb_get_width() -> Int {
-  return fb_width_get();
+  return fb_width;
 }
 
 fn fb_get_height() -> Int {
-  return fb_height_get();
+  return fb_height;
 }
 
 fn fb_ring_active() -> Int {
@@ -213,9 +251,9 @@ fn fb_asset_region_base() -> Int {
 // ring back buffers on the GRUB path. Gated on fb_addr != 0 (not the build
 // macro) so it covers both paths: GRUB (multiboot2 tag) and PVH (VBE probe).
 fn fb_wire_draw_target() -> Unit {
-  let a: Int = fb_addr_get();
+  let a: Int = fb_addr;
   if (a != 0) {
-    let p: Int = fb_pitch_get();
+    let p: Int = fb_pitch;
     fb_draw_target = a;
     fb_target_stride = p;
   }
@@ -234,8 +272,8 @@ fn fb_clear(pm: cap phys.mem, color: Int) -> Unit {
   if (base == 0) {
     return;
   }
-  let w: Int = fb_width_get();
-  let h: Int = fb_height_get();
+  let w: Int = fb_width;
+  let h: Int = fb_height;
   let total: Int = fb_clear_total(w, h);
   unsafe {
     let i: Int = 0;
@@ -252,8 +290,8 @@ fn fb_pixel(pm: cap phys.mem, x: Int, y: Int, color: Int) -> Unit {
   if (base == 0) {
     return;
   }
-  let w: Int = fb_width_get();
-  let h: Int = fb_height_get();
+  let w: Int = fb_width;
+  let h: Int = fb_height;
   if (x < 0 || y < 0 || x >= w || y >= h) {
     return;
   }
@@ -277,8 +315,8 @@ fn fb_fill_rect(pm: cap phys.mem, x: Int, y: Int, w: Int, h: Int, color: Int) ->
   // in-bounds via clip_rect/rect_fits_gate). imin/imax are assets.curlee's
   // helpers — NOT available here (standalone-checkable module), so the
   // clamping is inlined as fb_imin / fb_max0.
-  let fbw: Int = fb_width_get();
-  let fbh: Int = fb_height_get();
+  let fbw: Int = fb_width;
+  let fbh: Int = fb_height;
   let x0: Int = fb_max0(x);   // x < 0 ? 0 : x
   let y0: Int = fb_max0(y);   // y < 0 ? 0 : y
   let xe: Int = x + w;
@@ -306,7 +344,7 @@ fn fb_fill_rect(pm: cap phys.mem, x: Int, y: Int, w: Int, h: Int, color: Int) ->
 // `while (1) { ... break; }` shape becomes a `done` flag (no break in
 // Curlee) and the mutable cursor (x0, y0, err) becomes assignments.
 fn fb_line(pm: cap phys.mem, x0: Int, y0: Int, x1: Int, y1: Int, color: Int) -> Unit {
-  let addr: Int = fb_addr_get();
+  let addr: Int = fb_addr;
   if (addr == 0) {
     return;
   }
@@ -349,8 +387,8 @@ fn fb_blit_asset(pm: cap phys.mem, src: Int, src_w: Int, src_h: Int, dst_x: Int,
   if (src_w <= 0 || src_h <= 0) {
     return;
   }
-  let fbw: Int = fb_width_get();
-  let fbh: Int = fb_height_get();
+  let fbw: Int = fb_width;
+  let fbh: Int = fb_height;
   if (dst_x < 0 || dst_y < 0 || dst_x + src_w > fbw || dst_y + src_h > fbh) {
     return;
   }
@@ -397,7 +435,7 @@ fn fb_blit_asset(pm: cap phys.mem, src: Int, src_w: Int, src_h: Int, dst_x: Int,
 // single-buffered (the VBE-probed LFB is the draw target and writes go
 // straight to it, matching the C #ifdef JOE_PVH_BOOT present).
 fn fb_present(pm: cap phys.mem) -> Unit {
-  let addr: Int = fb_addr_get();
+  let addr: Int = fb_addr;
   if (addr == 0) {
     return;
   }
@@ -405,8 +443,8 @@ fn fb_present(pm: cap phys.mem) -> Unit {
     // First present: check the framebuffer fits a ring slot (same gate as
     // frame_ring_fits). If not, stay single-buffered forever (no-op present
     // — preserves 2a/2e behavior on oversized modes).
-    let w: Int = fb_width_get();
-    let h: Int = fb_height_get();
+    let w: Int = fb_width;
+    let h: Int = fb_height;
     if (w <= 640 && h <= 480) {   // frame_ring_max_w/h() (canvas_test §15)
       fb_ring_activate();
     }
@@ -416,9 +454,9 @@ fn fb_present(pm: cap phys.mem) -> Unit {
   // framebuffer, then advance the slot (verified ring arithmetic).
   let base: Int = fb_draw_target;
   let stride: Int = fb_target_stride;
-  let pitch: Int = fb_pitch_get();
-  let w: Int = fb_width_get();
-  let h: Int = fb_height_get();
+  let pitch: Int = fb_pitch;
+  let w: Int = fb_width;
+  let h: Int = fb_height;
   unsafe {
     let row: Int = 0;
     while (row < h) {
@@ -538,8 +576,8 @@ fn fb_loop_state_reset() -> Unit {
   }
   ring_active = 0;
   ring_slot = 0;
-  fb_draw_target = fb_addr_get();
-  fb_target_stride = fb_pitch_get();
+  fb_draw_target = fb_addr;
+  fb_target_stride = fb_pitch;
   return;
 }
 

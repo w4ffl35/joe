@@ -20,12 +20,12 @@
 #      exactly like kernel.curlee's net_llm_roundtrip.
 #   2. Codegens it with `curlee build --target freestanding-c`.
 #   3. Compiles it with a host harness that:
-#        - links kernel/net_stack.c (the REAL raw-state shim — the same C
-#          file the kernel links) for the net_state_*/net_resp_*/net_poll_*
-#          externs,
 #        - mocks the 2d-1 NIC externs (net_link_up/net_mac_byte/
 #          net_tx_stage_byte/net_tx_send/net_rx_*/net_rx_wait/
-#          net_arp_request_gateway),
+#          net_arp_request_gateway) — the net_state_*/net_resp_* state
+#          functions are GENUINE Curlee statics inside the probe TU (gh issue
+#          #20; the kernel/net_stack.c raw-state shim is deleted, so nothing
+#          C is linked for them),
 #        - replays the scripted RX frames: an ARP reply, a SYN-ACK
 #          (peer ISN 0x12345678), then the stub server's 126-byte response
 #          SPLIT across two TCP segments (90 header bytes + 36 body bytes) so
@@ -42,12 +42,13 @@
 #          (121-byte header + 36-byte body) at offsets 54..210, IP total 197,
 #          IP checksum 0x0FEF (ground truth), checksum = the C algorithm,
 #        - the poll loop returns 1 with net_response_len()==36 and the body
-#          equals {"tool":"frame_tick","args":[0,1,2]}.
+#          equals {"tool":"frame_tick","args":[0,1,2]} (asserted inside the
+#          probe's own main — the Curlee static store, gh issue #20).
 #
 # The VM suite (kernel/net_stack_test.curlee) proves the pure checksums equal
 # the C ground truth for the pinned one-shot values; this harness proves the
-# GLUE stages the exact C wire frames and streams the response body with the
-# real shim state — identical wire behavior to the former net_stack.c.
+# GLUE stages the exact C wire frames and streams the response body through
+# the Curlee static state — identical wire behavior to the former net_stack.c.
 
 set -euo pipefail
 
@@ -288,10 +289,10 @@ static void build_tcp_seg(unsigned char* out, const unsigned char* payload,
 
 /* The codegen exports main as curlee_main (non-static entry). */
 long long curlee_main(void);
-/* The real raw-state shim (kernel/net_stack.c) implements net_state_* etc. */
-long long net_state_get(void);
-long long net_resp_len(void);
-long long net_resp_byte(long long i);
+/* The net state functions (net_state_*, net_resp_*, net_poll_*) are GENUINE
+ * Curlee statics inside the probe TU (gh issue #20) — the harness no longer
+ * links the kernel/net_stack.c raw-state shim; the probe's own main asserts
+ * the body readback (rc == 0 covers len/bytes/sum). */
 
 static int failures = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("NET-CODEGEN: FAIL %s\n", msg); failures++; } } while (0)
@@ -411,8 +412,6 @@ static void assert_req(void)
 
 int main(void)
 {
-    const char ENVELOPE[] = "{\"tool\":\"frame_tick\",\"args\":[0,1,2]}";
-    int i;
     script_rx();
     long long rc = curlee_main();
     if (rc != 0) {
@@ -426,19 +425,10 @@ int main(void)
     assert_syn();
     assert_ack();
     assert_req();
-    /* The response body read back through the real shim store. */
-    if (net_resp_len() != 36) {
-        printf("NET-CODEGEN: FAIL net_resp_len()=%lld (expected 36)\n", net_resp_len());
-        failures++;
-    }
-    for (i = 0; i < 36; ++i) {
-        if (net_resp_byte(i) != (long long)(unsigned char)ENVELOPE[i]) {
-            printf("NET-CODEGEN: FAIL body byte %d = %lld (expected %d)\n",
-                   i, net_resp_byte(i), (unsigned char)ENVELOPE[i]);
-            failures++;
-            break;
-        }
-    }
+    /* The response body readback is asserted INSIDE the codegen probe (its
+     * main returns a distinct code per failure — 4 len, 5/6 body bytes, 7
+     * sum), so rc == 0 already proves the 36-byte body landed in the Curlee
+     * static store (gh issue #20 — no C shim to read from). */
     if (failures == 0) {
         printf("NET-CODEGEN: PASS SYN/ACK/REQ wire frames + 36-byte response body (identical to the C stack)\n");
         return 0;
@@ -447,11 +437,11 @@ int main(void)
 }
 EOF
 
-# 4. Compile: the codegen probe + the host harness + the REAL state shim.
+# 4. Compile: the codegen probe + the host harness (the net state is genuine
+#    Curlee statics inside the probe TU — gh issue #20 — so no C shim links).
 cc -ffreestanding -fno-builtin -nostdlib -std=c11 -c "$BUILD/net_stack_codegen_probe.c" -o "$BUILD/net_stack_codegen_probe.o"
 cc -ffreestanding -fno-builtin -nostdlib -std=c11 -c "$HARNESS" -o "$BUILD/net_stack_codegen_harness.o"
-cc -ffreestanding -fno-builtin -nostdlib -std=c11 -Ikernel -c "$ROOT/kernel/net_stack.c" -o "$BUILD/net_stack_codegen_shim.o"
-cc "$BUILD/net_stack_codegen_probe.o" "$BUILD/net_stack_codegen_harness.o" "$BUILD/net_stack_codegen_shim.o" -o "$BUILD/net_stack_codegen_run"
+cc "$BUILD/net_stack_codegen_probe.o" "$BUILD/net_stack_codegen_harness.o" -o "$BUILD/net_stack_codegen_run"
 
 if "$BUILD/net_stack_codegen_run"; then
   echo "PASS: net_stack glue stages the exact C wire frames and streams the stub response on the host (no NIC needed)"
