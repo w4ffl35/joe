@@ -37,6 +37,7 @@ JSON_SRC      := kernel/json.curlee
 SERIAL_SRC    := kernel/serial.curlee
 VGA_SETUP_SRC := kernel/vga_setup.curlee
 VBE_SRC       := kernel/vbe.curlee
+VIRTIO_NET_SRC := kernel/virtio_net.curlee
 NET_STACK_SRC := kernel/net_stack.curlee
 NET_GLUE_SRC  := kernel/net_glue.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
@@ -81,7 +82,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
@@ -114,16 +115,17 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_STATE_C) $(VBE_STATE_C
 	# must resolve; on the GRUB/ISO path it is dead code — the multiboot2 tag
 	# always wins, and the PVH-build gate in main keeps the call unreached).
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_STATE_C) -o $(BUILD_DIR)/vbe_state.o
-	# Phase 2d-1: VirtIO-net driver (kernel/virtio_net.c). PVH path — option 1
-	# ACTIVE (JOE_PVH_BOOT): 1-byte ring/buffer stubs, every extern returns 0,
-	# net_probe() is a safe no-op (the PVH machine has no legacy PCI config
-	# space — see the file header). The GRUB/ISO path compiles WITHOUT the
-	# macro and gets the full option-2 rings (see kernel-grub.elf below).
-	# NOTE: this compile was MISSING from this rule (the link below references
-	# build/virtio_net.o), so a clean-tree `make verify` failed with
-	# "ld: cannot find build/virtio_net.o" — the GRUB rule's 32-bit object was
-	# the only producer, a build-order-dependent accident. Fixed by compiling
-	# the PVH stub object here (2d-4 review, issue #8).
+	# Phase 2d-1: VirtIO-net driver. gh issue #14: the 798-line driver is now
+	# GENUINE Curlee (kernel/virtio_net.curlee, merged into kernel.c above);
+	# kernel/virtio_net.c is reduced to the raw ring/buffer shim (the two
+	# PVH-conditional buffer groups + base-address getters + the sfence
+	# extern — the fb.c pattern). PVH path — option 1 ACTIVE (JOE_PVH_BOOT):
+	# 1-byte ring/buffer stubs, every getter returns 0, net_probe() is a safe
+	# no-op (the PVH machine has no legacy PCI config space — see the file
+	# header). The GRUB/ISO path compiles WITHOUT the macro and gets the full
+	# option-2 rings (see kernel-grub.elf below). The Curlee layer references
+	# the getter symbols on BOTH builds (the merged kernel.c is identical), so
+	# the stub object must link here (the issue #8 build-order fix applies).
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
 	# Phase 2d-2 (gh issue #12): TCP/IP stack raw-state shim (kernel/net_stack.c)
 	# — the ARP/IPv4/TCP logic moved to net_stack.curlee + the kernel.curlee
@@ -147,7 +149,7 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_STATE_C) $(VBE_STATE_C
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(NET_STACK_SRC) $(MB2_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(NET_STACK_SRC) $(MB2_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
@@ -157,6 +159,10 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	$(CURLEE) check $(SERIAL_SRC)
 	$(CURLEE) check $(VGA_SETUP_SRC)
 	$(CURLEE) check $(VBE_SRC)
+	# gh issue #14: the VirtIO-net driver is genuine Curlee (the 798-line
+	# kernel/virtio_net.c was reduced to a ring/buffer shim); it declares its
+	# own externs (C shim getters + sfence) so it verifies standalone.
+	$(CURLEE) check $(VIRTIO_NET_SRC)
 	$(CURLEE) check $(NET_STACK_SRC)
 	$(CURLEE) check $(MB2_SRC)
 	$(CURLEE) check $(MERGED_SRC)
@@ -256,9 +262,12 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_CLEAR_C) $(FB_C) $
 	# the GRUB path — main's PVH-build gate keeps vbe_probe unreached, but
 	# the symbol must resolve).
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_STATE_C) -o $(BUILD_DIR)/vbe_state.o
-	# Phase 2d-1: VirtIO-net driver — GRUB/ISO path compiles WITHOUT JOE_PVH_BOOT,
-	# so option 2 is ACTIVE: full rings (2 RX x 2048 + 2 TX x 2048, depth 256)
-	# and the NIC runs (this is where qemu-net-smoke boots; see the target).
+	# Phase 2d-1: VirtIO-net driver — GRUB/ISO path compiles WITHOUT
+	# JOE_PVH_BOOT, so option 2 is ACTIVE: full rings (2 RX x 2048 + 2 TX x
+	# 2048, depth 256) and the NIC runs (this is where qemu-net-smoke boots;
+	# see the target). The shim (kernel/virtio_net.c) only owns the buffers +
+	# getters now; the driver itself is kernel/virtio_net.curlee (gh issue
+	# #14), merged into kernel.c.
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
 	# Phase 2d-2 (gh issue #12): TCP/IP stack raw-state shim — GRUB path
 	# compiles WITHOUT JOE_PVH_BOOT, so the real 256-byte response store + full
@@ -341,8 +350,10 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	# framebuffer-state shim is C (see the kernel.elf rule).
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_STATE_C) -o $(BUILD_DIR)/vbe_state.o
 	# Phase 2d-1: VirtIO-net driver, PVH option-1 stubs (JOE_PVH_BOOT) — the
-	# NIC is compiled IN so the no-NIC-safe path is exercised on the existing
-	# smoke gates (net_probe finds nothing, all externs return 0).
+	# ring/buffer shim is compiled IN (kernel/virtio_net.c, getters return 0;
+	# the driver itself is kernel/virtio_net.curlee, gh issue #14) so the
+	# no-NIC-safe path is exercised on the existing smoke gates (net_probe
+	# finds nothing, all externs return 0).
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
 	# Phase 2d-2 (gh issue #12): TCP/IP stack raw-state shim, PVH option-1
 	# stubs (JOE_PVH_BOOT) — compiled IN so the shim extern surface is linked
@@ -540,6 +551,22 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' net_state_get$$' && echo "PASS: net_state_get linked (state shim)"
 	@nm $(KERNEL_ELF) | grep -q ' net_resp_store$$' && echo "PASS: net_resp_store linked (state shim)"
 	@nm $(KERNEL_ELF) | grep -q ' net_poll_fuel$$' && echo "PASS: net_poll_fuel linked (state shim)"
+	# gh issue #14: the VirtIO-net driver is now GENUINE Curlee (ported from
+	# the 798-line kernel/virtio_net.c) — the codegen emits the extern surface
+	# as the static curlee_net_* symbols, and the raw ring/buffer shim
+	# (kernel/virtio_net.c) must be linked for the getters + sfence the Curlee
+	# layer calls on BOTH builds.
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_probe$$' && echo "PASS: curlee_net_probe linked (VirtIO-net driver, gh issue #14)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_init$$' && echo "PASS: curlee_net_init linked (VirtIO-net driver)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_rx_len$$' && echo "PASS: curlee_net_rx_len linked (VirtIO-net driver)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_rx_byte$$' && echo "PASS: curlee_net_rx_byte linked (VirtIO-net driver)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_tx_send$$' && echo "PASS: curlee_net_tx_send linked (VirtIO-net driver)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_rx_wait$$' && echo "PASS: curlee_net_rx_wait linked (VirtIO-net driver)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_arp_request_gateway$$' && echo "PASS: curlee_net_arp_request_gateway linked (VirtIO-net driver)"
+	@nm $(KERNEL_ELF) | grep -q ' virtio_net_rx_buf_base$$' && echo "PASS: virtio_net_rx_buf_base linked (ring/buffer shim)"
+	@nm $(KERNEL_ELF) | grep -q ' virtio_net_tx_buf_base$$' && echo "PASS: virtio_net_tx_buf_base linked (ring/buffer shim)"
+	@nm $(KERNEL_ELF) | grep -q ' virtio_net_rx_qmem_base$$' && echo "PASS: virtio_net_rx_qmem_base linked (ring/buffer shim)"
+	@nm $(KERNEL_ELF) | grep -q ' virtio_net_sfence$$' && echo "PASS: virtio_net_sfence linked (ring/buffer shim)"
 	# Phase 2d-4: the tool-queue producer API the LLM bridge drives
 	# (fb_tool_enqueue(2, arg) — the 2d-3 contract, wired into the 2b ring).
 	# gh issue #13: the blitter + event loop moved to Curlee (kernel/fb.curlee),

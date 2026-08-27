@@ -346,11 +346,13 @@ fn serial_llm_marker(pm: cap phys.mem, n: Int) -> Unit {
 // delivering the first RX frame). Every step is gated on the previous step's
 // return, so a missing NIC emits nothing and existing gates (which boot
 // WITHOUT -netdev) stay green — acceptance criterion 6 (no-NIC-safe).
+// The net_* driver functions are genuine Curlee (kernel/virtio_net.curlee,
+// gh issue #14) and take the pm capability; net_link_up() is pure and does not.
 fn net_bringup(pm: cap phys.mem) -> Unit {
-  let p: Int = net_probe();
+  let p: Int = net_probe(pm);
   if (p == 1) {
     serial_net_marker(pm, 1);
-    let i: Int = net_init();
+    let i: Int = net_init(pm);
     if (i == 1) {
       serial_net_marker(pm, 2);
       let l: Int = net_link_up();
@@ -358,11 +360,11 @@ fn net_bringup(pm: cap phys.mem) -> Unit {
         serial_net_marker(pm, 3);
         // Deterministic frame source (LOCKED): guest ARPs the gateway, slirp
         // answers automatically — the first RX frame, no host-side injection.
-        let sent: Int = net_arp_request_gateway();
-        let rlen: Int = net_rx_wait();
+        let sent: Int = net_arp_request_gateway(pm);
+        let rlen: Int = net_rx_wait(pm);
         if (rlen > 0) {
           serial_rx_marker(pm, rlen);
-          net_rx_done();
+          net_rx_done(pm);
         }
       }
     }
@@ -500,11 +502,11 @@ fn json_llm_bridge(pm: cap phys.mem) -> Unit {
 fn net_llm_roundtrip(pm: cap phys.mem) -> Unit {
   let up: Int = net_link_up();
   if (up == 1) {
-    let conn: Int = net_connect(8080);
+    let conn: Int = net_connect(pm, 8080);
     if (conn == 1) {
       serial_arp_marker(pm, 1);
       serial_tcp_marker(pm, 1);
-      let sent: Int = net_send(36);
+      let sent: Int = net_send(pm, 36);
       if (sent == 1) {
         serial_snd_marker(pm, 36);
         // Poll until the response body is ready or the stack fails closed.
@@ -513,7 +515,7 @@ fn net_llm_roundtrip(pm: cap phys.mem) -> Unit {
         // Result 3 is also != 0, so the loop terminates for the same reason;
         // net_response_len() reports 0 after truncation, so no marker is
         // emitted for a corrupt body (the 2d-3 parser would see len 0).
-        while (net_stack_poll() == 0) {
+        while (net_stack_poll(pm) == 0) {
         }
         let rlen: Int = net_response_len();
         if (rlen > 0) {
