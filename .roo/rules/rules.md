@@ -170,11 +170,16 @@ while (cond) {
 
 ### Operators (supported fragment)
 
-- Arithmetic: `+` `-` `*` `/`
+- Arithmetic: `+` `-` `*` `/` `%` (Euclidean modulo — verified directly
+  2026-08-27: `7 % 3` runs, and `%` is provable inside `ensures`
+  contracts via Z3's `Z3_OP_MOD`. It is NOT unsupported/freestanding-only
+  — this doc previously said otherwise and was stale.)
 - Comparison: `==` `!=` `<` `>` `<=` `>=`
 - Logic: `&&` `||` `!`
-- **NO shifts, NO modulo (%), NO bitwise ops (`& | ^ ~`).** These are
-  rejected by the compiler — do not use them.
+- **NO shifts, NO bitwise ops (`& | ^ ~`)** — confirmed absent from
+  curlee's lexer/parser as of this writing. Verify against
+  `~/Projects/curlee/src/lexer/` or a throwaway `curlee run` probe if
+  this matters for what you're doing, rather than trusting this doc.
 
 ### Literals
 
