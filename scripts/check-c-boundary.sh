@@ -7,8 +7,9 @@
 # in the Curlee layer; C is only for I/O touches and raw memory moves.
 #
 # Checks:
-#   1. No kernel/*.c exceeds 200 lines (grandfathered files are exempt and
-#      tracked for migration in the policy doc).
+#   1. No kernel/*.c exceeds 200 lines (no grandfathers remain — the last one,
+#      libgcc32.c, was deleted in gh issue #21 once curlee #288 bundled the
+#      32-bit GCC ABI helpers into the toolchain runtime).
 #   2. No kernel/*.c contains a pure-data red flag: a `switch` with >4 cases,
 #      or a `static const` array with >32 elements.
 #   3. No kernel/*.c calls back into Curlee (calls a curlee_* / fb_* / net_*
@@ -26,21 +27,6 @@ KERNEL_DIR="$ROOT/kernel"
 # The 200-line cap.
 MAX_LINES=200
 
-# Grandfathered files (tracked in docs/c-boundary-policy.md §3): existing
-# drivers that predate the policy. They are exempt from the line cap until
-# migration (Curlee gains assignment + bitwise + port I/O).
-GRANDFATHERED=(
-  "libgcc32.c"    # 322 lines — GCC ABI shim, NEVER migrates
-)
-
-is_grandfathered() {
-    local f="$1"
-    for g in "${GRANDFATHERED[@]}"; do
-        [[ "$f" == "$g" ]] && return 0
-    done
-    return 1
-}
-
 violations=0
 
 echo "=== C boundary check (docs/c-boundary-policy.md) ==="
@@ -49,14 +35,10 @@ for f in "$KERNEL_DIR"/*.c; do
     name="$(basename "$f")"
     lines="$(wc -l < "$f")"
 
-    # 1. Line cap (grandfathered exempt).
+    # 1. Line cap (no grandfathers — every kernel/*.c must be at or under it).
     if (( lines > MAX_LINES )); then
-        if is_grandfathered "$name"; then
-            echo "  [warn] $name: $lines lines (grandfathered, exempt from cap — migrate per policy)"
-        else
-            echo "  [FAIL] $name: $lines lines exceeds the $MAX_LINES-line cap (docs/c-boundary-policy.md §3)"
-            violations=$((violations + 1))
-        fi
+        echo "  [FAIL] $name: $lines lines exceeds the $MAX_LINES-line cap (docs/c-boundary-policy.md §3)"
+        violations=$((violations + 1))
     else
         echo "  [ok]   $name: $lines lines"
     fi
@@ -96,4 +78,4 @@ if (( violations > 0 )); then
     exit 1
 fi
 
-echo "=== C boundary: OK (no violations; grandfather list: ${#GRANDFATHERED[@]} files) ==="
+echo "=== C boundary: OK (no violations; no grandfathered files) ==="
