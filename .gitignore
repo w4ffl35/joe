@@ -27,3 +27,6 @@ out.c
 
 # --- Curlee compiler generated C (build intermediates live in build/) ---
 *.curlee.c
+
+# --- headlesscode orchestrator worktrees / state (never source, never commit) ---
+/.worktrees/
