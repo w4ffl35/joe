@@ -106,15 +106,12 @@ A C file **satisfies** the policy if it is:
 
 The current C surface under `kernel/` — ALL files below the cap and in the
 exempt category (raw memory moves / build geometry / linkage shims), with
-zero pure logic; only `libgcc32.c` is grandfathered for the line cap:
-
-| File | Lines | Pure-logic estimate | Migrate when |
-|---|---|---|---|
-| `libgcc32.c` | 322 | 0 (compiler shim) | never (GCC ABI) |
-
-The other three files are BELOW the cap, in the exempt category above
-(raw memory moves / build geometry / C-level linkage), NOT in the
-grandfather list:
+zero pure logic and **no grandfathered files**: the last one,
+`libgcc32.c` (322 lines, "never migrates — GCC ABI"), was DELETED in gh
+issue #21 once curlee #288 bundled the equivalent 32-bit helpers into the
+curlee toolchain runtime (`runtime/libgcc32_helpers.c` — the GRUB/ISO path
+links that toolchain-owned file now instead of a kernel-local copy). The
+remaining files are exactly:
 
 - **`fb.c`** (~90 lines) — the two LARGE PVH-conditional buffers (the
   128x128 asset region + the 2x640x480 frame ring, compiled OUT on the PVH
@@ -157,6 +154,15 @@ Also DELETED in gh issue #20 (all three residuals the issue tracked):
 - **`net_stack.c`** (119 lines) + **`net_stack.h`** — the raw-state shim is
   gone; the one-shot state + 256-byte response store are Curlee statics in
   `net_glue.curlee`.
+
+Also DELETED in gh issue #21 (the compiler-runtime residual, not a driver):
+- **`libgcc32.c`** (322 lines) — the 32-bit GCC ABI helpers
+  (`__muldi3`/`__udivdi3`/`__umoddi3`/`__udivmoddi4`/`__divdi3`/`__moddi3`/
+  `__negdi2`/`__ashldi3`/`__lshrdi3`/`__ashrdi3`/`__cmpdi2`) for the
+  `-m32` GRUB path. curlee #288 bundled the equivalent implementation into
+  the curlee toolchain runtime (`runtime/libgcc32_helpers.c`), so the GRUB/
+  ISO build links the toolchain-owned object — the kernel no longer carries
+  its own copy, and `kernel/` has no grandfather list left.
 
 ## 4. Migration roadmap (what unblocks what)
 
@@ -226,8 +232,9 @@ refactored) and have the C side consume it via the extern window.
 
 `scripts/check-c-boundary.sh` runs on every `make verify` (and standalone):
 
-- **Fails** if any `kernel/*.c` exceeds **200 lines** (grandfathered files
-  listed in §3 are exempt until migration).
+- **Fails** if any `kernel/*.c` exceeds **200 lines** (no grandfathers
+  remain — `libgcc32.c` was the last, deleted in gh issue #21; the 32-bit
+  GCC ABI helpers now live in the curlee toolchain runtime).
 - **Fails** if any `kernel/*.c` contains a `switch` with >4 cases or a
   `static const` array >32 elements (pure-data red flags).
 - **Fails** if any `kernel/*.c` calls `fb_*`-style externs back into Curlee

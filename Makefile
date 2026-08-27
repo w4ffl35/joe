@@ -49,17 +49,27 @@ MB2_SRC       := kernel/mb2.curlee
 MB2_STATE_C   := kernel/mb2_state.c
 NET_C         := kernel/virtio_net.c
 NET_H         := kernel/net.h
-LIBGCC32_C    := kernel/libgcc32.c
 LINKER_GRUB   := scripts/linker-grub.ld
 MERGE_SCRIPT  := scripts/build-kernel.sh
-# Curlee runtime (crt0.S, linker.ld, rt.c) lives at the source root, not under
-# build/. Prefer CURLEE_ROOT (repo root); otherwise derive it from the curlee
-# binary location (curlee is at <root>/build/<preset>/curlee).
+# Curlee runtime (crt0.S, linker.ld, rt.c, libgcc32_helpers.c) lives at the
+# source root, not under build/. Prefer CURLEE_ROOT (repo root); otherwise
+# derive it from the curlee binary location (curlee is at
+# <root>/build/<preset>/curlee).
 ifdef CURLEE_ROOT
 CURLEE_RT := $(CURLEE_ROOT)/runtime
 else
 CURLEE_RT := $(shell dirname $$(dirname $(CURLEE)))/../runtime
 endif
+
+# 32-bit GCC ABI helpers (__muldi3/__udivdi3/__umoddi3/__udivmoddi4/
+# __divdi3/__moddi3/__negdi2/__ashldi3/__lshrdi3/__ashrdi3/__cmpdi2) for the
+# GRUB/ISO path (kernel-grub.elf). curlee #288 bundled these into the
+# toolchain runtime (runtime/libgcc32_helpers.c) so downstream projects never
+# ship their own copy — gh issue #21 deleted kernel/libgcc32.c and this build
+# consumes the toolchain-bundled file instead (same symbols, one source of
+# truth). Only linked into kernel-grub.elf: the 64-bit PVH path (kernel.elf)
+# has native int64_t arithmetic and never needs them.
+LIBGCC32_HELPERS_C := $(CURLEE_RT)/libgcc32_helpers.c
 
 CC := cc
 AS := as
@@ -238,10 +248,13 @@ iso: $(ISO)
 # the link uses `ld -m elf_i386`. GRUB's multiboot2 loader enters this kernel
 # in 32-bit protected mode with %ebx = the trusted info pointer; boot.S stores
 # it into mb2_info_addr and calls curlee_main (compiled -m32, so the 64-bit
-# Int math is implemented by libgcc32.o's __muldi3/__divdi3/... helpers).
+# Int math is implemented by the 32-bit GCC ABI helpers — since curlee #288 /
+# gh issue #21 these come from the TOOLCHAIN-BUNDLED runtime
+# (libgcc32_helpers.c, $(CURLEE_RT)); the kernel-local kernel/libgcc32.c is
+# deleted).
 #
 # The 64-bit PVH/QEMU path (kernel.elf via crt0.S) is completely unchanged.
-$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(FB_C) $(MB2_STATE_C) $(LIBGCC32_C) $(NET_C) $(NET_H) $(LINKER_GRUB)
+$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(FB_C) $(MB2_STATE_C) $(LIBGCC32_HELPERS_C) $(NET_C) $(NET_H) $(LINKER_GRUB)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel-grub.o
@@ -262,7 +275,10 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(FB_C) $(MB2_STATE_C) $
 	# getters now; the driver itself is kernel/virtio_net.curlee (gh issue
 	# #14), merged into kernel.c.
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
-	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(LIBGCC32_C) -o $(BUILD_DIR)/libgcc32.o
+	# 32-bit GCC ABI helpers — curlee #288: bundled in the toolchain runtime
+	# (libgcc32_helpers.c). gh issue #21 deleted kernel/libgcc32.c; the link
+	# below resolves __muldi3/__udivdi3/... from this toolchain-owned object.
+	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(LIBGCC32_HELPERS_C) -o $(BUILD_DIR)/libgcc32.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	# boot.S: ELFCLASS32 object with the multiboot2 header + 32-bit protected-mode
 	# entry that captures %ebx and calls curlee_main directly (no GDT/page tables:
