@@ -30,3 +30,7 @@ out.c
 
 # --- headlesscode orchestrator worktrees / state (never source, never commit) ---
 /.worktrees/
+
+# --- Auto-generated per-worker task files (orchestrator scratch, not
+#     hand-written design docs -- those stay tracked directly under plans/) ---
+/plans/parallel-tasks/
