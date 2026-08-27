@@ -189,6 +189,32 @@ while (cond) {
 - Hex addresses may use `_` separators: `0xFD00_0000`.
 - String literals: `"x"`.
 
+### Fixed-size arrays
+
+Now supported in BOTH the freestanding kernel build and `curlee run` (the
+VM) — landed 2026-08-27 via curlee#301/joeos#36, already used in
+`kernel/net_stack.curlee`. **Scope determines the keyword** — verified
+directly, a live session got this wrong and misdiagnosed the resulting
+parse error as "arrays aren't supported" when the real issue was just
+the wrong keyword for the scope:
+- Module (top) level: MUST use `static`. A top-level `let` is a hard
+  parse error.
+- Inside a function body: use `let`.
+
+```curlee
+static buf: [Int; 4] = [0; 4];   // module level — static only
+
+fn main() -> Int {
+  let local_buf: [Int; 4] = [0; 4];   // inside a function — let
+  buf[0] = 42;
+  local_buf[0] = 7;
+  return buf[0] + local_buf[0];
+}
+```
+
+`N` must be a compile-time literal (or a `--define`d build constant).
+Every access must be provably in bounds.
+
 ### Physical memory (`Phys<T>`) — freestanding / kernel
 
 ```curlee
