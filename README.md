@@ -1,266 +1,146 @@
 # JOE
 
 ![status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-red)
+![license: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)
 
-A blazing fast minimal operating system for hackers.
+A from-scratch x86-64 kernel whose entire driver layer is written in
+[Curlee](https://github.com/w4ffl35/curlee), a verification-first systems
+language. Every module passes formal verification (`curlee check`, backed by
+Z3) before the kernel is built. No proof, no build.
 
-JOE runs one language - [CURLEE](https://github.com/w4ffl35/curlee).
+## What is this
 
-JOE is a minimalist operating system that will remain thin. Do not expect it to bloat with drivers, software or other features.
+JOE is an experimental, pre-alpha hobby OS kernel. Its driver layer — serial,
+VGA setup, VBE probe, multiboot2 parsing, framebuffer blitter, VirtIO-net,
+TCP/IP, and the JSON parser — is 100% Curlee after a full migration from C.
+It boots under QEMU and VirtualBox, renders a software framebuffer, and runs
+a real TCP/IP stack that performs an HTTP round-trip against a host-side
+server. The kernel does not run AI inference, bundle any model, or provide
+LLM/TTS/STT/image-generation capabilities. Its "LLM bridge" is a
+network/JSON/tool-queue exercise: the model (or a deterministic stub) lives
+on the host, never in the kernel.
 
-JOE does NOT come with a web browser or a calculator or nearly any other software.
+What is unusual here is the toolchain: a formally verified language is
+generating the kernel's drivers. That is the point of the project, and it is
+compelling on its own.
 
-JOE DOES come with CURLEE, the ability to run AI inference on your own models, and some minimal tools to help you get started.
+## Quick start
 
-JOE also comes bundled with Qwen 3.5 9b. JOE is natively capable of running LLMs, TTS, STT and Image generation models.
-
-YOU are respondible for wrighting your own software and drivers for JOE. If you want to use JOE, you will need to learn how to write software for it, or better yet: make your LLM write software for you.
-
----
-
-## Phase 1: Bare-Metal "Hello World from JOE"
-
-This phase builds the first bootable JOE kernel: a freestanding x86-64
-kernel written in Curlee that boots and renders **"Hello World from JOE"**
-to the screen, with serial output for verification.
-
-### Architecture
-
-- **Language**: [Curlee](https://github.com/w4ffl35/curlee) — a
-  verification-first language. The kernel is written in the freestanding
-  Curlee subset (Int/Bool arithmetic, `if`/`while`, `extern fn`, and
-  `Phys<T>` raw memory access under `unsafe` + `cap phys.mem`).
-- **Toolchain**: Curlee's `curlee build --link` emits freestanding C from the
-  verified program, compiles it with `-ffreestanding -fno-builtin -nostdlib`,
-  assembles its `crt0.S` boot stub, and links with its `linker.ld` into a
-  bootable x86-64 multiboot2+PVH kernel ELF.
-- **Boot (primary, QEMU)**: `qemu-system-x86_64 -kernel build/kernel.elf`
-  boots via the PVH note (`.note.Xen`) directly into 64-bit long mode.
-- **Boot (secondary, VirtualBox)**: `make iso` produces a GRUB-bootable ISO
-  (`build/joeos.iso`) wrapping the same kernel ELF. GRUB's multiboot2 loader
-  (which supports x86-64 ELF kernels) enters the kernel in long mode.
-- **Display**: the kernel renders "Hello World from JOE" to the VGA text
-  buffer (`Phys<U16>` writes at `0xB8000`, attribute 0x0F), after programming
-  VGA text mode 3 (`vga_setup.curlee`, ported from the deleted
-  `vga_setup.c`, issue #10). Under QEMU this renders perfectly.
-  A framebuffer renderer (blitter + 5x7 glyphs as 32bpp pixels) is included
-  and is selected when a real linear framebuffer is available — the Phase 2
-  demo scene (a panel rectangle, a line, "JOE" in scaled glyphs) renders to
-  the framebuffer via the Curlee blitter (`fb.curlee`, gh issue #13) and the
-  serial `FB: 1` / `RING: 1` markers prove it under QEMU
-  (`make qemu-pvh-fb-smoke` / `make qemu-fb-smoke`).
-- **VirtualBox display note (known limitation)**: VirtualBox's VGA emulation
-  does not reliably present a bare-metal kernel's text plane or framebuffer
-  after a GRUB handoff — attempts with text mode, mode-3 reset, gfxterm, and
-  the `0xFD000000` framebuffer all showed garbled/black output. The kernel
-  itself is correct (QEMU renders it perfectly).
-- **Verification (authoritative)**: every boot — QEMU `-kernel`, GRUB ISO
-  under QEMU, and VirtualBox — emits `Hello World from JOE!` on COM1,
-  captured to a host serial log. This is the deterministic, machine-checked
-  acceptance gate (`make qemu-smoke`).
-
-### Project layout
-
-```
-Makefile                 # build: merged kernel.elf, iso; run: qemu; verify gates
-scripts/
-  find-curlee.sh         # locate the curlee compiler (CURLEE/CURLEE_ROOT/PATH)
-  build_iso.sh           # grub-mkrescue GRUB ISO (VirtualBox path)
-  vbox-setup.sh          # automated VirtualBox VM creation + boot (VBoxManage)
-  build-kernel.sh        # concat pure modules + kernel.curlee -> single-TU merged file
-kernel/
-  kernel.curlee          # Phase 2 entry: externs, render_frame scene, main
-  canvas.curlee          # pure verified color/geometry math (VM-tested)
-  glyphs.curlee          # pure 5x7 glyph math + text layout (VM-tested)
-  assets.curlee          # pure blit-fit + frame-ring math (VM-tested)
-  canvas_test.curlee     # VM-runnable assertions over the pure modules
-  pack.curlee            # pure cell/pixel helpers (VM-testable, verified)
-  boot.S                 # multiboot2 64-bit entry (GRUB ISO path)
-  serial.curlee          # COM1 serial driver (ported from putc_driver.c, issue #9)
-  vga_setup.curlee       # VGA text-mode-3 register programming (ported from vga_setup.c, issue #10)
-  vga_text_clear.c       # 0xB8000 text-buffer clear (raw memory move — see c-boundary-policy.md)
-  fb.c                   # linear-FB software blitter (pixel/fill/line/text/blit)
-```
-
-### Prerequisites
-
-- The **Curlee compiler** (built from `~/Projects/curlee`; the Makefile
-  auto-detects it via `scripts/find-curlee.sh`). Set `CURLEE` or
-  `CURLEE_ROOT` if it's elsewhere.
-- `cc`, `ld`, `objdump`, `nm`, `readelf` (binutils + a C compiler).
-- `qemu-system-x86_64` (for boot testing).
-- `grub-mkrescue` (grub-pc-bin / grub2-common) — only for `make iso`.
-
-### Build & verify
+Prerequisites: the Curlee compiler (`scripts/find-curlee.sh` auto-detects it;
+override with `CURLEE` or `CURLEE_ROOT`), `cc`/`ld`/binutils, and
+`qemu-system-x86_64`. `grub-mkrescue` is needed only for `make iso`.
 
 ```sh
-make kernel     # -> build/kernel.elf  (QEMU path)
-make iso        # -> build/joeos.iso   (VirtualBox path)
-make verify     # static gates: check, packer test, canvas-run, ELF entry,
-                # _start, curlee_main, PVH note
-make qemu-smoke # dynamic gate: boot kernel.elf, assert serial log contains
-                # "Hello World from JOE"
-make qemu-fb-smoke   # dynamic gate: boot FB ISO, assert serial "FB: 1"
-make qemu-loop-smoke # dynamic gate: boot FB ISO, assert the 60 FPS loop ran
-                     # frames FR:0..FR:2+ deterministically
+make kernel          # verify + codegen + link -> build/kernel.elf (PVH path)
+make verify          # static gates: curlee check/run, codegen harnesses, ELF checks
+make qemu-smoke      # boot the PVH kernel, assert "Hello World from JOE" on serial
+make iso             # GRUB-bootable ISO -> build/joeos.iso (VirtualBox path)
+make qemu-fb-smoke   # boot the framebuffer ISO, assert FB: 1 and RING: 1 on serial
 ```
 
-### Run
+All of the above were run on a clean checkout and pass. For the live dev
+loop, `make qemu-serial` prints boot output to the terminal (Ctrl-A X to
+quit). VirtualBox is exercised via `bash scripts/vbox-setup.sh --headless`
+after `make iso`.
 
-```sh
-# QEMU (primary development tool) — the kernel's boot output prints LIVE to
-# your terminal ("Hello World from JOE!"), no GUI needed. Ctrl-A X to quit.
-make qemu-serial
+## What it does today
 
-# QEMU with a real GUI window (like VirtualBox) when a display server is
-# available; serial goes to build/serial.log
-make qemu-display
+Everything below is proven by the serial markers the project's own smoke
+gates assert. Serial (COM1) is the authoritative console.
 
-# QEMU exposing a VNC server (127.0.0.1:5901) — connect with any VNC client
-# to see the rendered VGA text; serial goes to build/serial.log
-make qemu-gui
+- **Boots and halts deterministically.** Every boot path emits
+  `Hello World from JOE!` on serial (`make qemu-smoke`).
+- **Software framebuffer renderer in Curlee** (`kernel/fb.curlee`): pixel,
+  fill-rect, line, blit, and glyph-text primitives, a 60 FPS event loop, and
+  a back-buffer ring flip. Markers: `FB: 1` (framebuffer ready), `FR:0`..`FR:3`
+  (loop frames), `RING: 1` (real flip) — asserted in order by
+  `make qemu-loop-smoke`. Without a framebuffer it falls back to the VGA
+  text buffer.
+- **Bochs VBE probe** (`kernel/vbe.curlee`) finds a linear framebuffer on
+  the PVH path (`make qemu-pvh-fb-smoke` asserts `FB: 1`).
+- **VirtIO-net driver in Curlee** (`kernel/virtio_net.curlee`): PCI probe,
+  virtqueue setup, RX/TX rings. Markers `NET: 1` (found) → `NET: 2` (ready)
+  → `NET: 3` (link up), then `RX: <len>` (first frame) — asserted by
+  `make qemu-net-smoke` with a two-QEMU socket harness.
+- **TCP/IP stack in Curlee** (`kernel/net_stack.curlee`): ARP, IPv4, TCP,
+  RFC 1071/793 checksums, HTTP Content-Length framing. Pure Curlee and
+  VM-verified (`make net-stack-run`, `make net-stack-codegen-run`).
+- **LLM-bridge round-trip:** the kernel POSTs over its own stack to a
+  host-side HTTP server, parses the JSON tool-call envelope
+  (`kernel/json.curlee`), enqueues the tool call, and acks. Markers
+  `ARP: 1`, `TCP: 1`, `SND: 36`, `RCV: 36`, `JSON: 1`, `TOOL: 2`, `LLM: 1`
+  are asserted in order by `make qemu-llm-smoke`. The default server is the
+  deterministic `scripts/llm_stub_server.py` (returns the fixed 36-byte
+  envelope `{"tool":"frame_tick","args":[0,1,2]}`); pointing it at a real
+  llama.cpp server is documented but intentionally not part of the
+  deterministic gate. The gate needs host port 8080 free.
+- **Verification model:** pure modules are VM-runnable (`make canvas-run`,
+  `make net-stack-run`); freestanding paths are proven by host-side codegen
+  harnesses (`json-codegen-run`, `net-stack-codegen-run`, `mb2-codegen-run`);
+  `make verify` runs the whole chain plus ELF/symbol/PVH-note checks.
 
-# QEMU headless — serial output to build/serial.log (CI/automation)
-make qemu
+**C-to-Curlee migration is complete.** `ls kernel/*.c` finds nothing, and
+`make c-boundary` (`scripts/check-c-boundary.sh`) reports "zero C files; no
+grandfathered files". `kernel/net.h` survives only as the C-visible contract
+documentation for the network API. The live count is tracked in the
+[C-to-Curlee Migration](https://github.com/w4ffl35/joeos/milestone/1)
+milestone.
 
-# Boot the ISO under QEMU (sanity for the VirtualBox path)
-make qemu-iso
+## Architecture
 
-# VirtualBox — fully automated (creates VM, attaches ISO, enables serial,
-# starts it):
-make iso                          # -> build/joeos.iso
-bash scripts/vbox-setup.sh        # creates/registers/starts the "JOE" VM
-# Optional flags:
-#   --iso <path>    use a different ISO (e.g. on an external drive)
-#   --name <vm>     VM name (default JOE)
-#   --headless      run without a GUI window (serial log still captures output)
-#
-# The VM is configured with 64 MiB RAM / 1 vCPU, DVD-first boot, no disk/network,
-# and COM1 -> a host serial log (build/vbox-serial.log, or next to the ISO).
-# If the host's KVM module holds the virtualization extension, the script
-# temporarily unloads it, starts the VM, and reloads KVM afterward.
-#
-# Manual steps (equivalent):
-#   1. New VM -> Linux / Other 64-bit
-#   2. Attach build/joeos.iso as a CD/DVD drive
-#   3. Boot (it is bootable)
-#   "Hello World from JOE" appears on screen; serial output (if a serial
-#   port is configured) carries the same text for host logs.
-```
+- **Two boot paths.** *PVH*: `qemu -kernel build/kernel.elf` boots 64-bit
+  directly via the ELF's PVH note (crt0.S); the VBE probe supplies the
+  framebuffer. The PVH machine exposes no legacy PCI, so no NIC here.
+  *GRUB/multiboot2*: the ISO path (VirtualBox, and QEMU for the gate tests);
+  boot.S captures the multiboot2 info pointer and SeaBIOS's legacy PCI is
+  where VirtIO-net actually runs. This is also where the framebuffer flip
+  runs at full geometry.
+- **Why both:** PVH is the fast, scriptable dev loop. The ISO path is the
+  VirtualBox target and the only place the NIC is reachable.
+- **One merged Curlee translation unit.** `scripts/build-kernel.sh`
+  concatenates the modules (the freestanding codegen rejects imports). Pure
+  math lives in VM-runnable modules (`canvas`/`glyphs`/`assets`/`pack`/
+  `json`/`net_stack`) verified with `curlee check`; drivers use Curlee
+  statics, `addr_of` getters, `phys_read`/`phys_write` builtins, and
+  `Phys<T>` under `cap phys.mem`.
+- **C/Curlee split rationale:** [`docs/c-boundary-policy.md`](docs/c-boundary-policy.md).
+  Its one-sentence rule — no logic in C. Today there is no C at all in
+  `kernel/`.
+- **Design constraints:** single address space, Ring 0; no libc, no malloc,
+  no MMU setup.
 
-### Recommended development loop
+## Status / roadmap
 
-Use **QEMU** to test the machine as you build it — it's what Curlee's own CI
-uses, and its serial output is the kernel's console:
+This only runs under QEMU (primary) and VirtualBox (secondary). **No real
+hardware has been tested** — see the
+[Bare-Metal Readiness](https://github.com/w4ffl35/joeos/milestone/2)
+milestone.
 
-```sh
-make qemu-serial # kernel prints "Hello World from JOE!" live to the
-                 # terminal — the primary dev loop (Ctrl-A X to quit)
-make verify      # static verification gates
-make qemu-smoke  # automated boot + serial assertion
-```
+Limitations, stated plainly:
 
-Use **VirtualBox only for packaging validation** (that the ISO is bootable
-and the kernel runs), since its VGA emulation does not reliably present a
-bare-metal kernel's display after a GRUB handoff — the serial log is the
-proof there: `bash scripts/vbox-setup.sh --headless` then check
-`vbox-serial.log` for `Hello World from JOE!`.
+- No persistent storage: there is no disk driver (virtio-blk is an open item).
+- Networking works only under a hypervisor's paravirtualized virtio-net.
+  There is no real NIC driver.
+- VirtualBox's VGA emulation garbles the text plane and framebuffer after
+  the GRUB handoff; serial is the authoritative console there.
+- The LLM smoke gate needs host port 8080 free (see above).
 
-### Verification gates (acceptance criteria)
+Future work is tracked in three milestones:
+[C-to-Curlee Migration](https://github.com/w4ffl35/joeos/milestone/1)
+(closed out), [Bare-Metal Readiness](https://github.com/w4ffl35/joeos/milestone/2)
+(real-hardware validation), and
+[Native Inference (Edge)](https://github.com/w4ffl35/joeos/milestone/3)
+(open investigation).
 
-| Gate | Command | Pass condition |
-|------|---------|----------------|
-| Verify | `make verify` | `curlee check` on all pure modules + merged kernel; `curlee run` packer → 0; `curlee run` canvas_test → 0; ELF entry set; `_start` + `curlee_main` present; `.note.Xen` PVH present |
-| Renderer math | `make canvas-run` | `curlee run kernel/canvas_test.curlee` → 0 (color/geometry/glyph/asset/tool-queue assertions) |
-| Boot (QEMU) | `make qemu-smoke` | kernel.elf boots under QEMU; serial log contains `Hello World from JOE!` |
-| Boot (ISO/GRUB) | `make qemu-iso` | ISO boots under QEMU via GRUB; serial log contains `Hello World from JOE!` |
-| Framebuffer (ISO) | `make qemu-fb-smoke` | FB-mode ISO boots; serial log contains `FB: 1` (multiboot2 framebuffer tag parsed, `fb_ready()==1`) |
-| 60 FPS loop (ISO) | `make qemu-loop-smoke` | FB-mode ISO boots; serial log contains `FR:0`, `FR:1`, `FR:2` then `FB: 1` (the deterministic loop rendered >1 frame) |
+## Relationship to Curlee
 
-All gates pass on this branch (QEMU serial: `Hello World from JOE!`, GRUB
-ISO boots, ELF entry + symbols + PVH note verified).
-
----
-
-## Phase 2: Agentic Framebuffer OS (software renderer)
-
-Phase 2 refactors the static test kernel into an AI-native, single-address-space
-OS with a freestanding software renderer targeting the linear framebuffer.
-
-### Architecture
-
-- **Two layers**: Curlee computes geometry/intent (pure, Z3-verified, VM-tested)
-  AND executes the pixel loops ([`kernel/fb.curlee`](kernel/fb.curlee) — the
-  blitter + 60 FPS event loop, gh issue #13). The blitter's small mutable
-  state (tool ring, loop counters, ring bookkeeping, draw-target
-  indirection) is genuine Curlee `static` module state (the toolchain gained
-  static + `[T; N]` arrays), and the runtime-address memory moves are Curlee
-  compiler builtins (`phys_write_u32`/`phys_read_u8/u32` — inline volatile
-  stores/loads). The C shim ([`kernel/fb.c`](kernel/fb.c)) keeps ONLY the
-  four framebuffer globals and the two LARGE PVH-conditional buffers (the
-  128x128 asset region + 2x640x480 frame ring — sized per build with
-  `#ifndef JOE_PVH_BOOT` because Curlee has no conditional compilation and
-  the PVH loader rejects a large BSS, see `docs/phase2c-report.md` §4.3).
-- **Single-TU merge**: the freestanding codegen crashes on `import`, so
-  [`scripts/build-kernel.sh`](scripts/build-kernel.sh) concatenates the pure
-  modules + `kernel.curlee` into one self-contained translation unit.
-- **Pure modules** (all VM-testable via `make canvas-run`):
-  - [`kernel/canvas.curlee`](kernel/canvas.curlee) — color packing/channels,
-    rect containment/cover, clamp, clip, alpha blend
-  - [`kernel/glyphs.curlee`](kernel/glyphs.curlee) — 5x7 glyph pixel test +
-    text layout math
-  - [`kernel/assets.curlee`](kernel/assets.curlee) — blit-fit OOB gate + frame
-    ring-buffer slot math, static asset-region geometry, runtime fit gates
-    (rect/line/char/asset), frame-ring geometry (Phase 2c)
-- **Blitter** ([`kernel/fb.curlee`](kernel/fb.curlee)): genuine Curlee
-  functions `fb_clear`, `fb_pixel`, `fb_fill_rect`, `fb_line`,
-  `fb_blit_asset`, `fb_present`, plus the Phase 2b 60 FPS loop + tool ring
-  (`fb_loop_init`/`fb_loop_frame`/`fb_run_loop`/`fb_tool_enqueue`/...),
-  all bounds-checked. Glyph text rendering is Curlee too — `draw_glyph` in
-  [`kernel/kernel.curlee`](kernel/kernel.curlee) reads `glyph_pixel` from
-  [`kernel/glyphs.curlee`](kernel/glyphs.curlee) and drives `fb_pixel` (no C
-  glyph-table copy). The tool ring is Curlee statics; only the two large
-  PVH-conditional buffers (asset region + frame ring) stay as C static
-  arrays in [`kernel/fb.c`](kernel/fb.c) — no malloc. Phase 2c:
-  `fb_present()` performs a real back-buffer flip on the GRUB framebuffer
-  path (serial `RING: 1`).
-- **Declarative scene**: `render_frame(frame)` in
-  [`kernel/kernel.curlee`](kernel/kernel.curlee) describes one frame (colors
-  bound to `let`s — the verifier rejects calls as call arguments); every
-  primitive is gated by a verified pure gate reading the runtime FB size from
-  `fb_get_width`/`fb_get_height` (out-of-bounds primitives are skipped);
-  Curlee's `main` drives the fuel-bounded loop when `fb_ready()` is 1, else
-  falls back to VGA text + serial.
-
-### Phase 2 roadmap
-
-| Phase | Scope | Status |
-|-------|-------|--------|
-| 2a | Software renderer: blitter primitives, text, bitmap/frame blit, pure verified math modules | ✅ done |
-| 2b | Kernel tool API & 60 FPS event loop — Curlee `main` drives a fuel-bounded while-loop; `fb.c` owns the frame counter + fixed-slot tool ring; `make qemu-loop-smoke` asserts frames FR:0..FR:2+ | ✅ done |
-| 2c | Memory & asset management contracts (ring-buffer hardening, static buffers) | ✅ done — static asset region (128x128) + 2-slot 640x480 frame ring (no malloc); every blit/fill/line/text path gated by verified pure gates (OOB primitives skipped); `fb_present()` real flip on the GRUB FB path (serial `RING: 1`); PVH path compiles the ring out (`JOE_PVH_BOOT`) for QEMU's PVH loader limit; canvas_test §14–17 VM-asserts all geometry |
-| 2d | LLM bridge (VirtIO-net/TCP + JSON) — host-side llama.cpp | planned |
-| 2e | Framebuffer address plumbing — 32-bit multiboot2 entry + framebuffer request tag; serial `FB: 1` proves `fb_ready()==1` (`make qemu-fb-smoke`) | ✅ done |
-
-See [`docs/phase2-architecture.md`](docs/phase2-architecture.md) for the full
-design, the Curlee verifier-fragment constraints discovered, and the Curlee
-codegen import fix as a follow-up work item.
-
-### Design notes
-
-- **Single-address space, Ring 0**: `Phys<T>` writes are direct volatile
-  stores; no MMU setup, no privilege transitions.
-- **Deterministic verification**: every `phys<U32>(0xADDR)` address is a
-  constant literal (Curlee rule), the packer (`pack.curlee`) is pure
-  `Int -> Int`, and the full check pipeline (lex → parse → resolve →
-  type-check → verify) runs before any code is emitted (`no proof, no build`).
-- **Minimal footprint**: no libc, no malloc, no String/Vec (rejected by the
-  freestanding target), no drivers beyond the VGA buffer + COM1 serial hook.
-
-## Installation
-
-TODO: Write installation instructions.
+JOE is both a proving ground for and a consumer of
+[w4ffl35/curlee](https://github.com/w4ffl35/curlee). Kernel work keeps
+surfacing language gaps — extern statics, `addr_of`, runtime-address
+`phys_read`/`phys_write` builtins, and per-build static sizing via `--define`
+all landed because this kernel needed them. See the Curlee repo for the
+language itself.
 
 ## License
 
-See [LICENSE](LICENSE) for license rights and limitations (GPL 3.0).
+GPL-3.0 — see [LICENSE](LICENSE).
