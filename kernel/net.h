@@ -5,11 +5,13 @@
 // Single source of truth for the byte-buffer contract between the NIC driver
 // (2d-1) and the TCP layer (2d-2). Since gh issue #14 the driver is GENUINE
 // Curlee (kernel/virtio_net.curlee — codegen'd as the static curlee_net_*
-// symbols; kernel/virtio_net.c is reduced to a ring/buffer shim that no
-// longer implements these), and the Curlee window into the API is the same
-// function set as the externs declared below (threaded with `pm: cap
-// phys.mem` in Curlee, dropped by codegen). The declarations below remain as
-// the C-visible contract documentation; the 2d-2 stack consumes the surface
+// symbols), and gh issue #296 DELETED the last C residual (kernel/virtio_net.c):
+// the ring/buffer memory is Curlee statics sized per build via `--define`, the
+// base-address getters are Curlee addr_of reads, and the ring-publication
+// fence is the runtime's curlee_sfence. The Curlee window into the API is the
+// same function set as the declarations below (threaded with `pm: cap
+// phys.mem` in Curlee, dropped by codegen). The declarations remain as the
+// C-visible contract documentation; the 2d-2 stack consumes the surface
 // through kernel/net_glue.curlee.
 //
 // RX handoff (fixed-slot, driver -> stack):
@@ -36,8 +38,9 @@
 // Buffer sizing (LOCKED in issue #5): 2 RX buffers x 2048 B + 2 TX buffers x
 // 2048 B. The RX buffers must be >= 256 B (wire-shape §3.2 absolute limit for
 // the LLM response body, docs/phase2d-wire.md). On the PVH build
-// (JOE_PVH_BOOT) virtio_net.c stubs these down to 1 byte and every extern
-// returns 0 — the API surface is identical on both paths.
+// (JOE_PVH_BOOT) the Curlee statics stub down to 1 element via the PVH
+// `--define` set and every base getter returns 0 (gh issue #296) — the API
+// surface is identical on both paths.
 #ifndef JOE_NET_H
 #define JOE_NET_H
 
@@ -46,7 +49,8 @@
 #define NET_TX_BUFS      2
 #define NET_TX_BUF_BYTES 2048
 
-// Implemented by kernel/virtio_net.c (freestanding, no libc).
+// Implemented by kernel/virtio_net.curlee (codegen'd as curlee_net_* / the
+// Curlee addr_of getters; kernel/virtio_net.c is DELETED, gh issue #296).
 long long net_probe(void);
 long long net_init(void);
 long long net_link_up(void);

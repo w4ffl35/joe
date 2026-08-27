@@ -44,13 +44,33 @@ CANVAS_TEST   := kernel/canvas_test.curlee
 JSON_TEST     := kernel/json_test.curlee
 NET_STACK_TEST := kernel/net_stack_test.curlee
 BOOT_ASM      := kernel/boot.S
-FB_C          := kernel/fb.c
 MB2_SRC       := kernel/mb2.curlee
 MB2_STATE_C   := kernel/mb2_state.c
-NET_C         := kernel/virtio_net.c
-NET_H         := kernel/net.h
 LINKER_GRUB   := scripts/linker-grub.ld
 MERGE_SCRIPT  := scripts/build-kernel.sh
+
+# Per-build-target static array sizing (gh issue #296): the SAME merged
+# kernel.curlee source declares the large static buffers (fb.curlee's asset
+# region + frame ring, virtio_net.curlee's ring/buffer memory) with sizes
+# that are constant expressions over these build-time constants, injected
+# with `curlee build --define NAME=VALUE` (no C shim, no conditional
+# compilation). kernel/fb.c + kernel/virtio_net.c are DELETED.
+#   PVH build (qemu -kernel) — PVH_DEFINES: the buffers stub to 1 element
+#   (JOE_PVH_BOOT=1) so the image stays within QEMU's PVH LOAD budget
+#   (docs/phase2c-report.md §4.3). kernel.elf + kernel-smoke.elf.
+#   GRUB build (kernel-grub.elf / ISO) — GRUB_DEFINES: full option-2 sizes,
+#   where the framebuffer flip / the NIC actually runs.
+#   check — CHECK_DEFINES: the full-size (GRUB) geometry (the harder verify
+#   case; the canvas_test/VM gates assert the pure constants on both sides).
+PVH_DEFINES := --define JOE_PVH_BOOT=1 \
+  --define ASSET_REGION_W=1 --define ASSET_REGION_H=1 \
+  --define FRAME_RING_SLOTS=1 --define FRAME_RING_MAX_W=1 --define FRAME_RING_MAX_H=1 \
+  --define NET_QMEM_PAGES=1 --define NET_RX_BUFS=1 --define NET_TX_BUFS=1 --define NET_BUF_BYTES=1
+GRUB_DEFINES := --define JOE_PVH_BOOT=0 \
+  --define ASSET_REGION_W=128 --define ASSET_REGION_H=128 \
+  --define FRAME_RING_SLOTS=2 --define FRAME_RING_MAX_W=640 --define FRAME_RING_MAX_H=480 \
+  --define NET_QMEM_PAGES=5 --define NET_RX_BUFS=2 --define NET_TX_BUFS=2 --define NET_BUF_BYTES=2048
+CHECK_DEFINES := $(GRUB_DEFINES)
 # Curlee runtime (crt0.S, linker.ld, rt.c, libgcc32_helpers.c) lives at the
 # source root, not under build/. Prefer CURLEE_ROOT (repo root); otherwise
 # derive it from the curlee binary location (curlee is at
@@ -92,16 +112,17 @@ $(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
-$(KERNEL_ELF): $(MERGED_SRC) $(FB_C) $(MB2_STATE_C) $(NET_C) $(NET_H)
+$(KERNEL_ELF): $(MERGED_SRC) $(MB2_STATE_C)
 	@mkdir -p $(BUILD_DIR)
-	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
+	# PVH path (qemu -kernel): the large Curlee buffers (asset region, frame
+	# ring, net ring/buffer memory) are sized to 1-element stubs by the PVH
+	# --define set (JOE_PVH_BOOT=1) so the image stays within QEMU's PVH LOAD
+	# budget (docs/phase2c-report.md §4.3 — a large BSS silently breaks the
+	# PVH entry). The GRUB/ISO path (kernel-grub.elf below) uses the GRUB
+	# define set and gets the full ring/asset region, where the framebuffer
+	# flip actually runs (gh issue #296).
+	$(CURLEE) build --target freestanding-c $(PVH_DEFINES) -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel.o
-	# PVH path (qemu -kernel): compile-time-empty frame ring/asset region
-	# (JOE_PVH_BOOT) so the image stays within QEMU's PVH LOAD budget (a large
-	# BSS silently breaks the PVH entry — see kernel/fb.c header). The GRUB/ISO
-	# path (kernel-grub.elf) compiles WITHOUT this macro and gets the full
-	# ring/asset region, which is where the framebuffer flip actually runs.
-	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	# gh issue #15 + #20: the multiboot2 tag walk is Curlee (kernel/mb2.curlee,
 	# merged into kernel.c above). The only C residual is the raw-state shim
 	# (kernel/mb2_state.c): mb2_info_addr_get (reads boot.S's .data global —
@@ -121,18 +142,12 @@ $(KERNEL_ELF): $(MERGED_SRC) $(FB_C) $(MB2_STATE_C) $(NET_C) $(NET_H)
 	# (gh issue #20): the framebuffer state it fills is Curlee statics in
 	# fb.curlee, written through fb_state_set — the former vbe_state.c shim
 	# (`vbe_state_set`) is deleted and nothing from it links here.
-	# Phase 2d-1: VirtIO-net driver. gh issue #14: the 798-line driver is now
-	# GENUINE Curlee (kernel/virtio_net.curlee, merged into kernel.c above);
-	# kernel/virtio_net.c is reduced to the raw ring/buffer shim (the two
-	# PVH-conditional buffer groups + base-address getters + the sfence
-	# extern — the fb.c pattern). PVH path — option 1 ACTIVE (JOE_PVH_BOOT):
-	# 1-byte ring/buffer stubs, every getter returns 0, net_probe() is a safe
-	# no-op (the PVH machine has no legacy PCI config space — see the file
-	# header). The GRUB/ISO path compiles WITHOUT the macro and gets the full
-	# option-2 rings (see kernel-grub.elf below). The Curlee layer references
-	# the getter symbols on BOTH builds (the merged kernel.c is identical), so
-	# the stub object must link here (the issue #8 build-order fix applies).
-	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
+	# Phase 2d-1 (gh issue #296): the VirtIO-net driver is GENUINE Curlee —
+	# kernel/virtio_net.c is DELETED. The ring/buffer memory is Curlee statics
+	# sized per build via --define (PVH: 1-element stubs / option 1, GRUB:
+	# full option-2 rings), the base-address getters are Curlee addr_of reads,
+	# and the ring-publication fence lives in the Curlee runtime (curlee_sfence,
+	# rt.c — the old virtio_net_sfence extern is gone). Nothing C links here.
 	# Phase 2d-2 (gh issue #12): TCP/IP stack — the ARP/IPv4/TCP logic is
 	# net_stack.curlee + the kernel.curlee glue, and since gh issue #20 the
 	# mutable one-shot state + 256-byte response store are Curlee statics in
@@ -141,8 +156,8 @@ $(KERNEL_ELF): $(MERGED_SRC) $(FB_C) $(MB2_STATE_C) $(NET_C) $(NET_H)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
-	  $(BUILD_DIR)/kernel.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2_state.o $(BUILD_DIR)/virtio_net.o \
+	  $(BUILD_DIR)/kernel.o \
+	  $(BUILD_DIR)/mb2_state.o \
 	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 	@echo "Built $@"
@@ -158,21 +173,26 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
 	$(CURLEE) check $(ASSETS_SRC)
-	$(CURLEE) check $(FB_SRC)
+	# gh issue #296: fb.curlee's large buffers are sized by --define build
+	# constants, so the standalone check passes the full-size (GRUB) define
+	# set (the harder verify case; the PVH stub case is exercised by the PVH
+	# kernel build below).
+	$(CURLEE) check $(CHECK_DEFINES) $(FB_SRC)
 	$(CURLEE) check $(JSON_SRC)
 	$(CURLEE) check $(SERIAL_SRC)
 	$(CURLEE) check $(VGA_SETUP_SRC)
-	# gh issue #14: the VirtIO-net driver is genuine Curlee (the 798-line
-	# kernel/virtio_net.c was reduced to a ring/buffer shim); it declares its
-	# own externs (C shim getters + sfence) so it verifies standalone.
-	$(CURLEE) check $(VIRTIO_NET_SRC)
+	# gh issue #14 + #296: the VirtIO-net driver is genuine Curlee; its
+	# ring/buffer statics are sized by --define (checked with the full GRUB
+	# define set here) and its only extern is the runtime curlee_sfence.
+	$(CURLEE) check $(CHECK_DEFINES) $(VIRTIO_NET_SRC)
 	# The pure protocol core stays VM-checkable standalone (extern-free).
 	$(CURLEE) check $(NET_STACK_SRC)
 	# gh issue #20: kernel/vbe.curlee and kernel/mb2.curlee are NOT checked
 	# standalone anymore — they call fb.curlee's fb_state_set (the shared
 	# framebuffer-state setter), so they verify through the MERGED TU below
-	# (the net_glue.curlee precedent).
-	$(CURLEE) check $(MERGED_SRC)
+	# (the net_glue.curlee precedent). The merged TU needs the full define
+	# set for the same reason as the standalone fb/net checks.
+	$(CURLEE) check $(CHECK_DEFINES) $(MERGED_SRC)
 	@echo "curlee check: OK (all modules + merged kernel verified)"
 
 # Pure packer is VM-runnable; assert the deterministic cell math.
@@ -254,11 +274,15 @@ iso: $(ISO)
 # deleted).
 #
 # The 64-bit PVH/QEMU path (kernel.elf via crt0.S) is completely unchanged.
-$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(FB_C) $(MB2_STATE_C) $(LIBGCC32_HELPERS_C) $(NET_C) $(NET_H) $(LINKER_GRUB)
+$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(MB2_STATE_C) $(LIBGCC32_HELPERS_C) $(NET_H) $(LINKER_GRUB)
 	@mkdir -p $(BUILD_DIR)
-	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
+	# GRUB/ISO path (gh issue #296): the GRUB --define set (JOE_PVH_BOOT=0)
+	# sizes the Curlee buffers to the FULL geometry — 128x128 asset region,
+	# 2x640x480 frame ring, 5-page net qmem + 2x2048 data buffers — which is
+	# where the framebuffer flip and the NIC actually run. kernel/fb.c +
+	# kernel/virtio_net.c are DELETED; nothing C links for them.
+	$(CURLEE) build --target freestanding-c $(GRUB_DEFINES) -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel-grub.o
-	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	# gh issue #15 + #20: the multiboot2 tag walk is Curlee (kernel/mb2.curlee,
 	# merged into kernel.c). The raw-state shim (kernel/mb2_state.c —
 	# mb2_info_addr_get only) links here too; on THIS path it is the LIVE one
@@ -268,13 +292,11 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(FB_C) $(MB2_STATE_C) $
 	# mb2_state_set setter is deleted, gh issue #20); the phys_read_u8/u32
 	# reads are Curlee compiler builtins.
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_STATE_C) -o $(BUILD_DIR)/mb2_state.o
-	# Phase 2d-1: VirtIO-net driver — GRUB/ISO path compiles WITHOUT
-	# JOE_PVH_BOOT, so option 2 is ACTIVE: full rings (2 RX x 2048 + 2 TX x
-	# 2048, depth 256) and the NIC runs (this is where qemu-net-smoke boots;
-	# see the target). The shim (kernel/virtio_net.c) only owns the buffers +
-	# getters now; the driver itself is kernel/virtio_net.curlee (gh issue
-	# #14), merged into kernel.c.
-	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
+	# Phase 2d-1 (gh issue #296): the VirtIO-net driver is GENUINE Curlee with
+	# the full option-2 rings (the GRUB define set) — this is where
+	# qemu-net-smoke boots. The former ring/buffer shim (kernel/virtio_net.c)
+	# is deleted; the ring memory + data buffers are Curlee statics and the
+	# getters are Curlee addr_of reads, so no virtio C object links here.
 	# 32-bit GCC ABI helpers — curlee #288: bundled in the toolchain runtime
 	# (libgcc32_helpers.c). gh issue #21 deleted kernel/libgcc32.c; the link
 	# below resolves __muldi3/__udivdi3/... from this toolchain-owned object.
@@ -285,8 +307,8 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(FB_C) $(MB2_STATE_C) $
 	# the multiboot2 handoff already provides flat 32-bit segments, paging off).
 	$(AS) --32 $(BOOT_ASM) -o $(BUILD_DIR)/boot.o
 	$(LD) -m elf_i386 -nostdlib -static -T $(LINKER_GRUB) \
-	  $(BUILD_DIR)/kernel-grub.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2_state.o $(BUILD_DIR)/virtio_net.o \
+	  $(BUILD_DIR)/kernel-grub.o \
+	  $(BUILD_DIR)/mb2_state.o \
 	  $(BUILD_DIR)/libgcc32.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/boot.o \
 	  -o $@
 	@echo "Built $@ (GRUB multiboot2, 32-bit entry)"
@@ -341,21 +363,19 @@ qemu-gui: $(KERNEL_ELF)
 # qemu-pvh-fb-smoke.
 $(BUILD_DIR)/kernel-smoke.elf: check
 	@mkdir -p $(BUILD_DIR)
-	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel-smoke.c $(MERGED_SRC)
+	# PVH smoke kernel (gh issue #296): built like kernel.elf with the PVH
+	# --define set (JOE_PVH_BOOT=1) — the Curlee buffers stub to 1 element,
+	# every getter returns 0, and the no-NIC-safe path is exercised on the
+	# existing smoke gates (net_probe finds nothing). kernel/fb.c +
+	# kernel/virtio_net.c are DELETED; nothing C links for them.
+	$(CURLEE) build --target freestanding-c $(PVH_DEFINES) -o $(BUILD_DIR)/kernel-smoke.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel-smoke.c -o $(BUILD_DIR)/kernel-smoke.o
-	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
 	# gh issue #15 + #20: the multiboot2 tag walk is Curlee (merged into
 	# kernel-smoke.c); only the raw-state shim is C (mb2_info_addr_get — see
 	# the kernel.elf rule). The framebuffer state it fills is Curlee statics
 	# in fb.curlee (fb_state_set); the phys_read_u8/u32 reads are Curlee
 	# compiler builtins.
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_STATE_C) -o $(BUILD_DIR)/mb2_state.o
-	# Phase 2d-1: VirtIO-net driver, PVH option-1 stubs (JOE_PVH_BOOT) — the
-	# ring/buffer shim is compiled IN (kernel/virtio_net.c, getters return 0;
-	# the driver itself is kernel/virtio_net.curlee, gh issue #14) so the
-	# no-NIC-safe path is exercised on the existing smoke gates (net_probe
-	# finds nothing, all externs return 0).
-	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
 	# Phase 2d-2 (gh issue #12): TCP/IP stack — the one-shot state + response
 	# store are Curlee statics in net_glue.curlee (gh issue #20), so nothing
 	# C links here; on the no-NIC-safe smoke gates the glue's net_link_up()
@@ -364,8 +384,8 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
-	  $(BUILD_DIR)/kernel-smoke.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2_state.o $(BUILD_DIR)/virtio_net.o \
+	  $(BUILD_DIR)/kernel-smoke.o \
+	  $(BUILD_DIR)/mb2_state.o \
 	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 
@@ -552,11 +572,12 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_state_get$$' && echo "PASS: curlee_net_state_get linked (Curlee state, gh issue #20)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_resp_store$$' && echo "PASS: curlee_net_resp_store linked (Curlee response store, gh issue #20)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_poll_fuel$$' && echo "PASS: curlee_net_poll_fuel linked (Curlee poll fuel, gh issue #20)"
-	# gh issue #14: the VirtIO-net driver is now GENUINE Curlee (ported from
-	# the 798-line kernel/virtio_net.c) — the codegen emits the extern surface
-	# as the static curlee_net_* symbols, and the raw ring/buffer shim
-	# (kernel/virtio_net.c) must be linked for the getters + sfence the Curlee
-	# layer calls on BOTH builds.
+	# gh issue #14 + #296: the VirtIO-net driver is now GENUINE Curlee (ported
+	# from the 798-line kernel/virtio_net.c, which is DELETED) — the codegen
+	# emits the driver surface as the static curlee_net_* symbols, the ring/
+	# buffer memory + base getters are Curlee statics/addr_of reads (the
+	# curlee_virtio_net_* symbols), and the ring-publication fence is the
+	# runtime's curlee_sfence. Nothing C links for the driver on either build.
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_probe$$' && echo "PASS: curlee_net_probe linked (VirtIO-net driver, gh issue #14)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_init$$' && echo "PASS: curlee_net_init linked (VirtIO-net driver)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_rx_len$$' && echo "PASS: curlee_net_rx_len linked (VirtIO-net driver)"
@@ -564,22 +585,26 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_tx_send$$' && echo "PASS: curlee_net_tx_send linked (VirtIO-net driver)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_rx_wait$$' && echo "PASS: curlee_net_rx_wait linked (VirtIO-net driver)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_arp_request_gateway$$' && echo "PASS: curlee_net_arp_request_gateway linked (VirtIO-net driver)"
-	@nm $(KERNEL_ELF) | grep -q ' virtio_net_rx_buf_base$$' && echo "PASS: virtio_net_rx_buf_base linked (ring/buffer shim)"
-	@nm $(KERNEL_ELF) | grep -q ' virtio_net_tx_buf_base$$' && echo "PASS: virtio_net_tx_buf_base linked (ring/buffer shim)"
-	@nm $(KERNEL_ELF) | grep -q ' virtio_net_rx_qmem_base$$' && echo "PASS: virtio_net_rx_qmem_base linked (ring/buffer shim)"
-	@nm $(KERNEL_ELF) | grep -q ' virtio_net_sfence$$' && echo "PASS: virtio_net_sfence linked (ring/buffer shim)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_net_rx_buf_base$$' && echo "PASS: curlee_virtio_net_rx_buf_base linked (Curlee RX buf getter, issue #296)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_net_tx_buf_base$$' && echo "PASS: curlee_virtio_net_tx_buf_base linked (Curlee TX buf getter, issue #296)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_net_rx_qmem_base$$' && echo "PASS: curlee_virtio_net_rx_qmem_base linked (Curlee RX qmem getter, issue #296)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_net_pvh_build$$' && echo "PASS: curlee_virtio_net_pvh_build linked (Curlee build discriminator, issue #296)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_sfence$$' && echo "PASS: curlee_sfence linked (runtime ring-publication fence, issue #296)"
 	# Phase 2d-4: the tool-queue producer API the LLM bridge drives
 	# (fb_tool_enqueue(2, arg) — the 2d-3 contract, wired into the 2b ring).
 	# gh issue #13: the blitter + event loop moved to Curlee (kernel/fb.curlee),
 	# so the codegen emits the queue producer as the static curlee_fb_tool_enqueue
 	# symbol (the C extern was removed); the ring flip + the runtime-address
 	# memory moves are now ALL Curlee (the phys builtins inline in the codegen —
-	# no C symbols), so the gates check the Curlee statics and the C getters.
+	# no C symbols), so the gates check the Curlee statics and the Curlee
+	# addr_of getters (gh issue #296 — the C getters are gone with fb.c).
 	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_tool_enqueue$$' && echo "PASS: curlee_fb_tool_enqueue linked (Curlee tool queue)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_present$$' && echo "PASS: curlee_fb_present linked (Curlee blitter)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_ring_activate$$' && echo "PASS: curlee_fb_ring_activate linked (Curlee ring flip)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_ring_advance$$' && echo "PASS: curlee_fb_ring_advance linked (Curlee ring advance)"
-	@nm $(KERNEL_ELF) | grep -q ' fb_frame_ring_slot_base$$' && echo "PASS: fb_frame_ring_slot_base linked (frame-ring base getter)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_frame_ring_slot_base$$' && echo "PASS: curlee_fb_frame_ring_slot_base linked (Curlee frame-ring base getter, issue #296)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_asset_region_base_get$$' && echo "PASS: curlee_fb_asset_region_base_get linked (Curlee asset-region base getter, issue #296)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_pvh_build$$' && echo "PASS: curlee_fb_pvh_build linked (Curlee build discriminator, issue #296)"
 	# Phase 2f (gh issue #11 + #20): the Curlee Bochs VBE probe
 	# (kernel/vbe.curlee) fills the framebuffer state through fb.curlee's
 	# fb_state_set — a genuine Curlee function (codegen'd as the static

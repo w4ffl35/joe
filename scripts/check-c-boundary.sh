@@ -65,13 +65,11 @@ for f in "$KERNEL_DIR"/*.c; do
     #    Only match NON-comment lines (grep -v strips // comments; the former
     #    vbe.c mentioned fb_ready only in its header comment).
     if grep -vE '^\s*//' "$f" | grep -qE '\b(curlee_|fb_init|fb_ready|fb_get_|fb_asset_|fb_ring_|fb_loop_|json_|vga_cell|render_frame|draw_glyph)\s*\('; then
-        # Whitelist: these extern-implementation shims legitimately DEFINE the
-        # symbols (fb_* in fb.c) rather than call them. net_* files only define
-        # net_* — they never call them, so they are excluded from the pattern.
-        if [[ "$name" != "fb.c" ]]; then
-            echo "  [FAIL] $name: calls a Curlee/codegen symbol (C must not call up — docs/c-boundary-policy.md §2)"
-            violations=$((violations + 1))
-        fi
+        # The former fb.c whitelist is gone with the file (gh issue #296):
+        # kernel/fb.c is deleted, so no C file legitimately defines fb_* /
+        # curlee_* symbols — any match is a layering violation.
+        echo "  [FAIL] $name: calls a Curlee/codegen symbol (C must not call up — docs/c-boundary-policy.md §2)"
+        violations=$((violations + 1))
     fi
 done
 

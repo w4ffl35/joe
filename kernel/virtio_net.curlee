@@ -35,31 +35,30 @@
 //   GRUB build (no JOE_PVH_BOOT) — OPTION 2 ACTIVE: full rings (2 RX x 2048 B
 //   + 2 TX x 2048 B, ring depth 256). The NIC runs on the GRUB/ISO path, which
 //   is where qemu-net-smoke boots.
-//   PVH build (JOE_PVH_BOOT) — OPTION 1 ACTIVE: the ring/buffer memory stubs
-//   to 1 byte (owned by the C shim, kernel/virtio_net.c), every extern returns
-//   0, and net_probe() is a safe no-op. Trigger: the documented Phase 2f
-//   measurement (docs/phase2f-report.md §4) that QEMU's `-kernel` PVH machine
-//   (xenpvh) exposes NO legacy PCI config space — every 0xCF8/0xCFC read
-//   returns 0 regardless of machine type or device — so the NIC is
-//   unreachable there, and stubbing keeps the image inside the PVH LOAD
-//   budget. The extern surface is identical on both paths.
+//   PVH build (JOE_PVH_BOOT) — OPTION 1 ACTIVE: the ring/buffer memory is
+//   stubbed to 1 element (Curlee statics sized by --define, gh issue #296),
+//   every base getter returns 0, and net_probe() is a safe no-op. Trigger:
+//   the documented Phase 2f measurement (docs/phase2f-report.md §4) that
+//   QEMU's `-kernel` PVH machine (xenpvh) exposes NO legacy PCI config space
+//   — every 0xCF8/0xCFC read returns 0 regardless of machine type or device
+//   — so the NIC is unreachable there, and stubbing keeps the image inside
+//   the PVH LOAD budget. The getter surface is identical on both paths.
 //
-// PORT NOTE — what stayed in C and why (the fb.c pattern, gh issue #13):
-//   Curlee has NO conditional compilation and BOTH builds compile the SAME
-//   merged kernel.c (scripts/build-kernel.sh), so a full-size Curlee static
-//   array for the 5-page ring memory / 2048-byte data buffers would land in
-//   the PVH kernel's BSS unconditionally and blow QEMU's PVH LOAD budget
-//   (docs/phase2c-report.md §4.3). The ring/buffer memory therefore stays in
-//   the C shim (kernel/virtio_net.c) under #ifndef JOE_PVH_BOOT, exactly like
-//   fb.c's asset region / frame ring, and THIS module addresses it through
-//   the shim's base-address getters (virtio_net_*_qmem_base /
-//   virtio_net_*_buf_base, 0 on the PVH 1-byte stubs). This is the resolved
-//   form of the port's "address-of a Curlee-owned buffer" gap: the buffers
-//   are C-owned for the PVH-size reason above, and their runtime addresses
-//   flow in through the getter externs — no address-of builtin needed. The
-//   descriptor addr field (u64) is built with the Int -> U64 widening for
-//   values < 2^32 (curlee #277) or written low-32-only when the pages were
-//   pre-zeroed (the high dword is 0 for every buffer below 4 GiB).
+// PORT NOTE — per-build-target static array sizing (gh issue #296): the
+//   5-page ring memory and the 2048-byte RX/TX data buffers are Curlee
+//   statics whose sizes are constant expressions over build-time constants
+//   injected with `curlee build --define NAME=VALUE`. The SAME merged source
+//   is built twice: the PVH build (JOE_PVH_BOOT=1) sizes the qmem to 1 page
+//   and the data buffers to 1 element, so the image stays inside QEMU's PVH
+//   LOAD budget (docs/phase2c-report.md §4.3); the GRUB build (full defines)
+//   gets the option-2 rings where the NIC runs. This replaces the former
+//   kernel/virtio_net.c `#ifndef JOE_PVH_BOOT` shim (DELETED), and the base
+//   addresses flow in through Curlee `addr_of` reads (issue #286) instead of
+//   C getter externs — the "address-of a Curlee-owned buffer" gap the port
+//   originally dodged is now closed. The descriptor addr field (u64) is
+//   built with the Int -> U64 widening for values < 2^32 (curlee #277) or
+//   written low-32-only when the pages were pre-zeroed (the high dword is 0
+//   for every buffer below 4 GiB).
 //
 // PORT NOTE — memory barriers (the 2d-1 review flag): the C original's
 //   net_mem_barrier (a compiler barrier, __asm__ volatile("" ::: "memory"))
@@ -67,12 +66,14 @@
 //   or phys_read_u* builtin, which codegen as *(volatile uintN_t*)(addr)
 //   loads/stores — GCC never reorders volatile accesses relative to each
 //   other, so the device-visible order is exactly the program order. The
-//   sfence before each idx publication is KEPT, as a tiny C shim extern
-//   (virtio_net_sfence — an "I/O touch / raw memory move" under
-//   docs/c-boundary-policy.md §1): x86 TSO + QEMU TCG both execute the
-//   volatile stores in program order, but the fence is behavior-preserving
-//   belt-and-braces for the QEMU TCG kick-ordering concern the C original
-//   documented, and it costs one extern call per ring publication.
+//   sfence before each idx publication is KEPT, now as the Curlee runtime's
+//   curlee_sfence extern (rt.c — an "I/O touch / raw memory move" under
+//   docs/c-boundary-policy.md §1 that moved out of the deleted
+//   kernel/virtio_net.c into the toolchain runtime): x86 TSO + QEMU TCG both
+//   execute the volatile stores in program order, but the fence is
+//   behavior-preserving belt-and-braces for the QEMU TCG kick-ordering
+//   concern the C original documented, and it costs one extern call per ring
+//   publication.
 //
 // No-NIC-safe (acceptance criterion 6): with no virtio-net device, net_probe()
 // finds nothing (config reads return 0xFFFFFFFF), net_init()/net_link_up()/
@@ -89,24 +90,107 @@
 //     the phys_write_u8/u16/u32/u64 builtins (inline volatile stores).
 //   - Deterministic verification: `curlee check virtio_net.curlee` runs
 //     standalone and the merged kernel re-verifies it (`make check`).
-//   - Minimal footprint: no libc, no String/Vec; every buffer is C-owned
-//     static memory (the PVH budget reason above) or a small Curlee static.
+//   - Minimal footprint: no libc, no String/Vec; every buffer is a Curlee
+//     static — the small driver-state arrays plus the ring/buffer memory,
+//     sized per build via --define (gh issue #296).
 
 // ---------------------------------------------------------------------------
-// Extern window into the C ring/buffer shim (kernel/virtio_net.c). Every
-// symbol is defined 1:1 in C; the codegen emits direct calls. Declared HERE,
-// once — the merged TU forbids duplicate externs.
+// Ring/buffer memory + build-geometry getters (gh issue #296 — per-build-
+// target static array sizing via `curlee build --define NAME=VALUE`).
 // ---------------------------------------------------------------------------
 
-// Build discriminator + the C-owned ring/buffer addresses (0 on the PVH
-// 1-byte stubs, so the Curlee gates never activate there — the fb.c pattern).
-extern fn virtio_net_pvh_build() -> Int;
-extern fn virtio_net_rx_qmem_base() -> Int;
-extern fn virtio_net_tx_qmem_base() -> Int;
-extern fn virtio_net_rx_buf_base(slot: Int) -> Int;
-extern fn virtio_net_tx_buf_base(slot: Int) -> Int;
-// sfence for ring publication (see the PORT NOTE above).
-extern fn virtio_net_sfence() -> Unit;
+// Ring memory: 3 x 4096 per queue. QEMU aligns the used ring to 4096 relative
+// to the queue base (align_up in its legacy vring code), so the BASE MUST be
+// 4096-aligned. A bare __attribute__((aligned(4096))) on a static array is not
+// reliably honored by the linker for BSS symbols, so we use an over-allocated
+// buffer and queue_setup() manually aligns the working base (`(raw + 4095) &
+// ~4095UL` — ported verbatim from the C original).
+//
+// Over-allocation math: the aligned base can be up to (4096-1) bytes past the
+// raw start, and we need 3 x 4096 from the aligned base. So the raw buffer
+// must be >= 4095 + 3*4096 = 16383 bytes. 5 pages (20480) is safe on both
+// sides. Sized per build: NET_QMEM_PAGES=5 on the GRUB build, 1 on the PVH
+// build (1-element-stub semantics — the getters return 0 and net_init() bails
+// on virtio_net_pvh_build()==1).
+static rx_qmem: [U8; NET_QMEM_PAGES * 4096] = [0; NET_QMEM_PAGES * 4096];
+static tx_qmem: [U8; NET_QMEM_PAGES * 4096] = [0; NET_QMEM_PAGES * 4096];
+
+// RX/TX data buffers (static, no malloc). Addressed via the base getters; the
+// descriptor addr field is the row address (like the C original's
+// `(uint64_t)(unsigned long)rx_buf[s]`). NET_RX_BUFS=2 x NET_BUF_BYTES=2048 on
+// the GRUB build (>= 256 B: the wire-shape §3.2 absolute response limit; 2048
+// covers the ARP frame and the 2d-2 HTTP round trip comfortably), 1 x 1 on
+// the PVH build.
+static rx_buf: [U8; NET_RX_BUFS * NET_BUF_BYTES] = [0; NET_RX_BUFS * NET_BUF_BYTES];
+static tx_buf: [U8; NET_TX_BUFS * NET_BUF_BYTES] = [0; NET_TX_BUFS * NET_BUF_BYTES];
+
+// Build discriminator: 1 on the PVH build (the buffers above are 1-element
+// stubs and every base getter returns 0), 0 on the GRUB build. The C
+// #define's JOE_PVH_BOOT is now a `--define` build constant folded by the
+// parser. net_init() bails on this returning 1 (option 1, see the header).
+fn virtio_net_pvh_build() -> Int {
+  return JOE_PVH_BOOT;
+}
+
+// Base of the RX queue's ring memory (0 on the PVH stub). addr_of (issue
+// #286) yields the physical address of the Curlee-owned static; the kernel
+// runs with identity paging so virtual == physical. Requires unsafe + cap
+// phys.mem (the phys-builtin gate); pm is dropped by codegen.
+fn virtio_net_rx_qmem_base(pm: cap phys.mem) -> Int {
+  if (JOE_PVH_BOOT == 1) {
+    return 0;
+  }
+  unsafe {
+    return addr_of(rx_qmem);
+  }
+  return 0;
+}
+
+// Base of the TX queue's ring memory (0 on the PVH stub).
+fn virtio_net_tx_qmem_base(pm: cap phys.mem) -> Int {
+  if (JOE_PVH_BOOT == 1) {
+    return 0;
+  }
+  unsafe {
+    return addr_of(tx_qmem);
+  }
+  return 0;
+}
+
+// Base address of RX buffer slot `slot` (0 on the PVH stub, or for an
+// out-of-range slot — defense-in-depth over the Curlee bounds).
+fn virtio_net_rx_buf_base(pm: cap phys.mem, slot: Int) -> Int {
+  if (JOE_PVH_BOOT == 1) {
+    return 0;
+  }
+  if (slot >= 0 && slot < NET_RX_BUFS) {
+    unsafe {
+      return addr_of(rx_buf) + slot * NET_BUF_BYTES;
+    }
+  }
+  return 0;
+}
+
+// Base address of TX buffer slot `slot` (0 on the PVH stub, or for an
+// out-of-range slot — defense-in-depth over the Curlee bounds).
+fn virtio_net_tx_buf_base(pm: cap phys.mem, slot: Int) -> Int {
+  if (JOE_PVH_BOOT == 1) {
+    return 0;
+  }
+  if (slot >= 0 && slot < NET_TX_BUFS) {
+    unsafe {
+      return addr_of(tx_buf) + slot * NET_BUF_BYTES;
+    }
+  }
+  return 0;
+}
+
+// Ring-publication store fence (see the PORT NOTE above). Defined in the
+// Curlee freestanding runtime (runtime/rt.c) as curlee_sfence — the "I/O
+// touch / raw memory move" that used to live in the deleted
+// kernel/virtio_net.c, now a toolchain-runtime helper (gh issue #296). The
+// codegen emits a direct call to the exact name (no curlee_ mangle).
+extern fn curlee_sfence() -> Unit;
 
 // ---------------------------------------------------------------------------
 // Driver state (all Curlee statics — the toolchain's static + [T; N] arrays).
@@ -262,7 +346,7 @@ fn refill_rx(pm: cap phys.mem) -> Unit {
   let s: Int = 0;
   while (s < 2) {   // NET_RX_BUFS
     if (rx_buf_state[s] == 0) {
-      let buf: Int = virtio_net_rx_buf_base(s);
+      let buf: Int = virtio_net_rx_buf_base(pm, s);
       let desc: Int = vring_desc_base(rx_ring_base, s);
       unsafe {
         let a64: U64 = buf;
@@ -281,7 +365,7 @@ fn refill_rx(pm: cap phys.mem) -> Unit {
     s = s + 1;
   }
   if (armed > 0) {
-    virtio_net_sfence();   // desc[] + ring[] stores visible before idx
+    curlee_sfence();   // desc[] + ring[] stores visible before idx
     let idx_addr: Int = vring_avail_idx_addr(rx_ring_base);
     unsafe {
       phys_write_u16(idx_addr, rx_avail_head);
@@ -464,12 +548,12 @@ fn net_init(pm: cap phys.mem) -> Int {
     // 3. Status: ACKNOWLEDGE | DRIVER (0x01 | 0x02).
     port_outb(io_base + 18, 3);
     // 4. Set up RX and TX queues (3-page legacy layout each).
-    let qrx: Int = queue_setup(pm, 0, virtio_net_rx_qmem_base());
+    let qrx: Int = queue_setup(pm, 0, virtio_net_rx_qmem_base(pm));
     if (qrx == 0) {
       port_outb(io_base + 18, 128);   // VIRTIO_CONFIG_S_FAILED 0x80
       return 0;
     }
-    let qtx: Int = queue_setup(pm, 1, virtio_net_tx_qmem_base());
+    let qtx: Int = queue_setup(pm, 1, virtio_net_tx_qmem_base(pm));
     if (qtx == 0) {
       port_outb(io_base + 18, 128);
       return 0;
@@ -565,7 +649,7 @@ fn net_rx_byte(pm: cap phys.mem, i: Int) -> Int {
       if (i < 0 || i >= rx_frame_len[cur] - 10) {
         return 0;
       } else {
-        let buf: Int = virtio_net_rx_buf_base(cur);
+        let buf: Int = virtio_net_rx_buf_base(pm, cur);
         unsafe {
           let b: U8 = phys_read_u8(buf + i + 10);
           let bi: Int = b + 0;
@@ -607,7 +691,11 @@ fn net_tx_stage_byte(pm: cap phys.mem, i: Int, b: Int) -> Int {
   if (b < 0 || b > 255) {
     return 0;
   }
-  let buf: Int = virtio_net_tx_buf_base(tx_stage);
+  // Copy the staging slot index to a local first: passing module-level
+  // mutable state directly into a capability-parameter call is rejected by
+  // the verifier (opaque contract, issue #287) — the value is the same.
+  let stage_slot: Int = tx_stage;
+  let buf: Int = virtio_net_tx_buf_base(pm, stage_slot);
   unsafe {
     phys_write_u8(buf + i, b);
   }
@@ -639,7 +727,7 @@ fn net_tx_send(pm: cap phys.mem, len: Int) -> Int {
       if (tx_buf_state[stage] != 0) {
         return 0;   // no free TX slot
       }
-      let buf: Int = virtio_net_tx_buf_base(stage);
+      let buf: Int = virtio_net_tx_buf_base(pm, stage);
       unsafe {
         // Shift the staged Ethernet frame up by the header size, then zero
         // the header slot. (The stack staged bytes 0..len-1; the wire needs
@@ -665,7 +753,7 @@ fn net_tx_send(pm: cap phys.mem, len: Int) -> Int {
         phys_write_u32(desc + 8, len + 10);   // len (includes the header)
         phys_write_u16(desc + 12, 0);     // flags 0 — device reads the TX buffer
       }
-      virtio_net_sfence();   // desc[] + ring[] stores visible before idx
+      curlee_sfence();   // desc[] + ring[] stores visible before idx
       let entry: Int = vring_avail_entry(tx_ring_base, tx_avail_head % 256);
       unsafe {
         phys_write_u16(entry, desc_id);

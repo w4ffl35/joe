@@ -22,9 +22,10 @@ C exists for exactly two reasons in JOE:
    0x1CE/0x1CF) is now a genuine Curlee function (`vbe.curlee`, issue #11);
    `virtio_net.c` was the last (issue #14): the entire 798-line VirtIO-net
    driver — PCI config-space probe, legacy virtqueue setup, RX/TX, frame
-   I/O — is now `virtio_net.curlee`, with only the PVH-conditional
-   ring/buffer memory + the base-address getters + the sfence left in C
-   (see §3).
+   I/O — is now `virtio_net.curlee`, and gh issue #296 DELETED the last C
+   residual (the PVH-conditional ring/buffer memory + getters + sfence —
+   now Curlee statics sized by `--define` + `addr_of` reads + the runtime's
+   `curlee_sfence`; see §3).
 2. **Raw memory moves** — volatile framebuffer writes, ring DMA, and the
    mutable driver *state* that the Curlee layer does not express. The
    sequential 0xB8000 text-buffer clear was a raw memory move that *could
@@ -52,9 +53,9 @@ C exists for exactly two reasons in JOE:
    (tool ring, loop counters, ring bookkeeping, draw-target indirection)
    moved into Curlee `static` module state, and the runtime-address memory
    moves became Curlee COMPILER BUILTINS (`phys_write_u32` / `phys_read_u8/
-   u32` — inline volatile stores/loads, no C symbol), leaving `fb.c` a
-   ~90-line build-geometry shim: the two large PVH-conditional buffers only
-   (see §3).
+   u32` — inline volatile stores/loads, no C symbol). gh issue #296 DELETED
+   the last `fb.c` residual — the two large PVH-conditional buffers are now
+   Curlee statics sized by `--define` with `addr_of` base getters (see §3).
 
 Everything else — parsers, protocol logic, checksums, layout math, glyph
 tables, geometry — belongs in the **pure, verified Curlee layer**
@@ -110,29 +111,21 @@ zero pure logic and **no grandfathered files**: the last one,
 `libgcc32.c` (322 lines, "never migrates — GCC ABI"), was DELETED in gh
 issue #21 once curlee #288 bundled the equivalent 32-bit helpers into the
 curlee toolchain runtime (`runtime/libgcc32_helpers.c` — the GRUB/ISO path
-links that toolchain-owned file now instead of a kernel-local copy). The
-remaining files are exactly:
+links that toolchain-owned file now instead of a kernel-local copy).
 
-- **`fb.c`** (~90 lines) — the two LARGE PVH-conditional buffers (the
-  128x128 asset region + the 2x640x480 frame ring, compiled OUT on the PVH
-  build — `JOE_PVH_BOOT`): Curlee has no conditional compilation and both
-  builds compile the same merged kernel.c, so a full-size Curlee static
-  array would land in the PVH kernel's BSS unconditionally and blow QEMU's
-  PVH LOAD budget (docs/phase2c-report.md §4.3). Plus the build-geometry
-  externs (`fb_pvh_build` / `fb_asset_region_base_get` /
-  `fb_frame_ring_slot_base`, 0 on the PVH stubs). gh issue #20 deleted the
-  fb_addr/fb_pitch/fb_width/fb_height globals + the four `fb_*_get`
-  getters from this file — the framebuffer state is Curlee statics in
-  `fb.curlee`. Migrates when Curlee gains conditional compilation.
-- **`virtio_net.c`** (~90 lines) — its 798 lines of driver logic (PCI
-  config-space scanning, legacy virtqueue setup, RX/TX ring math, frame I/O)
-  migrated to `virtio_net.curlee` in issue #14, leaving the two large
-  PVH-conditional buffer groups (5-page qmem + 2x2048 data buffers per
-  queue, compiled OUT on the PVH build exactly like `fb.c`'s), the four
-  base-address getters (the `fb_asset_region_base_get` pattern), the
-  `virtio_net_pvh_build` discriminator, and the `virtio_net_sfence` ring-
-  publication fence. The buffers must be C-owned for the PVH-size reason.
-  Migrates when Curlee gains conditional compilation.
+The former **`fb.c`** and **`virtio_net.c`** entries are DELETED (gh issue
+#296): Curlee gained per-build-target static array sizing (`curlee build
+--define NAME=VALUE`), so the two LARGE PVH-conditional buffer groups (the
+128x128 asset region + the 2x640x480 frame ring; the 5-page net qmem + the
+2x2048 data buffers) are now Curlee statics sized by --define — the PVH
+build stubs them to 1 element (JOE_PVH_BOOT=1, inside QEMU's PVH LOAD
+budget, docs/phase2c-report.md §4.3) and the GRUB build sizes them to full
+geometry. Their base-address getters are Curlee `addr_of` reads (issue
+#286), and the ring-publication sfence moved into the Curlee runtime as
+`curlee_sfence`. Nothing C links for either driver on either build.
+
+The remaining files are exactly:
+
 - **`mb2_state.c`** (~25 lines) — gh issue #20 reduced it to the single
   raw-state half Curlee cannot express: the multiboot2 info pointer.
   `mb2_info_addr` is a WEAK `.data` global that kernel/boot.S (32-bit
@@ -223,6 +216,14 @@ The C surface collapses to a thin I/O shim once the Curlee features land
    256-byte response store are Curlee statics in `net_glue.curlee`. The
    descriptor `addr` u64 field is built with the `Int -> U64` widening for
    values < 2^32 (curlee #277).
+6. **Per-build-target static array sizing (`--define NAME=VALUE`, curlee
+   issue #296) + address-of (`addr_of`, curlee issue #286)** — the final
+   unblocker: `fb.c` and `virtio_net.c` are DELETED. The two large
+   PVH-conditional buffer groups are Curlee statics sized by `--define`
+   (the PVH build stubs them to 1 element; the GRUB build sizes them to the
+   full geometry), the base-address getters are `addr_of` reads (issue
+   #286, `unsafe` + `cap phys.mem`), and the ring-publication fence is the
+   Curlee runtime's `curlee_sfence` (the former `virtio_net_sfence` extern).
 
 Until then, **do not add new pure logic to C**. If a feature needs pure
 logic, write it as a Curlee module (even if the driver can't yet be

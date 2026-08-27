@@ -34,8 +34,9 @@
 // kernel/fb.c + the four fb_*_get externs + the vbe_state.c / mb2_state.c
 // setter shims are GONE. This module owns the state as Curlee statics, fills
 // it through fb_state_set (called by mb2.curlee / vbe.curlee), and reads it
-// directly in the blitter; kernel/fb.c is now ONLY the two large
-// PVH-conditional buffers + the build-geometry getters.
+// directly in the blitter. kernel/fb.c is now DELETED (gh issue #296): the
+// two large buffers and the build-geometry getters moved here as
+// define-sized Curlee statics + addr_of getters.
 //
 // The runtime-address phys builtins REQUIRE an `unsafe { }` block AND a
 // `cap phys.mem` parameter in the enclosing function (belt-and-suspenders —
@@ -63,32 +64,75 @@
 //     all non-linear address math hidden in contract-less helpers (the
 //     established canvas/net_glue pattern).
 //   - Minimal footprint: no libc, no malloc, no String/Vec; the static
-//     arrays here are the 8-slot tool ring (128 bytes) — the two large
-//     PVH-conditional buffers stay in the C shim for the budget reason above.
+//     arrays are the 8-slot tool ring (128 bytes) plus the two large
+//     define-sized buffers — the asset region + frame ring — sized per build
+//     via `--define` (gh issue #296) instead of a C shim.
 
 // ---------------------------------------------------------------------------
-// Extern window into the C build-geometry shim (kernel/fb.c). Every symbol is
-// defined 1:1 in C; the codegen emits direct calls. Declared HERE, once —
-// the merged TU forbids duplicate externs (net_glue.curlee's note).
+// Build-geometry buffers + getters (gh issue #296 — per-build-target static
+// array sizing via `curlee build --define NAME=VALUE`).
 //
-// gh issue #20: the framebuffer globals (fb_addr/fb_pitch/fb_width/fb_height)
-// are GONE from C — they are Curlee statics below (fb_addr/fb_pitch/
-// fb_width/fb_height), filled by this module's fb_state_set (called by
-// kernel/mb2.curlee's mb2_parse and kernel/vbe.curlee's vbe_probe; the
-// vbe_state.c / mb2_state.c setter shims were deleted). The four
-// fb_*_get externs are deleted with them.
+// The two LARGE static buffers — the 128x128 asset region and the 2-slot
+// 640x480 frame ring — are Curlee statics whose sizes are constant
+// expressions over build-time constants: the SAME merged source is built
+// twice, once with the PVH define set (JOE_PVH_BOOT=1 sizes them to
+// 1-element stubs so QEMU's `-kernel` PVH LOAD budget is untouched —
+// docs/phase2c-report.md §4.3) and once with the GRUB define set (full
+// 128x128 / 2x640x480, where the flip actually runs). This replaces the
+// former kernel/fb.c `#ifndef JOE_PVH_BOOT` shim, which is DELETED (the C
+// #defines are now Curlee build defines); the base-address getters use the
+// addr_of builtin (issue #286) instead of C externs, and the build
+// discriminator is the JOE_PVH_BOOT define read in an expression position.
 // ---------------------------------------------------------------------------
 
-// Compile-time build geometry:
-//   - fb_pvh_build(): 1 on the PVH build (the large buffers compile to 1-byte
-//     stubs), 0 on the GRUB build.
-//   - fb_asset_region_base_get(): the asset region's runtime address (0 on
-//     the PVH stub).
-//   - fb_frame_ring_slot_base(slot): the base address of frame-ring slot
-//     `slot` (0 on the PVH stub, or for an out-of-range slot).
-extern fn fb_pvh_build() -> Int;
-extern fn fb_asset_region_base_get() -> Int;
-extern fn fb_frame_ring_slot_base(slot: Int) -> Int;
+// The 128x128 32bpp RAW asset region (fb_asset_region_base exposes it) and
+// the double-buffer frame ring (2 slots x up to 640x480 32bpp surfaces — the
+// exact size the multiboot2 framebuffer request tag (boot.S) asks GRUB for).
+// Sizes are define expressions: on the PVH build the defines are 1, so the
+// arrays are 1-element stubs and every getter below returns 0 (the Curlee
+// gates never activate); on the GRUB build they are the full dimensions
+// (canvas_test.curlee §14/§15 asserts the pure geometry on both sides).
+static asset_region: [U32; ASSET_REGION_W * ASSET_REGION_H] =
+  [0; ASSET_REGION_W * ASSET_REGION_H];
+static frame_ring: [U32; FRAME_RING_SLOTS * FRAME_RING_MAX_W * FRAME_RING_MAX_H] =
+  [0; FRAME_RING_SLOTS * FRAME_RING_MAX_W * FRAME_RING_MAX_H];
+
+// Build discriminator: 1 on the PVH build (the buffers above are 1-element
+// stubs and every getter returns 0), 0 on the GRUB build. The C #define's
+// JOE_PVH_BOOT is now a `--define` build constant folded by the parser.
+fn fb_pvh_build() -> Int {
+  return JOE_PVH_BOOT;
+}
+
+// The asset region's runtime address (0 on the PVH stub). The addr_of
+// builtin (issue #286) yields the physical address of the Curlee-owned
+// static array; the kernel runs with identity paging (crt0.S maps the first
+// 2 MiB identity) so virtual == physical. Requires unsafe + cap phys.mem
+// (the established phys-builtin gate); pm is dropped by codegen.
+fn fb_asset_region_base_get(pm: cap phys.mem) -> Int {
+  if (JOE_PVH_BOOT == 1) {
+    return 0;
+  }
+  unsafe {
+    return addr_of(asset_region);
+  }
+  return 0;
+}
+
+// Base address of frame-ring slot `slot` (0 on the PVH stub, or for an
+// out-of-range slot). The Curlee fb_ring_activate / fb_ring_advance re-point
+// the draw target at this address (bounds-checked as defense-in-depth).
+fn fb_frame_ring_slot_base(pm: cap phys.mem, slot: Int) -> Int {
+  if (JOE_PVH_BOOT == 1) {
+    return 0;
+  }
+  if (slot >= 0 && slot < FRAME_RING_SLOTS) {
+    unsafe {
+      return addr_of(frame_ring) + slot * (FRAME_RING_MAX_W * FRAME_RING_MAX_H * 4);
+    }
+  }
+  return 0;
+}
 
 // ---------------------------------------------------------------------------
 // Mutable blitter state (Curlee statics — the toolchain's static + [T; N]
@@ -241,8 +285,8 @@ fn fb_asset_region_h() -> Int {
   }
 }
 
-fn fb_asset_region_base() -> Int {
-  return fb_asset_region_base_get();
+fn fb_asset_region_base(pm: cap phys.mem) -> Int {
+  return fb_asset_region_base_get(pm);
 }
 
 // Phase 2e-2/2f: wire the draw target to the visible framebuffer. Before the
@@ -446,7 +490,7 @@ fn fb_present(pm: cap phys.mem) -> Unit {
     let w: Int = fb_width;
     let h: Int = fb_height;
     if (w <= 640 && h <= 480) {   // frame_ring_max_w/h() (canvas_test §15)
-      fb_ring_activate();
+      fb_ring_activate(pm);
     }
     return;
   }
@@ -471,23 +515,23 @@ fn fb_present(pm: cap phys.mem) -> Unit {
       row = row + 1;
     }
   }
-  fb_ring_advance();
+  fb_ring_advance(pm);
   return;
 }
 
 // ---------------------------------------------------------------------------
 // Frame-ring transitions (the flip LOGIC — fit gate, copy, advance decision
 // — is Curlee's fb_present; these mutate the Curlee ring statics and fetch
-// the C-owned ring-slot base addresses)
+// the Curlee ring-slot base addresses via addr_of)
 // ---------------------------------------------------------------------------
 
 // Activate on the first present: ring_active=1, slot=0, draw target re-points
 // at frame_ring[0] with stride 640*4. Returns 1 on a real activation; on the
-// PVH build (ring compiled out — fb_frame_ring_slot_base returns 0) this is a
-// no-op returning 0, so fb_present stays single-buffered — exactly the old
-// #ifdef JOE_PVH_BOOT present's early return.
-fn fb_ring_activate() -> Int {
-  let slot0: Int = fb_frame_ring_slot_base(0);
+// PVH build (ring stubbed to 1 element — fb_frame_ring_slot_base returns 0)
+// this is a no-op returning 0, so fb_present stays single-buffered — exactly
+// the old JOE_PVH_BOOT-stub behavior.
+fn fb_ring_activate(pm: cap phys.mem) -> Int {
+  let slot0: Int = fb_frame_ring_slot_base(pm, 0);
   if (slot0 == 0) {
     return 0;
   }
@@ -501,10 +545,10 @@ fn fb_ring_activate() -> Int {
 // Advance after a flip: 0 -> 1 -> 0 (frame_ring_next for 2 slots). Re-points
 // the draw target at the new back buffer. No-op on the PVH build (slot base
 // is 0 — the ring never activates there, so this is unreachable).
-fn fb_ring_advance() -> Unit {
+fn fb_ring_advance(pm: cap phys.mem) -> Unit {
   let next: Int = (ring_slot + 1) % 2;
   ring_slot = next;
-  let slot_base: Int = fb_frame_ring_slot_base(next);
+  let slot_base: Int = fb_frame_ring_slot_base(pm, next);
   if (slot_base != 0) {
     fb_draw_target = slot_base;
     fb_target_stride = 2560;   // FRAME_RING_MAX_W * 4

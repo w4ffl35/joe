@@ -284,14 +284,14 @@ fn main(pm: cap phys.mem) -> Unit {
 > indirection) into Curlee `static` module state (toolchain static + `[T; N]`
 > arrays) and the runtime-address memory moves became Curlee compiler builtins
 > (`phys_write_u32` / `phys_read_u8/u32` — inline volatile stores/loads).
-> `kernel/fb.c` is now a ~140-line build-geometry shim: the four framebuffer
-> globals (filled by `mb2_state.c` / `vbe_state.c`) and the two LARGE
-> PVH-conditional buffers (128x128 asset region + 2x640x480 frame ring — sized
-> per build with `#ifndef JOE_PVH_BOOT` because Curlee has no conditional
-> compilation and the PVH loader rejects a large BSS, `docs/phase2c-report.md`
-> §4.3), plus `fb_pvh_build`/`fb_asset_region_base_get`/
-> `fb_frame_ring_slot_base`. This section is kept as the historical design
-> record.
+> `kernel/fb.c` is now DELETED (gh issue #296): the two LARGE PVH-conditional
+> buffers (128x128 asset region + 2x640x480 frame ring) are Curlee statics
+> sized per build with `curlee build --define NAME=VALUE` — the PVH build
+> (`JOE_PVH_BOOT=1`) stubs them to 1 element so the image stays inside QEMU's
+> PVH LOAD budget (`docs/phase2c-report.md` §4.3), the GRUB build sizes them
+> to full geometry, and the base-address getters (`fb_pvh_build` /
+> `fb_asset_region_base_get` / `fb_frame_ring_slot_base`) are Curlee `addr_of`
+> reads. This section is kept as the historical design record.
 
 Extends the existing glyph renderer with a full primitive surface. All functions
 bounds-check against `fb_width`/`fb_height` (defense-in-depth over Curlee geometry).
@@ -460,8 +460,9 @@ All six criteria verified (see `docs/phase2-report.md` Phase 2b section).
 4. `make qemu-loop-smoke` passes with the full ordered sequence
    `FR:0..FR:3, RING: 1, FB: 1, Hello World from JOE!`. ✅
 5. `make verify` + `make qemu-smoke` still pass (PVH path unchanged — the
-   ring/asset region are compiled out via `JOE_PVH_BOOT` because QEMU's PVH
-   loader rejects ELFs with a large BSS, verified empirically; see fb.c). ✅
+   ring/asset region are stubbed to 1 element via the PVH `--define` set
+   because QEMU's PVH loader rejects ELFs with a large BSS, verified
+   empirically, docs/phase2c-report.md §4.3; gh issue #296). ✅
 6. No malloc/libc anywhere; all buffers are static arrays (asset_region,
    frame_ring, tool_queue) with size-validated geometry cross-checked by the
    VM test. ✅
