@@ -31,9 +31,6 @@ MAX_LINES=200
 # migration (Curlee gains assignment + bitwise + port I/O).
 GRANDFATHERED=(
   "virtio_net.c"  # 798 lines — ring math, migrate with assignment+port I/O
-  "fb.c"          # 270 lines — raw state + memory-move shim (gh issue #13:
-                  #   blitter/event-loop logic migrated to fb.curlee; 0 pure
-                  #   logic, but the extern surface keeps it over the cap)
   "libgcc32.c"    # 322 lines — GCC ABI shim, NEVER migrates
 )
 

@@ -190,10 +190,12 @@ fn main() -> Int {
   let rv3: Bool = a.ring_valid_slot(-1, 4);
   if (rv3) { return 11; }
 
-  // --- 12: Phase 2b tool-queue geometry (fixed-slot ring in fb.c) -----------
-  // The C constants (TOOL_QUEUE_SLOTS / TOOL_SLOT_BYTES in kernel/fb.c) MUST
-  // agree with these pure values — the VM asserts the geometry both sides
-  // depend on, so a drift fails `make canvas-run` before any kernel boot.
+  // --- 12: Phase 2b tool-queue geometry (fixed-slot ring) ------------------
+  // The queue is a genuine Curlee static ring in kernel/fb.curlee (two
+  // parallel [Int; 8] arrays — 8 slots x 16 bytes) whose capacity/slot-size
+  // MUST agree with these pure values — the VM asserts the geometry the
+  // blitter depends on, so a drift fails `make canvas-run` before any kernel
+  // boot.
   let tq_slots: Int = a.tool_queue_slots();
   if (tq_slots != 8) { return 12; }                 // TOOL_QUEUE_SLOTS
   let tq_bytes: Int = a.tool_slot_bytes();
@@ -221,9 +223,10 @@ fn main() -> Int {
   let trn2: Int = a.tool_ring_next(3);
   if (trn2 != 4) { return 12; }
   // Oldest-live-slot index (the drain math): (head - count) mod 8,
-  // division-free. fb_run_loop (kernel/fb.curlee, gh issue #13) drains the
-  // oldest slot with an inline twin of this helper — these assertions pin
-  // the drain semantics both sides depend on.
+  // division-free (the kernel uses the `%` form). fb_run_loop
+  // (kernel/fb.curlee, gh issue #13) drains the oldest slot with an inline
+  // twin of this helper — these assertions pin the drain semantics both
+  // sides depend on.
   let to1: Int = a.tool_ring_oldest(2, 3);
   if (to1 != 7) { return 12; }        // slots 7,0,1 live -> oldest 7
   let to2: Int = a.tool_ring_oldest(0, 3);

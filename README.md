@@ -191,11 +191,16 @@ OS with a freestanding software renderer targeting the linear framebuffer.
 
 - **Two layers**: Curlee computes geometry/intent (pure, Z3-verified, VM-tested)
   AND executes the pixel loops ([`kernel/fb.curlee`](kernel/fb.curlee) — the
-  blitter + 60 FPS event loop, gh issue #13); the C shim
-  ([`kernel/fb.c`](kernel/fb.c)) owns ONLY the mutable state and raw memory
-  moves (framebuffer globals, the static ring/region arrays, the
-  runtime-address `phys_write_u32`/`fb_mem_read_u32` memory moves — Curlee
-  has no globals/arrays).
+  blitter + 60 FPS event loop, gh issue #13). The blitter's small mutable
+  state (tool ring, loop counters, ring bookkeeping, draw-target
+  indirection) is genuine Curlee `static` module state (the toolchain gained
+  static + `[T; N]` arrays), and the runtime-address memory moves are Curlee
+  compiler builtins (`phys_write_u32`/`phys_read_u8/u32` — inline volatile
+  stores/loads). The C shim ([`kernel/fb.c`](kernel/fb.c)) keeps ONLY the
+  four framebuffer globals and the two LARGE PVH-conditional buffers (the
+  128x128 asset region + 2x640x480 frame ring — sized per build with
+  `#ifndef JOE_PVH_BOOT` because Curlee has no conditional compilation and
+  the PVH loader rejects a large BSS, see `docs/phase2c-report.md` §4.3).
 - **Single-TU merge**: the freestanding codegen crashes on `import`, so
   [`scripts/build-kernel.sh`](scripts/build-kernel.sh) concatenates the pure
   modules + `kernel.curlee` into one self-contained translation unit.
@@ -214,10 +219,11 @@ OS with a freestanding software renderer targeting the linear framebuffer.
   all bounds-checked. Glyph text rendering is Curlee too — `draw_glyph` in
   [`kernel/kernel.curlee`](kernel/kernel.curlee) reads `glyph_pixel` from
   [`kernel/glyphs.curlee`](kernel/glyphs.curlee) and drives `fb_pixel` (no C
-  glyph-table copy). The tool ring + asset region + frame ring stay
-  fixed-slot static arrays owned by the C shim ([`kernel/fb.c`](kernel/fb.c))
-  — no malloc. Phase 2c: `fb_present()` performs a real back-buffer flip on
-  the GRUB framebuffer path (serial `RING: 1`).
+  glyph-table copy). The tool ring is Curlee statics; only the two large
+  PVH-conditional buffers (asset region + frame ring) stay as C static
+  arrays in [`kernel/fb.c`](kernel/fb.c) — no malloc. Phase 2c:
+  `fb_present()` performs a real back-buffer flip on the GRUB framebuffer
+  path (serial `RING: 1`).
 - **Declarative scene**: `render_frame(frame)` in
   [`kernel/kernel.curlee`](kernel/kernel.curlee) describes one frame (colors
   bound to `let`s — the verifier rejects calls as call arguments); every

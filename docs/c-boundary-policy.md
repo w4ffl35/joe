@@ -40,10 +40,14 @@ C exists for exactly two reasons in JOE:
    blitter (`fb.c`, 664 lines) migrated in issue #13: the pixel primitives,
    Bresenham, the Phase 2c ring flip, the tool-call queue and the loop
    control became `fb.curlee` (genuine Curlee, merged into the kernel TU),
-   and `fb.c` is now a raw-state + memory-move shim in the same class —
-   with the added **runtime-address physical write** `phys_write_u32` (the
-   `#279` read family's write counterpart, raw volatile stores) that lets
-   the Curlee blitter write the boot-discovered framebuffer address.
+   and `fb.c` became a raw-state + memory-move shim. The 2026-08 revision
+   (issue #13) then moved the SMALL mutable state (tool ring, loop counters,
+   ring bookkeeping, draw-target indirection) into Curlee `static` module
+   state (the toolchain gained static + `[T; N]` arrays) and the
+   runtime-address memory moves became Curlee COMPILER BUILTINS
+   (`phys_write_u32` / `phys_read_u8/u32` — inline volatile stores/loads, no
+   C symbol), leaving `fb.c` a ~140-line build-geometry shim: the four
+   framebuffer globals and the two large PVH-conditional buffers (see §3).
 
 Everything else — parsers, protocol logic, checksums, layout math, glyph
 tables, geometry — belongs in the **pure, verified Curlee layer**
@@ -98,7 +102,6 @@ The current offenders (grandfathered, tracked for migration):
 | File | Lines | Pure-logic estimate | Migrate when |
 |---|---|---|---|
 | `virtio_net.c` | 798 | ~300 (ring math) | Curlee gains assignment + port I/O |
-| `fb.c` | 270 | 0 (raw state + memory moves) | grandfathered for the line cap only — gh issue #13 migrated the blitter/event-loop logic |
 | `libgcc32.c` | 322 | 0 (compiler shim) | never (GCC ABI) |
 
 (`net_stack.c` is gone from this table: its ~700 lines of protocol logic
@@ -106,16 +109,15 @@ migrated to `net_stack.curlee` + the kernel.curlee glue in issue #12, and
 the file is now a ~110-line raw-state shim in the exempt category above.
 `mb2.c` is gone too: its 116-line tag walk migrated to `mb2.curlee` in issue
 #15, leaving a ~50-line raw-state shim (`mb2_state.c` — the info-addr
-getter, the four framebuffer-global stores, and the runtime-address
-`phys_read_u8/u32` raw volatile loads, curlee issue #279) in the exempt
-category above. `fb.c` is now the same class — gh issue #13 migrated its
-~150 lines of blitter/event-loop logic (pixel primitives, Bresenham, the
-tool-call queue, the loop control) to `fb.curlee`; the ~270-line residual is
-the raw-state + memory-move shim (framebuffer globals, the static ring/
-region arrays, the `phys_write_u32`/`fb_mem_read_u32` runtime-address
-memory moves — the write counterpart of the #279 reads) in the exempt
-category above, grandfathered for the line cap only because the 26-symbol
-extern window keeps it over 200 lines.)
+getter and the four framebuffer-global stores; the runtime-address
+`phys_read_u8/u32` raw volatile loads are now Curlee compiler builtins) in
+the exempt category above. `fb.c` is now also BELOW the cap — gh issue #13
+migrated its ~150 lines of blitter/event-loop logic (pixel primitives,
+Bresenham, the tool-call queue, the loop control) to `fb.curlee`, and the
+2026-08 revision moved the small mutable state into Curlee statics + the
+memory moves into the phys builtins; the ~140-line residual is the
+build-geometry shim (framebuffer globals + the two large PVH-conditional
+buffers + the base-address getters) in the exempt category above.)
 
 ## 4. Migration roadmap (what unblocks what)
 
@@ -135,10 +137,11 @@ The C surface collapses to a thin I/O shim once three Curlee features land
    now `vbe.curlee` — its only C residual is the `vbe_state_set` state shim,
    the globals-write half of the raw-state category above).
    **Runtime-address physical writes** (the `phys_read_u*` counterpart)
-   LANDED and unblocked the `fb.c` blitter in issue #13: `phys_write_u32`
-   (defined in `fb.c`'s shim — raw volatile stores, the same class as the
-   `#279` reads) is what lets the Curlee pixel primitives write the hardware
-   framebuffer at its boot-discovered runtime address.
+   LANDED as Curlee COMPILER BUILTINS and unblocked the `fb.c` blitter in
+   issue #13: `phys_write_u32` is now an inline volatile store in the
+   freestanding codegen (no C symbol — the `fb.c` shim definition was
+   deleted in the 2026-08 revision), so the Curlee pixel primitives write
+   the hardware framebuffer at its boot-discovered runtime address.
 3. **Bitwise ops + shifts** — unblocked big-endian packing, checksums,
    descriptor flags, and alignment math. Landed in the compiler ahead of
    issue #12, which used it to migrate the whole `net_stack.c` protocol core
@@ -150,10 +153,11 @@ The C surface collapses to a thin I/O shim once three Curlee features land
    multiboot2 info structure lives at a RUNTIME address captured by the boot
    stub, which a compile-time-literal `Phys<T>` cannot address. `mb2.curlee`
    (issue #15) calls them inside `unsafe` with `cap phys.mem`, exactly like
-   the `Phys<T>` reads; the definitions are raw volatile loads in
-   `mb2_state.c` (the current toolchain runtime does not carry the symbols).
-   A **runtime-address physical write** counterpart would additionally unblock
-   the `vga_text_clear.c` raw memory move.
+   the `Phys<T>` reads. In the 2026-08 toolchain these became Curlee
+   COMPILER BUILTINS (inline volatile loads — the `mb2_state.c` definitions
+   were deleted); a runtime-address physical write counterpart (also now a
+   builtin, `phys_write_u32`) additionally unblocks the `vga_text_clear.c`
+   raw memory move.
 
 Until then, **do not add new pure logic to C**. If a feature needs pure
 logic, write it as a Curlee module (even if the driver can't yet be

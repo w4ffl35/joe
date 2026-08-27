@@ -18,13 +18,15 @@
 #      return value (1 = usable 32bpp framebuffer tag found and globals
 #      filled; 0 = not), the exact acceptance-contract.
 #   2. Codegens it with `curlee build --target freestanding-c`.
-#   3. Compiles it with a host harness that MOCKS the three extern windows
-#      (mb2_info_addr_get / mb2_state_set / phys_read_u8+u32) against a
-#      1 MiB byte array standing in for physical memory:
-#        - the harness writes a synthetic multiboot2 info structure into the
-#          array at runtime addresses (little-endian, exactly as GRUB does),
-#        - phys_read_u8/u32 read the array at the given address (raw
-#          byte/word reads — the same shape as the kernel's volatile loads),
+#   3. Compiles it with a host harness that provides the two remaining extern
+#      windows (mb2_info_addr_get / mb2_state_set) and a 1 MiB byte array
+#      standing in for physical memory:
+#        - phys_read_u8/u32 are now Curlee COMPILER BUILTINS (inline volatile
+#          loads), so the harness writes the synthetic multiboot2 info
+#          structure into the array at its REAL address (MEM_BASE + offset,
+#          little-endian, exactly as GRUB does) and the parser's builtin
+#          reads dereference it directly — the old extern mocks are dead
+#          code kept for reference,
 #        - mb2_state_set records the (addr, pitch, width, height) the parser
 #          extracted,
 #      then drives curlee_main() across 12 scenarios and asserts BOTH the
@@ -51,9 +53,9 @@
 #  12. info addr NEGATIVE (a u64 with bit 63 set, cast to signed Int by
 #      mb2_info_addr_get): rc 0 — the C original's UNSIGNED `>= 0x100000000ULL`
 #      rejects it, and the Curlee gate must too (`base < 0`), BEFORE any
-#      physical read (a wild dereference at (uintptr_t)-1). The hardened
-#      phys_read_u8/u32 mocks FAIL the run if a negative-address read ever
-#      happens, so this case proves the gate — not the mock.
+#      physical read (a wild dereference at (uintptr_t)-1 would now segfault
+#      the harness — the builtin reads inline the deref, so a gate regression
+#      fails the run, just less gracefully than the old mocks).
 #
 # The boot gates then prove the real shim (kernel/mb2_state.c) + boot.S's
 # mb2_info_addr + the live GRUB tag produce the same result in the VM.
@@ -97,10 +99,38 @@ cat > "$HARNESS" <<'EOF'
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 
-/* ---- scripted physical memory: 1 MiB byte array (address == index) ---- */
+/* ---- scripted physical memory: 1 MiB mapped at the classic x86 LOW-MEMORY
+ * address 0x80000 (MAP_FIXED). The Curlee phys_read_u8/u32 calls are
+ * COMPILER BUILTINS (inline volatile loads — the old extern mocks below are
+ * dead code kept for reference), so the parser dereferences REAL addresses:
+ * the parser's trust gate rejects an info base >= 4 GiB, and a static array
+ * would sit at a userspace address far above that. Mapping at 0x80000 (a
+ * well-known free low-memory hole) makes the base pass the gate AND the
+ * builtin derefs hit real mapped memory. Scenario offsets are RELATIVE to
+ * this base: physical address = MEM_BASE + offset. ---- */
 #define MEM_SIZE 0x100000
-static unsigned char mem[MEM_SIZE];
+#define MEM_BASE 0x80000
+static unsigned char* mem;
+
+static int mem_ready(void)
+{
+    if (mem)
+    {
+        return 1;
+    }
+    void* p = mmap((void*)MEM_BASE, MEM_SIZE,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (p == MAP_FAILED)
+    {
+        fprintf(stderr, "MB2-CODEGEN: cannot map low memory at 0x80000\n");
+        return 0;
+    }
+    mem = (unsigned char*)p;
+    return 1;
+}
 
 static void put_u8(unsigned long addr, unsigned int v)
 {
@@ -177,7 +207,7 @@ long long curlee_main(void);
 /* Reset the scripted memory + recorded state for a fresh scenario. */
 static void reset_mem(void)
 {
-    memset(mem, 0, sizeof(mem));
+    memset(mem, 0, MEM_SIZE);
     state_called = 0;
     state_addr = state_pitch = state_width = state_height = 0;
 }
@@ -209,19 +239,27 @@ static void put_fb_tag(unsigned long p, unsigned long fb_addr, unsigned int bpp)
 }
 
 /* Run one scenario: arm the info structure, drive the parser, assert. The
- * caller must have reset_mem()'d and written the tags FIRST. */
-static void run_case(const char* name, long long addr, unsigned long total,
-                     int expect_rc, int expect_state,
+ * caller must have reset_mem()'d and written the tags FIRST (at RELATIVE
+ * offsets — physical address = MEM_BASE + offset). `base` is the raw
+ * current_addr to arm (MEM_BASE for in-range scenarios; 0, a negative, or
+ * >= 4 GiB for the trust-gate scenarios the parser must reject BEFORE any
+ * physical read — with the builtin reads, a gate regression segfaults the
+ * harness instead of the old mocks' graceful fail, still a clean gate fail).
+ * `mem_off` is the offset to write `total` (the total_size field) at, or -1
+ * to write nothing.
+ */
+static void run_case(const char* name, long long base, long long mem_off,
+                     unsigned long total, int expect_rc, int expect_state,
                      unsigned int e_addr, unsigned int e_pitch,
                      unsigned int e_width, unsigned int e_height)
 {
     long long rc;
-    if (addr > 0 && addr < (long long)MEM_SIZE)
+    if (mem_off >= 0)
     {
-        put_u32((unsigned long)addr, total);
-        put_u32((unsigned long)addr + 4, 0);   /* reserved */
+        put_u32((unsigned long)mem_off, total);
+        put_u32((unsigned long)mem_off + 4, 0);   /* reserved */
     }
-    current_addr = addr;
+    current_addr = base;
     rc = curlee_main();
     CHECK(rc == expect_rc, name);
     if (expect_state)
@@ -245,60 +283,65 @@ static void run_case(const char* name, long long addr, unsigned long total,
 
 int main(void)
 {
-    /* 1. Happy path: cmdline tag at 8 (advance 16) then fb tag at 24.
-     *    total = 8 + 16 + 32 = 56. */
+    if (!mem_ready())
+    {
+        return 1;
+    }
+    /* 1. Happy path: cmdline tag at offset 8 (advance 16) then fb tag at
+     *    offset 24. total = 8 + 16 + 32 = 56. The info base is mem[0]
+     *    (physical 0x80000). */
     reset_mem();
-    put_cmdline_tag(0x80008);
-    put_fb_tag(0x80018, 0xFD000000UL, 32);
-    run_case("happy", 0x80000, 56, 1, 1, 0xFD000000u, 2560, 640, 480);
+    put_cmdline_tag(0x8);
+    put_fb_tag(0x18, 0xFD000000UL, 32);
+    run_case("happy", MEM_BASE, 0, 56, 1, 1, 0xFD000000u, 2560, 640, 480);
 
     /* 2. info addr == 0 (the PVH path: no boot stub). */
     reset_mem();
-    run_case("zero_addr", 0, 0, 0, 0, 0, 0, 0, 0);
+    run_case("zero_addr", 0, -1, 0, 0, 0, 0, 0, 0, 0);
 
     /* 3. info addr >= 4 GiB. */
     reset_mem();
-    run_case("big_addr", 0x100000000LL, 0, 0, 0, 0, 0, 0, 0);
+    run_case("big_addr", 0x100000000LL, -1, 0, 0, 0, 0, 0, 0, 0);
 
     /* 4. total_size < 16. */
     reset_mem();
-    run_case("small_total", 0x80000, 8, 0, 0, 0, 0, 0, 0);
+    run_case("small_total", MEM_BASE, 0, 8, 0, 0, 0, 0, 0, 0);
 
     /* 5. total_size > 0x10000. */
     reset_mem();
-    run_case("big_total", 0x80000, 0x10001, 0, 0, 0, 0, 0, 0);
+    run_case("big_total", MEM_BASE, 0, 0x10001, 0, 0, 0, 0, 0, 0);
 
     /* 6. No framebuffer tag: one cmdline tag, total = 8 + 16 = 24. */
     reset_mem();
-    put_cmdline_tag(0x80008);
-    run_case("no_fb_tag", 0x80000, 24, 0, 0, 0, 0, 0, 0);
+    put_cmdline_tag(0x8);
+    run_case("no_fb_tag", MEM_BASE, 0, 24, 0, 0, 0, 0, 0, 0);
 
     /* 7. Framebuffer tag with bpp == 24 (not usable). */
     reset_mem();
-    put_fb_tag(0x80008, 0xFD000000UL, 24);
-    run_case("bpp_not_32", 0x80000, 40, 0, 0, 0, 0, 0, 0);
+    put_fb_tag(0x8, 0xFD000000UL, 24);
+    run_case("bpp_not_32", MEM_BASE, 0, 40, 0, 0, 0, 0, 0, 0);
 
     /* 8. Framebuffer tag with fb_addr == 0 (not usable). */
     reset_mem();
-    put_fb_tag(0x80008, 0, 32);
-    run_case("fb_addr_zero", 0x80000, 40, 0, 0, 0, 0, 0, 0);
+    put_fb_tag(0x8, 0, 32);
+    run_case("fb_addr_zero", MEM_BASE, 0, 40, 0, 0, 0, 0, 0, 0);
 
     /* 9. Malformed: first tag has size == 0 (break out, return 0). */
     reset_mem();
-    put_u32(0x80008, 8);     /* type 8 */
-    put_u32(0x8000C, 0);     /* size 0 -> malformed guard */
-    run_case("malformed_size0", 0x80000, 40, 0, 0, 0, 0, 0, 0);
+    put_u32(0x8, 8);     /* type 8 */
+    put_u32(0xC, 0);     /* size 0 -> malformed guard */
+    run_case("malformed_size0", MEM_BASE, 0, 40, 0, 0, 0, 0, 0, 0);
 
     /* 10. Odd tag alignment: a size-20 tag at 8 (advance 24) then the fb tag
      *     at 32. total = 8 + 24 + 32 = 64. Exercises (size + 7) & ~7. */
     reset_mem();
-    put_u32(0x80008, 5);     /* type 5 (framebuffer request) */
-    put_u32(0x8000C, 20);    /* size 20 -> aligned advance 24 */
-    put_u32(0x80010, 640);
-    put_u32(0x80014, 480);
-    put_u32(0x80018, 32);
-    put_fb_tag(0x80020, 0xFD000000UL, 32);
-    run_case("odd_alignment", 0x80000, 64, 1, 1, 0xFD000000u, 2560, 640, 480);
+    put_u32(0x8, 5);     /* type 5 (framebuffer request) */
+    put_u32(0xC, 20);    /* size 20 -> aligned advance 24 */
+    put_u32(0x10, 640);
+    put_u32(0x14, 480);
+    put_u32(0x18, 32);
+    put_fb_tag(0x20, 0xFD000000UL, 32);
+    run_case("odd_alignment", MEM_BASE, 0, 64, 1, 1, 0xFD000000u, 2560, 640, 480);
 
     /* 11. Framebuffer tag with a NON-ZERO HIGH dword (fb_addr =
      * 0x1_00000000): the Curlee gate requires addr_hi == 0 && addr_lo != 0,
@@ -307,17 +350,17 @@ int main(void)
      * unusable fb_addr = 0 for this tag — the port is strictly saner
      * (kernel/mb2.curlee's port notes). */
     reset_mem();
-    put_fb_tag(0x80008, 0x100000000ULL, 32);
-    run_case("fb_addr_hi", 0x80000, 40, 0, 0, 0, 0, 0, 0);
+    put_fb_tag(0x8, 0x100000000ULL, 32);
+    run_case("fb_addr_hi", MEM_BASE, 0, 40, 0, 0, 0, 0, 0, 0);
 
     /* 12. Info addr NEGATIVE (a u64 with bit 63 set — e.g. a corrupted
      * global — cast to signed Int by mb2_info_addr_get): the C original's
      * UNSIGNED `mb2_info_addr >= 0x100000000ULL` rejects it, and the Curlee
-     * gate must too (base < 0), BEFORE any physical read. The hardened
-     * phys_read_* mocks above fail the run on a negative-address read, so
-     * this case proves the trust gate, not the mock. */
+     * gate must too (base < 0), BEFORE any physical read. With the builtin
+     * reads a gate regression would deref (uintptr_t)-1 and segfault — this
+     * case proves the trust gate, not the mock. */
     reset_mem();
-    run_case("negative_addr", -1LL, 0, 0, 0, 0, 0, 0, 0);
+    run_case("negative_addr", -1LL, -1, 0, 0, 0, 0, 0, 0, 0);
 
     if (failures == 0)
     {
