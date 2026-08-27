@@ -58,8 +58,10 @@ extern fn curlee_halt() -> Unit;
 // live exactly once, next to the one-shot glue that consumes them:
 // net_connect / net_send / net_stack_poll / net_response_len /
 // net_response_byte are genuine Curlee functions there, gh issue #12). The
-// pure protocol core is kernel/net_stack.curlee (extern-free); the C shim is
-// kernel/net_stack.c (raw state + response byte store only).
+// pure protocol core is kernel/net_stack.curlee (extern-free); the mutable
+// one-shot state + 256-byte response store are Curlee statics in
+// kernel/net_glue.curlee (gh issue #20 — the kernel/net_stack.c raw-state
+// shim is deleted).
 
 // ===========================================================================
 // Phase 2 declarative render scene (called per-frame by fb_run_loop's C loop)
@@ -394,13 +396,13 @@ fn net_bringup(pm: cap phys.mem) -> Unit {
 //   SND: 36 net_send() queued the fixed 36-byte request
 //   RCV: 36 net_stack_poll() received the response body (<= 256 B)
 //
-// Fuel discipline: net_connect() and the response poll are bounded by the
-// C-side shim (net_rx_wait from 2d-1 + the net_poll_fuel counter) — the poll
-// loop uses the glue call in the CONDITION, exactly like the Phase 2b
-// `while (fb_loop_frame() < 4)` loop: each iteration re-evaluates
-// net_stack_poll() (kernel/net_glue.curlee, gh issue #12), which fails
-// closed (returns 2 — not 0) once its C-owned fuel counter is exhausted, so
-// the loop provably terminates.
+// Fuel discipline: net_connect() and the response poll are bounded by
+// net_rx_wait from 2d-1 + the net_poll_fuel counter (a Curlee static in
+// kernel/net_glue.curlee since gh issue #20) — the poll loop uses the glue
+// call in the CONDITION, exactly like the Phase 2b `while (fb_loop_frame() <
+// 4)` loop: each iteration re-evaluates net_stack_poll() (kernel/net_glue.
+// curlee, gh issue #12), which fails closed (returns 2 — not 0) once the
+// fuel counter is exhausted, so the loop provably terminates.
 // Phase 2d-3: the pure JSON/tool-call parser bridge (kernel/json.curlee, merged
 // in). Reads the received response body byte-by-byte through the 2d-2 glue
 // (net_response_len / net_response_byte — genuine Curlee, net_glue.curlee),
@@ -624,11 +626,12 @@ fn main(pm: cap phys.mem) -> Unit {
   json_llm_bridge(pm);
   // gh issue #15: the multiboot2 info parser is now a genuine Curlee
   // function (kernel/mb2.curlee, ported from kernel/mb2.c). fb_init() is
-  // gone — its only logic was "mb2_parse() then fb_wire_draw_target()", and
-  // C cannot call up into the codegen (the parse is the static
-  // `curlee_mb2_parse` symbol; C boundary policy). So main drives the parse
-  // (fills the framebuffer globals via the mb2_state_set shim) then wires
-  // the draw target — the multiboot2 tag always wins on the GRUB path.
+  //   gone — its only logic was "mb2_parse() then fb_wire_draw_target()", and
+  //   C cannot call up into the codegen (the parse is the static
+  //   `curlee_mb2_parse` symbol; C boundary policy). So main drives the parse
+  //   (fills the framebuffer state via fb_state_set — the Curlee setter in
+  //   fb.curlee, gh issue #20) then wires the draw target — the multiboot2
+  //   tag always wins on the GRUB path.
   let mb2_ok: Int = mb2_parse(pm);
   fb_wire_draw_target();
   // Phase 2f Bochs VBE probe — ported to Curlee in gh issue #11
@@ -638,11 +641,11 @@ fn main(pm: cap phys.mem) -> Unit {
   // JOE_PVH_BOOT` in the deleted fb.c fb_init: it only runs when the
   // multiboot2 parse found no framebuffer (fb_ready()==0 — the multiboot2
   // tag always wins on the GRUB path) AND this is the PVH build
-  // (fb_asset_region_w() reads 0 on PVH builds, 128 on the GRUB build — the
-  // same discriminator used below). On success the probe fills the
-  // framebuffer globals via the vbe_state_set shim; main then re-wires the
-  // draw target (the wiring just after mb2_parse ran while fb_addr was
-  // still 0).
+  //   (fb_asset_region_w() reads 0 on PVH builds, 128 on the GRUB build — the
+  //   same discriminator used below). On success the probe fills the
+  //   framebuffer state via fb_state_set (the Curlee setter in fb.curlee, gh
+  //   issue #20); main then re-wires the draw target (the wiring just after
+  //   mb2_parse ran while fb_addr was still 0).
   if (fb_ready() == 0) {
     let pvh_build: Int = fb_asset_region_w();
     if (pvh_build == 0) {
@@ -714,8 +717,10 @@ fn main(pm: cap phys.mem) -> Unit {
     // serial fallback keeps the Phase 1 gates green. vga_text_setup is a
     // genuine Curlee function (kernel/vga_setup.curlee, ported from the
     // deleted kernel/vga_setup.c in issue #10): it programs the VGA CRT
-    // controller for text mode 3, then delegates the 0xB8000 buffer clear
-    // to the vga_clear_text_buffer raw-memory-move extern.
+    // controller for text mode 3, then clears the 0xB8000 buffer via
+    // vga_clear_text_buffer — a genuine Curlee loop over the runtime-address
+    // phys_write_u16 builtin (gh issue #20; the former vga_text_clear.c
+    // raw-memory-move extern is deleted).
     vga_text_setup(pm);
   }
   unsafe {

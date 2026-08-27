@@ -44,15 +44,11 @@ CANVAS_TEST   := kernel/canvas_test.curlee
 JSON_TEST     := kernel/json_test.curlee
 NET_STACK_TEST := kernel/net_stack_test.curlee
 BOOT_ASM      := kernel/boot.S
-VGA_CLEAR_C   := kernel/vga_text_clear.c
 FB_C          := kernel/fb.c
 MB2_SRC       := kernel/mb2.curlee
 MB2_STATE_C   := kernel/mb2_state.c
-VBE_STATE_C   := kernel/vbe_state.c
 NET_C         := kernel/virtio_net.c
 NET_H         := kernel/net.h
-NET_STACK_C   := kernel/net_stack.c
-NET_STACK_H   := kernel/net_stack.h
 LIBGCC32_C    := kernel/libgcc32.c
 LINKER_GRUB   := scripts/linker-grub.ld
 MERGE_SCRIPT  := scripts/build-kernel.sh
@@ -86,35 +82,35 @@ $(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
-$(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_STATE_C) $(VBE_STATE_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H)
+$(KERNEL_ELF): $(MERGED_SRC) $(FB_C) $(MB2_STATE_C) $(NET_C) $(NET_H)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel.o
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_CLEAR_C) -o $(BUILD_DIR)/vga_text_clear.o
 	# PVH path (qemu -kernel): compile-time-empty frame ring/asset region
 	# (JOE_PVH_BOOT) so the image stays within QEMU's PVH LOAD budget (a large
 	# BSS silently breaks the PVH entry — see kernel/fb.c header). The GRUB/ISO
 	# path (kernel-grub.elf) compiles WITHOUT this macro and gets the full
 	# ring/asset region, which is where the framebuffer flip actually runs.
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
-	# gh issue #15: the multiboot2 tag walk is Curlee (kernel/mb2.curlee,
+	# gh issue #15 + #20: the multiboot2 tag walk is Curlee (kernel/mb2.curlee,
 	# merged into kernel.c above). The only C residual is the raw-state shim
-	# (kernel/mb2_state.c): mb2_info_addr_get (reads boot.S's .data global),
-	# mb2_state_set (fills the fb globals), and the runtime-address
-	# phys_read_u8/u32 raw volatile loads (curlee #279). Linked into every
-	# ELF because curlee_main -> curlee_mb2_parse references them in ALL
-	# builds (mb2_parse is always called on the GRUB path; on the PVH path
-	# the info addr reads 0 and the parse no-ops — the symbol must resolve).
+	# (kernel/mb2_state.c): mb2_info_addr_get (reads boot.S's .data global —
+	# a C-level linkage requirement: boot.S is 32-bit assembly writing a
+	# strong .data definition over the weak default, which a file-local Curlee
+	# static cannot express). The framebuffer state the parse fills is Curlee
+	# statics in fb.curlee (fb_state_set) — the mb2_state_set setter and the
+	# vbe_state.c shim were deleted in gh issue #20, and the runtime-address
+	# phys_read_u8/u32 reads are Curlee compiler builtins (curlee #279).
+	# Linked into every ELF because curlee_main -> curlee_mb2_parse references
+	# mb2_info_addr_get in ALL builds (mb2_parse is always called on the GRUB
+	# path; on the PVH path the info addr reads 0 and the parse no-ops — the
+	# symbol must resolve).
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_STATE_C) -o $(BUILD_DIR)/mb2_state.o
 	# Phase 2f: Bochs VBE probe — ported to Curlee in gh issue #11
-	# (kernel/vbe.curlee, merged into kernel.c above). The only C residual is
-	# the framebuffer-state shim (kernel/vbe_state.c, `vbe_state_set`) that
-	# the Curlee probe calls to fill the C-visible globals. Linked into every
-	# ELF because curlee_main references curlee_vbe_probe -> vbe_state_set in
-	# ALL builds (the probe is only CALLED on the PVH path, but the symbol
-	# must resolve; on the GRUB/ISO path it is dead code — the multiboot2 tag
-	# always wins, and the PVH-build gate in main keeps the call unreached).
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_STATE_C) -o $(BUILD_DIR)/vbe_state.o
+	# (kernel/vbe.curlee, merged into kernel.c above). No C residual remains
+	# (gh issue #20): the framebuffer state it fills is Curlee statics in
+	# fb.curlee, written through fb_state_set — the former vbe_state.c shim
+	# (`vbe_state_set`) is deleted and nothing from it links here.
 	# Phase 2d-1: VirtIO-net driver. gh issue #14: the 798-line driver is now
 	# GENUINE Curlee (kernel/virtio_net.curlee, merged into kernel.c above);
 	# kernel/virtio_net.c is reduced to the raw ring/buffer shim (the two
@@ -127,18 +123,16 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_STATE_C) $(VBE_STATE_C
 	# the getter symbols on BOTH builds (the merged kernel.c is identical), so
 	# the stub object must link here (the issue #8 build-order fix applies).
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
-	# Phase 2d-2 (gh issue #12): TCP/IP stack raw-state shim (kernel/net_stack.c)
-	# — the ARP/IPv4/TCP logic moved to net_stack.curlee + the kernel.curlee
-	# glue; this is now only the mutable state + response byte store. Same PVH
-	# discipline: the GRUB/ISO path (below) gets the real 256-byte store; the
-	# PVH path compiles the 1-byte stub so the PVH LOAD budget is untouched and
-	# the no-NIC-safe baseline stays green.
-	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_STACK_C) -o $(BUILD_DIR)/net_stack.o
+	# Phase 2d-2 (gh issue #12): TCP/IP stack — the ARP/IPv4/TCP logic is
+	# net_stack.curlee + the kernel.curlee glue, and since gh issue #20 the
+	# mutable one-shot state + 256-byte response store are Curlee statics in
+	# net_glue.curlee (the kernel/net_stack.c raw-state shim is DELETED —
+	# no C object links here).
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
-	  $(BUILD_DIR)/kernel.o $(BUILD_DIR)/vga_text_clear.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2_state.o $(BUILD_DIR)/vbe_state.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
+	  $(BUILD_DIR)/kernel.o $(BUILD_DIR)/fb.o \
+	  $(BUILD_DIR)/mb2_state.o $(BUILD_DIR)/virtio_net.o \
 	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 	@echo "Built $@"
@@ -149,7 +143,7 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_STATE_C) $(VBE_STATE_C
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(NET_STACK_SRC) $(MB2_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(NET_STACK_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
@@ -158,13 +152,16 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	$(CURLEE) check $(JSON_SRC)
 	$(CURLEE) check $(SERIAL_SRC)
 	$(CURLEE) check $(VGA_SETUP_SRC)
-	$(CURLEE) check $(VBE_SRC)
 	# gh issue #14: the VirtIO-net driver is genuine Curlee (the 798-line
 	# kernel/virtio_net.c was reduced to a ring/buffer shim); it declares its
 	# own externs (C shim getters + sfence) so it verifies standalone.
 	$(CURLEE) check $(VIRTIO_NET_SRC)
+	# The pure protocol core stays VM-checkable standalone (extern-free).
 	$(CURLEE) check $(NET_STACK_SRC)
-	$(CURLEE) check $(MB2_SRC)
+	# gh issue #20: kernel/vbe.curlee and kernel/mb2.curlee are NOT checked
+	# standalone anymore — they call fb.curlee's fb_state_set (the shared
+	# framebuffer-state setter), so they verify through the MERGED TU below
+	# (the net_glue.curlee precedent).
 	$(CURLEE) check $(MERGED_SRC)
 	@echo "curlee check: OK (all modules + merged kernel verified)"
 
@@ -244,24 +241,20 @@ iso: $(ISO)
 # Int math is implemented by libgcc32.o's __muldi3/__divdi3/... helpers).
 #
 # The 64-bit PVH/QEMU path (kernel.elf via crt0.S) is completely unchanged.
-$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_CLEAR_C) $(FB_C) $(MB2_STATE_C) $(VBE_STATE_C) $(LIBGCC32_C) $(NET_C) $(NET_H) $(NET_STACK_C) $(NET_STACK_H) $(LINKER_GRUB)
+$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(FB_C) $(MB2_STATE_C) $(LIBGCC32_C) $(NET_C) $(NET_H) $(LINKER_GRUB)
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel-grub.o
-	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_CLEAR_C) -o $(BUILD_DIR)/vga_text_clear.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
-	# gh issue #15: the multiboot2 tag walk is Curlee (kernel/mb2.curlee,
+	# gh issue #15 + #20: the multiboot2 tag walk is Curlee (kernel/mb2.curlee,
 	# merged into kernel.c). The raw-state shim (kernel/mb2_state.c —
-	# mb2_info_addr_get / mb2_state_set / phys_read_u8/u32) links here too;
-	# on THIS path it is the LIVE one (boot.S fills mb2_info_addr from %ebx
-	# and mb2_parse finds the framebuffer tag — the GRUB acceptance path).
+	# mb2_info_addr_get only) links here too; on THIS path it is the LIVE one
+	# (boot.S fills mb2_info_addr from %ebx and mb2_parse finds the
+	# framebuffer tag — the GRUB acceptance path). The framebuffer state the
+	# parse fills is Curlee statics in fb.curlee (fb_state_set — the former
+	# mb2_state_set setter is deleted, gh issue #20); the phys_read_u8/u32
+	# reads are Curlee compiler builtins.
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_STATE_C) -o $(BUILD_DIR)/mb2_state.o
-	# gh issue #11: the merged kernel.c now contains the Curlee vbe_probe
-	# (kernel/vbe.curlee), and curlee_main references it -> vbe_state_set, so
-	# the framebuffer-state shim must link here too (dead code at runtime on
-	# the GRUB path — main's PVH-build gate keeps vbe_probe unreached, but
-	# the symbol must resolve).
-	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_STATE_C) -o $(BUILD_DIR)/vbe_state.o
 	# Phase 2d-1: VirtIO-net driver — GRUB/ISO path compiles WITHOUT
 	# JOE_PVH_BOOT, so option 2 is ACTIVE: full rings (2 RX x 2048 + 2 TX x
 	# 2048, depth 256) and the NIC runs (this is where qemu-net-smoke boots;
@@ -269,12 +262,6 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_CLEAR_C) $(FB_C) $
 	# getters now; the driver itself is kernel/virtio_net.curlee (gh issue
 	# #14), merged into kernel.c.
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
-	# Phase 2d-2 (gh issue #12): TCP/IP stack raw-state shim — GRUB path
-	# compiles WITHOUT JOE_PVH_BOOT, so the real 256-byte response store + full
-	# state are linked here (this is where qemu-net-smoke and qemu-llm-smoke
-	# boot; the NIC is unreachable on the PVH path). The protocol logic itself
-	# is Curlee (net_stack.curlee merged into kernel.c + the kernel.curlee glue).
-	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_STACK_C) -o $(BUILD_DIR)/net_stack.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(LIBGCC32_C) -o $(BUILD_DIR)/libgcc32.o
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	# boot.S: ELFCLASS32 object with the multiboot2 header + 32-bit protected-mode
@@ -282,8 +269,8 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(VGA_CLEAR_C) $(FB_C) $
 	# the multiboot2 handoff already provides flat 32-bit segments, paging off).
 	$(AS) --32 $(BOOT_ASM) -o $(BUILD_DIR)/boot.o
 	$(LD) -m elf_i386 -nostdlib -static -T $(LINKER_GRUB) \
-	  $(BUILD_DIR)/kernel-grub.o $(BUILD_DIR)/vga_text_clear.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2_state.o $(BUILD_DIR)/vbe_state.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
+	  $(BUILD_DIR)/kernel-grub.o $(BUILD_DIR)/fb.o \
+	  $(BUILD_DIR)/mb2_state.o $(BUILD_DIR)/virtio_net.o \
 	  $(BUILD_DIR)/libgcc32.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/boot.o \
 	  -o $@
 	@echo "Built $@ (GRUB multiboot2, 32-bit entry)"
@@ -333,39 +320,36 @@ qemu-gui: $(KERNEL_ELF)
 # gate: it proves the whole pipeline (merge -> verify -> codegen -> compile ->
 # assemble -> link -> PVH boot -> curlee_main -> display + serial).
 # The PVH smoke kernel: built like kernel.elf (JOE_PVH_BOOT, crt0.S +
-# linker.ld, vbe.curlee merged + vbe_state.c linked) but with its own objects
-# so the smoke gates never clobber the dev-loop build. Shared by qemu-smoke
-# and qemu-pvh-fb-smoke.
+# linker.ld, vbe.curlee merged) but with its own objects so the smoke gates
+# never clobber the dev-loop build. Shared by qemu-smoke and
+# qemu-pvh-fb-smoke.
 $(BUILD_DIR)/kernel-smoke.elf: check
 	@mkdir -p $(BUILD_DIR)
 	$(CURLEE) build --target freestanding-c -o $(BUILD_DIR)/kernel-smoke.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel-smoke.c -o $(BUILD_DIR)/kernel-smoke.o
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VGA_CLEAR_C) -o $(BUILD_DIR)/vga_text_clear.o
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(FB_C) -o $(BUILD_DIR)/fb.o
-	# gh issue #15: the multiboot2 tag walk is Curlee (merged into
-	# kernel-smoke.c); only the raw-state shim is C (mb2_info_addr_get /
-	# mb2_state_set / phys_read_u8/u32 — see the kernel.elf rule).
+	# gh issue #15 + #20: the multiboot2 tag walk is Curlee (merged into
+	# kernel-smoke.c); only the raw-state shim is C (mb2_info_addr_get — see
+	# the kernel.elf rule). The framebuffer state it fills is Curlee statics
+	# in fb.curlee (fb_state_set); the phys_read_u8/u32 reads are Curlee
+	# compiler builtins.
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_STATE_C) -o $(BUILD_DIR)/mb2_state.o
-	# Phase 2f: the probe is Curlee (merged into kernel-smoke.c); only the
-	# framebuffer-state shim is C (see the kernel.elf rule).
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(VBE_STATE_C) -o $(BUILD_DIR)/vbe_state.o
 	# Phase 2d-1: VirtIO-net driver, PVH option-1 stubs (JOE_PVH_BOOT) — the
 	# ring/buffer shim is compiled IN (kernel/virtio_net.c, getters return 0;
 	# the driver itself is kernel/virtio_net.curlee, gh issue #14) so the
 	# no-NIC-safe path is exercised on the existing smoke gates (net_probe
 	# finds nothing, all externs return 0).
 	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_C) -o $(BUILD_DIR)/virtio_net.o
-	# Phase 2d-2 (gh issue #12): TCP/IP stack raw-state shim, PVH option-1
-	# stubs (JOE_PVH_BOOT) — compiled IN so the shim extern surface is linked
-	# on the no-NIC-safe smoke gates (every extern returns 0 / no-ops, the
-	# Curlee glue's net_link_up() gate keeps the whole round-trip a no-op,
-	# boot continues to VGA + serial + halt).
-	$(CC) -DJOE_PVH_BOOT -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(NET_STACK_C) -o $(BUILD_DIR)/net_stack.o
+	# Phase 2d-2 (gh issue #12): TCP/IP stack — the one-shot state + response
+	# store are Curlee statics in net_glue.curlee (gh issue #20), so nothing
+	# C links here; on the no-NIC-safe smoke gates the glue's net_link_up()
+	# gate keeps the whole round-trip a no-op and boot continues to VGA +
+	# serial + halt.
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(CURLEE_RT)/rt.c -o $(BUILD_DIR)/rt.o
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
-	  $(BUILD_DIR)/kernel-smoke.o $(BUILD_DIR)/vga_text_clear.o $(BUILD_DIR)/fb.o \
-	  $(BUILD_DIR)/mb2_state.o $(BUILD_DIR)/vbe_state.o $(BUILD_DIR)/virtio_net.o $(BUILD_DIR)/net_stack.o \
+	  $(BUILD_DIR)/kernel-smoke.o $(BUILD_DIR)/fb.o \
+	  $(BUILD_DIR)/mb2_state.o $(BUILD_DIR)/virtio_net.o \
 	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 
@@ -540,17 +524,18 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@readelf -S $(KERNEL_ELF) | grep -q '\.note\.Xen' && echo "PASS: PVH note (qemu -kernel)"
 	# Phase 2d-2 (gh issue #12): the one-shot stack glue is now GENUINE Curlee
 	# (codegen'd as curlee_net_connect & co — the C externs were removed) and
-	# the raw-state shim's extern window must be linked into the kernel (the
-	# Curlee codegen references the shim symbols 1:1; a missing symbol fails at
-	# link time, but this gate makes the wiring explicit).
+	# the mutable one-shot state + response store are Curlee statics in
+	# net_glue.curlee (gh issue #20 — the kernel/net_stack.c raw-state shim is
+	# deleted; the net_state_*/net_resp_*/net_poll_* C symbols are gone from
+	# the ELF by design, their functions codegen as curlee_net_state_* & co).
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_connect$$' && echo "PASS: curlee_net_connect linked (Curlee glue)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_send$$' && echo "PASS: curlee_net_send linked (Curlee glue)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_stack_poll$$' && echo "PASS: curlee_net_stack_poll linked (Curlee glue)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_response_len$$' && echo "PASS: curlee_net_response_len linked (Curlee glue)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_net_response_byte$$' && echo "PASS: curlee_net_response_byte linked (Curlee glue)"
-	@nm $(KERNEL_ELF) | grep -q ' net_state_get$$' && echo "PASS: net_state_get linked (state shim)"
-	@nm $(KERNEL_ELF) | grep -q ' net_resp_store$$' && echo "PASS: net_resp_store linked (state shim)"
-	@nm $(KERNEL_ELF) | grep -q ' net_poll_fuel$$' && echo "PASS: net_poll_fuel linked (state shim)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_state_get$$' && echo "PASS: curlee_net_state_get linked (Curlee state, gh issue #20)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_resp_store$$' && echo "PASS: curlee_net_resp_store linked (Curlee response store, gh issue #20)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_net_poll_fuel$$' && echo "PASS: curlee_net_poll_fuel linked (Curlee poll fuel, gh issue #20)"
 	# gh issue #14: the VirtIO-net driver is now GENUINE Curlee (ported from
 	# the 798-line kernel/virtio_net.c) — the codegen emits the extern surface
 	# as the static curlee_net_* symbols, and the raw ring/buffer shim
@@ -579,18 +564,20 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_ring_activate$$' && echo "PASS: curlee_fb_ring_activate linked (Curlee ring flip)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_ring_advance$$' && echo "PASS: curlee_fb_ring_advance linked (Curlee ring advance)"
 	@nm $(KERNEL_ELF) | grep -q ' fb_frame_ring_slot_base$$' && echo "PASS: fb_frame_ring_slot_base linked (frame-ring base getter)"
-	# Phase 2f (gh issue #11): the Curlee Bochs VBE probe (kernel/vbe.curlee)
-	# fills the framebuffer globals through the C state shim — the shim must be
-	# linked (the codegen references it 1:1; a missing symbol fails at link
-	# time, but this gate makes the wiring explicit).
-	@nm $(KERNEL_ELF) | grep -q ' vbe_state_set$$' && echo "PASS: vbe_state_set linked (VBE probe state shim)"
-	# gh issue #15: the multiboot2 tag walk is now GENUINE Curlee (ported
-	# from kernel/mb2.c) — the codegen emits it as curlee_mb2_parse, and the
-	# raw-state shim (kernel/mb2_state.c: mb2_info_addr_get / mb2_state_set)
-	# must be linked. The runtime-address reads (phys_read_u8/u32) are now
+	# Phase 2f (gh issue #11 + #20): the Curlee Bochs VBE probe
+	# (kernel/vbe.curlee) fills the framebuffer state through fb.curlee's
+	# fb_state_set — a genuine Curlee function (codegen'd as the static
+	# curlee_fb_state_set symbol); the former vbe_state.c shim is deleted and
+	# no C symbol links.
+	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_state_set$$' && echo "PASS: curlee_fb_state_set linked (Curlee framebuffer-state setter, gh issue #20)"
+	# gh issue #15 + #20: the multiboot2 tag walk is now GENUINE Curlee
+	# (ported from kernel/mb2.c) — the codegen emits it as curlee_mb2_parse,
+	# and the raw-state shim (kernel/mb2_state.c: mb2_info_addr_get only — the
+	# mb2_state_set setter is deleted, gh issue #20) must be linked for the
+	# boot.S interposition. The runtime-address reads (phys_read_u8/u32) are
 	# Curlee compiler builtins (inline volatile loads — no C symbol).
 	@nm $(KERNEL_ELF) | grep -q ' curlee_mb2_parse$$' && echo "PASS: curlee_mb2_parse linked (multiboot2 parser, gh issue #15)"
-	@nm $(KERNEL_ELF) | grep -q ' mb2_state_set$$' && echo "PASS: mb2_state_set linked (mb2 state shim)"
+	@nm $(KERNEL_ELF) | grep -q ' mb2_info_addr_get$$' && echo "PASS: mb2_info_addr_get linked (mb2 state shim)"
 	@echo "All verification gates passed."
 
 clean:

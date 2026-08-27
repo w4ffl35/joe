@@ -17,28 +17,43 @@
 // This is the same sequence OS kernels run on every boot and is harmless on
 // QEMU.
 //
-// Port note — what stayed in C (and why): the 24 register writes are pure
-// constant-port outb calls (curlee issue #269) and port directly. The
-// 0xB8000 text-buffer clear (2000 sequential 16-bit cells) does NOT port:
-// Curlee's Phys<T> addresses must be compile-time literals (a computed
-// address like 0xB8000 + i*2 is rejected), and the language has no
-// runtime-address physical WRITE builtin (only the phys_read_u8/u16/u32/u64
-// reads of curlee issue #279). A bounded Curlee loop therefore cannot
-// advance its write address; 2000 unrolled literal writes are rejected by
-// the issue scope and would blow QEMU's PVH LOAD budget. The clear stays as
-// a raw memory move in kernel/vga_text_clear.c — the second pillar of the C
-// boundary policy (docs/c-boundary-policy.md §1).
+// Port note — what stayed in C (and why): NOTHING stays in C anymore (gh
+// issue #20). The 24 register writes are pure constant-port outb calls
+// (curlee issue #269) and port directly. The 0xB8000 text-buffer clear
+// (2000 sequential 16-bit cells) was the one raw memory move that could NOT
+// port at issue #10's toolchain: Curlee's Phys<T> addresses must be
+// compile-time literals (a computed address like 0xB8000 + i*2 is rejected)
+// and the language had no runtime-address physical WRITE builtin. The
+// runtime-address phys_write_u16 builtin (curlee issue #285) landed since,
+// so the clear is now a genuine Curlee loop below (vga_clear_text_buffer)
+// and kernel/vga_text_clear.c is DELETED.
 //
 // Design laws honored:
 //   - Single address space, Ring 0: port I/O is direct x86 out asm
-//     (the curlee_port_outb prologue helper).
+//     (the curlee_port_outb prologue helper); the text clear is direct
+//     volatile 16-bit stores (phys_write_u16).
 //   - Deterministic verification: `curlee check vga_setup.curlee` runs
 //     standalone and the merged kernel re-verifies it (`make check`).
 //   - Minimal footprint: no libc, no String/Vec; a flat register sequence.
 
-// Provided by kernel/vga_text_clear.c: blanks the 0xB8000 text buffer to
-// blank cells (raw memory move — C boundary policy, see header above).
-extern fn vga_clear_text_buffer() -> Unit;
+// Blank the 0xB8000 VGA text buffer (80x25 cells, 2 bytes per cell) to
+// blank cells: space (0x20) with attribute 0x0F (bright white on black) —
+// 0x0F20 = 3872. Ported from the deleted kernel/vga_text_clear.c (gh issue
+// #20): the C loop's text[i] = 0x0F20 is a phys_write_u16 at the computed
+// runtime address 0xB8000 + i*2 (753664 + i*2), inside unsafe + cap
+// phys.mem (the runtime-address phys builtin rule). The write address is a
+// runtime value, so the verifier treats the accesses as trusted (no
+// out-of-bounds obligation — the Phys<T> model, documented).
+fn vga_clear_text_buffer(pm: cap phys.mem) -> Unit {
+  unsafe {
+    let i: Int = 0;
+    while (i < 2000) {
+      phys_write_u16(753664 + i * 2, 3872);   // 0xB8000 + i*2, 0x0F20
+      i = i + 1;
+    }
+  }
+  return;
+}
 
 // Program the VGA CRT Controller (MISC/SEQ/CRTC) for standard 80x25 text
 // mode 3. Mirrors the former kernel/vga_setup.c 1:1 — every outb below is
@@ -82,6 +97,6 @@ fn vga_text_setup(pm: cap phys.mem) -> Unit {
     port_outb(0x3D4, 0x16); port_outb(0x3D5, 0xB9); // v blank end
     port_outb(0x3D4, 0x17); port_outb(0x3D5, 0xA3); // mode control
   }
-  vga_clear_text_buffer();
+  vga_clear_text_buffer(pm);
   return;
 }

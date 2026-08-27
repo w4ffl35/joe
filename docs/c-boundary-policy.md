@@ -26,33 +26,35 @@ C exists for exactly two reasons in JOE:
    ring/buffer memory + the base-address getters + the sfence left in C
    (see §3).
 2. **Raw memory moves** — volatile framebuffer writes, ring DMA, and the
-   mutable driver *state* (frame counter, ring indices) that the Curlee layer
-   does not express (no globals, no arrays). The 0xB8000 text-buffer clear
-   is a raw memory move that *cannot* migrate: Curlee `Phys<T>` addresses
-   must be compile-time literals and there is no runtime-address physical
-   **write** builtin (only the `phys_read_u*` reads of curlee issue #279), so
-   a sequential 2000-cell clear is not expressible as a bounded Curlee loop
-   (`vga_text_clear.c` stays in C for this reason). The framebuffer globals
-   the VBE probe fills (`fb_addr/pitch/width/height`) are C-visible `.data`
-   state owned by `fb.c`, and Curlee has no globals, so those four stores
-   stay in C as a raw state shim (`vbe_state.c`, issue #11) — same class as
-   `vga_text_clear.c`'s memory move. The 1056-line TCP/IP stack
-   (`net_stack.c`) migrated in issue #12: the protocol logic became
-   `net_stack.curlee` (pure, VM-verified) + the kernel.curlee glue, and the
-   file is now a raw-state shim in the same class — the mutable one-shot
-   connection state and the 256-byte response byte store Curlee cannot own
-   (no globals, no arrays), with no protocol logic left. The framebuffer
-   blitter (`fb.c`, 664 lines) migrated in issue #13: the pixel primitives,
-   Bresenham, the Phase 2c ring flip, the tool-call queue and the loop
-   control became `fb.curlee` (genuine Curlee, merged into the kernel TU),
-   and `fb.c` became a raw-state + memory-move shim. The 2026-08 revision
-   (issue #13) then moved the SMALL mutable state (tool ring, loop counters,
-   ring bookkeeping, draw-target indirection) into Curlee `static` module
-   state (the toolchain gained static + `[T; N]` arrays) and the
-   runtime-address memory moves became Curlee COMPILER BUILTINS
-   (`phys_write_u32` / `phys_read_u8/u32` — inline volatile stores/loads, no
-   C symbol), leaving `fb.c` a ~140-line build-geometry shim: the four
-   framebuffer globals and the two large PVH-conditional buffers (see §3).
+   mutable driver *state* that the Curlee layer does not express. The
+   sequential 0xB8000 text-buffer clear was a raw memory move that *could
+   not* migrate at issue #10's toolchain: Curlee `Phys<T>` addresses must be
+   compile-time literals and there was no runtime-address physical **write**
+   builtin, so a 2000-cell clear was not expressible as a bounded Curlee loop
+   (`vga_text_clear.c`). The runtime-address `phys_write_u*` builtins
+   (curlee #285) landed since and gh issue #20 DELETED that file — the clear
+   is now a genuine Curlee loop in `vga_setup.curlee`. The framebuffer
+   globals the VBE probe fills (`fb_addr/pitch/width/height`) were C-visible
+   `.data` state owned by `fb.c`, filled through the `vbe_state.c` /
+   `mb2_state.c` setter shims; the toolchain's `static` + `[T; N]` arrays
+   (curlee #278) landed and gh issue #20 DELETED those shims — the state is
+   Curlee statics in `fb.curlee`, filled by its `fb_state_set` (called by
+   `mb2.curlee` / `vbe.curlee`) and read directly by the blitter. The
+   1056-line TCP/IP stack (`net_stack.c`) migrated in issue #12: the protocol
+   logic became `net_stack.curlee` (pure, VM-verified) + the kernel.curlee
+   glue, and the file was reduced to a raw-state shim — the mutable one-shot
+   connection state and the 256-byte response byte store. gh issue #20
+   DELETED that shim too: the state is Curlee statics in `net_glue.curlee`
+   (`[Int; 256]` response store). The framebuffer blitter (`fb.c`, 664
+   lines) migrated in issue #13: the pixel primitives, Bresenham, the Phase
+   2c ring flip, the tool-call queue and the loop control became `fb.curlee`
+   (genuine Curlee, merged into the kernel TU), the SMALL mutable state
+   (tool ring, loop counters, ring bookkeeping, draw-target indirection)
+   moved into Curlee `static` module state, and the runtime-address memory
+   moves became Curlee COMPILER BUILTINS (`phys_write_u32` / `phys_read_u8/
+   u32` — inline volatile stores/loads, no C symbol), leaving `fb.c` a
+   ~90-line build-geometry shim: the two large PVH-conditional buffers only
+   (see §3).
 
 Everything else — parsers, protocol logic, checksums, layout math, glyph
 tables, geometry — belongs in the **pure, verified Curlee layer**
@@ -98,45 +100,63 @@ A C file **satisfies** the policy if it is:
 
 | Cap | Value | Why |
 |---|---|---|
-| Max lines per `.c` file | **200** | `vga_text_clear.c` (35) proves drivers are small (`putc_driver.c`'s 43 and `vga_setup.c`'s 73 lines are gone — ported to `serial.curlee` and `vga_setup.curlee`, issues #9/#10) |
+| Max lines per `.c` file | **200** | `vga_text_clear.c` (29) proved drivers are small before its deletion (`putc_driver.c`'s 43 and `vga_setup.c`'s 73 lines are gone — ported to `serial.curlee` and `vga_setup.curlee`, issues #9/#10) |
 | Max pure-logic lines per `.c` file | **0** | Pure logic belongs in Curlee, period |
 | Max new `.c`/`.h` files added per feature | **1** | A new device should be one driver + Curlee modules |
 
-The current offenders (grandfathered, tracked for migration):
+The current C surface under `kernel/` — ALL files below the cap and in the
+exempt category (raw memory moves / build geometry / linkage shims), with
+zero pure logic; only `libgcc32.c` is grandfathered for the line cap:
 
 | File | Lines | Pure-logic estimate | Migrate when |
 |---|---|---|---|
 | `libgcc32.c` | 322 | 0 (compiler shim) | never (GCC ABI) |
 
-(`virtio_net.c` is gone from this table: its 798 lines — PCI config-space
-scanning, legacy virtqueue setup, RX/TX ring math, frame I/O — migrated to
-`virtio_net.curlee` in issue #14, leaving a ~90-line raw ring/buffer shim in
-the exempt category above: the two large PVH-conditional buffer groups
-(5-page qmem + 2x2048 data buffers per queue, compiled OUT on the PVH build
-exactly like `fb.c`'s asset region / frame ring — Curlee has no conditional
-compilation and both builds compile the same merged kernel.c), the four
-base-address getters that let the Curlee layer address the C-owned buffers as
-runtime addresses (the `fb_asset_region_base_get` pattern), the
-`virtio_net_pvh_build` discriminator, and the `virtio_net_sfence` ring-
-publication fence. The "address-of a Curlee-owned array" language gap the
-port originally depended on was sidestepped by this buffer-owner pattern —
-the buffers must be C-owned for the PVH-size reason, and their addresses flow
-into Curlee through the getter externs.)
+The other three files are BELOW the cap, in the exempt category above
+(raw memory moves / build geometry / C-level linkage), NOT in the
+grandfather list:
 
-(`net_stack.c` is gone from this table: its ~700 lines of protocol logic
-migrated to `net_stack.curlee` + the kernel.curlee glue in issue #12, and
-the file is now a ~110-line raw-state shim in the exempt category above.
-`mb2.c` is gone too: its 116-line tag walk migrated to `mb2.curlee` in issue
-#15, leaving a ~50-line raw-state shim (`mb2_state.c` — the info-addr
-getter and the four framebuffer-global stores; the runtime-address
-`phys_read_u8/u32` raw volatile loads are now Curlee compiler builtins) in
-the exempt category above. `fb.c` is now also BELOW the cap — gh issue #13
-migrated its ~150 lines of blitter/event-loop logic (pixel primitives,
-Bresenham, the tool-call queue, the loop control) to `fb.curlee`, and the
-2026-08 revision moved the small mutable state into Curlee statics + the
-memory moves into the phys builtins; the ~140-line residual is the
-build-geometry shim (framebuffer globals + the two large PVH-conditional
-buffers + the base-address getters) in the exempt category above.)
+- **`fb.c`** (~90 lines) — the two LARGE PVH-conditional buffers (the
+  128x128 asset region + the 2x640x480 frame ring, compiled OUT on the PVH
+  build — `JOE_PVH_BOOT`): Curlee has no conditional compilation and both
+  builds compile the same merged kernel.c, so a full-size Curlee static
+  array would land in the PVH kernel's BSS unconditionally and blow QEMU's
+  PVH LOAD budget (docs/phase2c-report.md §4.3). Plus the build-geometry
+  externs (`fb_pvh_build` / `fb_asset_region_base_get` /
+  `fb_frame_ring_slot_base`, 0 on the PVH stubs). gh issue #20 deleted the
+  fb_addr/fb_pitch/fb_width/fb_height globals + the four `fb_*_get`
+  getters from this file — the framebuffer state is Curlee statics in
+  `fb.curlee`. Migrates when Curlee gains conditional compilation.
+- **`virtio_net.c`** (~90 lines) — its 798 lines of driver logic (PCI
+  config-space scanning, legacy virtqueue setup, RX/TX ring math, frame I/O)
+  migrated to `virtio_net.curlee` in issue #14, leaving the two large
+  PVH-conditional buffer groups (5-page qmem + 2x2048 data buffers per
+  queue, compiled OUT on the PVH build exactly like `fb.c`'s), the four
+  base-address getters (the `fb_asset_region_base_get` pattern), the
+  `virtio_net_pvh_build` discriminator, and the `virtio_net_sfence` ring-
+  publication fence. The buffers must be C-owned for the PVH-size reason.
+  Migrates when Curlee gains conditional compilation.
+- **`mb2_state.c`** (~25 lines) — gh issue #20 reduced it to the single
+  raw-state half Curlee cannot express: the multiboot2 info pointer.
+  `mb2_info_addr` is a WEAK `.data` global that kernel/boot.S (32-bit
+  assembly, running BEFORE curlee_main) overwrites with its strong `.data`
+  definition on the GRUB path (GNU weak/strong interposition); the Curlee
+  window is `mb2_info_addr_get()`. Curlee statics are file-local in the
+  codegen (static C symbols), so boot.S cannot write one — a C-level
+  linkage requirement, the same class as the sfence. The former
+  `mb2_state_set` setter (the four framebuffer-global stores) is DELETED —
+  the state is Curlee statics in `fb.curlee` (gh issue #20). Migrates when
+  Curlee gains a boot-assembly-visible global.
+
+Also DELETED in gh issue #20 (all three residuals the issue tracked):
+- **`vga_text_clear.c`** (29 lines) — the 0xB8000 text-buffer clear is now
+  a genuine Curlee loop in `vga_setup.curlee` (runtime-address
+  `phys_write_u16`, curlee #285).
+- **`vbe_state.c`** (39 lines) — the framebuffer-state setter shim is gone;
+  `vbe.curlee` calls `fb.curlee`'s `fb_state_set`.
+- **`net_stack.c`** (119 lines) + **`net_stack.h`** — the raw-state shim is
+  gone; the one-shot state + 256-byte response store are Curlee statics in
+  `net_glue.curlee`.
 
 ## 4. Migration roadmap (what unblocks what)
 
@@ -154,10 +174,9 @@ The C surface collapses to a thin I/O shim once the Curlee features land
    `putc_driver.c` migrated first on this feature (issue #9, now
    `serial.curlee`); `vga_setup.c`'s register sequence followed (issue #10,
    now `vga_setup.curlee`); `vbe.c`'s Bochs VBE probe followed (issue #11,
-   now `vbe.curlee` — its only C residual is the `vbe_state_set` state shim,
-   the globals-write half of the raw-state category above); `virtio_net.c`
-   followed last (issue #14, now `virtio_net.curlee` — the let-bound I/O-BAR
-   base + constant-offset ports, curlee #276, cover the whole register set).
+   now `vbe.curlee`); `virtio_net.c` followed last (issue #14, now
+   `virtio_net.curlee` — the let-bound I/O-BAR base + constant-offset ports,
+   curlee #276, cover the whole register set).
    **Runtime-address physical writes** (the `phys_read_u*` counterpart)
    LANDED as Curlee COMPILER BUILTINS and unblocked the `fb.c` blitter in
    issue #13: `phys_write_u32` is now an inline volatile store in the
@@ -166,31 +185,38 @@ The C surface collapses to a thin I/O shim once the Curlee features land
    the hardware framebuffer at its boot-discovered runtime address. Issue
    #14 uses the full `phys_write_u8/u16/u32/u64` surface to fill the legacy
    vring structures (desc/avail/used) at their runtime 4096-aligned bases.
+   gh issue #20 then used the same `phys_write_u16` builtin to delete
+   `vga_text_clear.c` — the 0xB8000 text-buffer clear is a genuine Curlee
+   loop in `vga_setup.curlee`.
 3. **Bitwise ops + shifts** — unblocked big-endian packing, checksums,
    descriptor flags, and alignment math. Landed in the compiler ahead of
    issue #12, which used it to migrate the whole `net_stack.c` protocol core
    (byte layout, RFC 1071/793 checksums, the HTTP framing state machine) to
-   `net_stack.curlee` — only the raw-state shim remains in C. Issue #15 used
-   it for the `(size + 7) & ~7` tag-alignment math in `mb2.curlee`; issue
-   #14 uses it for the PCI config address assembly and the `(raw + 4095) &
-   ~4095` queue-base alignment in `virtio_net.curlee`.
+   `net_stack.curlee`. Issue #15 used it for the `(size + 7) & ~7`
+   tag-alignment math in `mb2.curlee`; issue #14 uses it for the PCI config
+   address assembly and the `(raw + 4095) & ~4095` queue-base alignment in
+   `virtio_net.curlee`.
 4. **Runtime-address physical reads (`phys_read_u8/u16/u32/u64`, curlee issue
-   #279)** — the last piece that unblocked the `mb2.c` tag walk: the
-   multiboot2 info structure lives at a RUNTIME address captured by the boot
-   stub, which a compile-time-literal `Phys<T>` cannot address. `mb2.curlee`
+   #279)** — the piece that unblocked the `mb2.c` tag walk: the multiboot2
+   info structure lives at a RUNTIME address captured by the boot stub,
+   which a compile-time-literal `Phys<T>` cannot address. `mb2.curlee`
    (issue #15) calls them inside `unsafe` with `cap phys.mem`, exactly like
    the `Phys<T>` reads. In the 2026-08 toolchain these became Curlee
    COMPILER BUILTINS (inline volatile loads — the `mb2_state.c` definitions
-   were deleted); a runtime-address physical write counterpart (also now a
-   builtin, `phys_write_u32`) additionally unblocks the `vga_text_clear.c`
-   raw memory move. Issue #14 uses them for the RX-frame byte reads and the
-   used-ring idx/elem reads in `virtio_net.curlee`.
+   were deleted); their runtime-address physical write counterpart
+   (`phys_write_u*`, curlee #285) is the builtin gh issue #20's
+   `vga_text_clear.c` deletion uses. Issue #14 uses them for the RX-frame
+   byte reads and the used-ring idx/elem reads in `virtio_net.curlee`.
 5. **Fixed-size arrays + statics + Int->U64 widening (curlee #278/#277)** —
    landed in the 2026-08 toolchain. `fb.curlee` (issue #13) moved the small
    mutable blitter state into Curlee `static` + `[T; N]` state; issue #14
    does the same for the whole driver state (rx_buf_state/rx_frame_len/
-   guest_mac/ring heads). The descriptor `addr` u64 field is built with the
-   `Int -> U64` widening for values < 2^32 (curlee #277).
+   guest_mac/ring heads). gh issue #20 used the same feature to delete
+   `vbe_state.c` and `net_stack.c` — the framebuffer state is Curlee statics
+   in `fb.curlee` (filled by `fb_state_set`), and the TCP one-shot state +
+   256-byte response store are Curlee statics in `net_glue.curlee`. The
+   descriptor `addr` u64 field is built with the `Int -> U64` widening for
+   values < 2^32 (curlee #277).
 
 Until then, **do not add new pure logic to C**. If a feature needs pure
 logic, write it as a Curlee module (even if the driver can't yet be

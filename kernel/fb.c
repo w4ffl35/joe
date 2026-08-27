@@ -6,31 +6,31 @@
 // (kernel/fb.curlee): the tool ring (tool_kinds/tool_args/tool_head/
 // tool_count), the loop counters (loop_frame/loop_drained), the ring
 // bookkeeping (ring_active/ring_slot) and the draw-target indirection
-// (fb_draw_target/fb_target_stride) are now Curlee `static` module state
+// (fb_draw_target/fb_target_stride) are Curlee `static` module state
 // (the toolchain gained static + [T; N] arrays). The runtime-address
-// physical-memory moves are now Curlee COMPILER BUILTINS (phys_write_u32 /
+// physical-memory moves are Curlee COMPILER BUILTINS (phys_write_u32 /
 // phys_read_u8/u32 — inline volatile stores/loads in the freestanding
-// codegen), so the C definitions of phys_write_u32 / fb_mem_read_u32 were
-// deleted.
+// codegen).
+//
+// gh issue #20: the framebuffer state (fb_addr/fb_pitch/fb_width/fb_height)
+// ALSO moved to Curlee — the four .data globals + the four fb_*_get getters
+// are DELETED. The state is Curlee statics in kernel/fb.curlee, filled by
+// its fb_state_set (called by kernel/mb2.curlee's mb2_parse and
+// kernel/vbe.curlee's vbe_probe) and read directly by the blitter.
 //
 // What remains here, and ONLY why (per docs/c-boundary-policy.md §1 — "No
 // logic in C — only I/O touches and raw memory moves"):
-//   - fb_addr/fb_pitch/fb_width/fb_height: C-visible .data globals filled by
-//     kernel/mb2_state.c and kernel/vbe_state.c (the multiboot2-tag / VBE-
-//     probe state shims); the Curlee blitter reads them through the 4
-//     getters below.
 //   - The two LARGE static buffers — the 128x128 asset region and the 2-slot
 //     640x480 frame ring — compiled OUT on the PVH build (JOE_PVH_BOOT):
 //     QEMU's `-kernel` PVH loader refuses ELFs whose LOAD segment (file +
 //     BSS) exceeds a hard budget (verified empirically in
 //     docs/phase2c-report.md §4.3: even a 64 KB static buffer makes the BIOS
-//     hang with no serial; the PVH kernel's BSS+stack is ~45 KB today).
-//     Curlee has no conditional compilation and BOTH builds compile the SAME
-//     merged kernel.c (scripts/build-kernel.sh), so a full-size Curlee
-//     static array would land in the PVH kernel's BSS unconditionally. The
-//     C `#ifndef JOE_PVH_BOOT` is the ONLY way to size them per build. This
-//     is the sole reason these two buffers stay in C; every other byte of
-//     the former shim moved to Curlee.
+//     hang with no serial). Curlee has no conditional compilation and BOTH
+//     builds compile the SAME merged kernel.c (scripts/build-kernel.sh), so
+//     a full-size Curlee static array would land in the PVH kernel's BSS
+//     unconditionally. The C `#ifndef JOE_PVH_BOOT` is the ONLY way to size
+//     them per build. This is the sole reason these two buffers stay in C;
+//     every other byte of the former shim moved to Curlee.
 //   - The compile-time build geometry (the ONLY #ifdefs left in this file):
 //     fb_pvh_build() (1 on the PVH build, 0 on the GRUB build) and the two
 //     base-address getters (fb_asset_region_base_get /
@@ -41,13 +41,6 @@
 // owner — the module whose mb2_info_addr_get reads it).
 
 #include <stdint.h>
-
-// Framebuffer state. Zero until the multiboot2 framebuffer tag (GRUB path)
-// or the Bochs VBE probe (PVH path) is parsed.
-unsigned int fb_addr = 0;
-unsigned int fb_pitch = 0;
-unsigned int fb_width = 0;
-unsigned int fb_height = 0;
 
 // ---------------------------------------------------------------------------
 // Phase 2c: static asset region + frame ring (no malloc anywhere)
@@ -130,13 +123,3 @@ long long fb_frame_ring_slot_base(long long slot)
     return 0;
 #endif
 }
-
-// ---------------------------------------------------------------------------
-// Framebuffer state getters (the Curlee blitter reads the globals through
-// these — mb2_state.c / vbe_state.c fill them).
-// ---------------------------------------------------------------------------
-
-long long fb_addr_get(void) { return (long long)fb_addr; }
-long long fb_pitch_get(void) { return (long long)fb_pitch; }
-long long fb_width_get(void) { return (long long)fb_width; }
-long long fb_height_get(void) { return (long long)fb_height; }

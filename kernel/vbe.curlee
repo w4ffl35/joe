@@ -29,16 +29,20 @@
 // LFB — no hardcoded/unvalidated LFB writes (an unmapped LFB faults the VM,
 // docs/phase2e-architecture.md §7 finding 4).
 //
-// Port note — what stayed in C (and why): the whole probe (port I/O, mode
-// programming, readback validation) ports directly — the same
-// port_outw/port_inw pattern as kernel/serial.curlee and
-// kernel/vga_setup.curlee. The framebuffer globals it fills are C-visible
-// .data state owned by kernel/fb.c (still C — the blitter), and Curlee has
-// no global variables and no way to address C globals, so the four stores
-// stay as a raw state shim in kernel/vbe_state.c (`vbe_state_set`) — the
-// second pillar of the C boundary policy (docs/c-boundary-policy.md §1:
-// "No logic in C — only I/O touches and raw memory moves."). Everything else
-// is genuine Curlee below.
+// Port note — what stayed in C (and why): NOTHING stays in C anymore (gh
+// issue #20). The whole probe (port I/O, mode programming, readback
+// validation) ports directly — the same port_outw/port_inw pattern as
+// kernel/serial.curlee and kernel/vga_setup.curlee. The framebuffer state it
+// fills was C-visible .data owned by kernel/fb.c, filled through the
+// kernel/vbe_state.c setter shim (`vbe_state_set`); that shim is DELETED —
+// the state is now Curlee statics in kernel/fb.curlee, filled through its
+// fb_state_set function (this module calls it below). Everything here is
+// genuine Curlee.
+//
+// Verification note (gh issue #20): this module calls fb.curlee's
+// fb_state_set, so it is verified via the MERGED kernel TU (`make check`),
+// not standalone — the net_glue.curlee precedent (the standalone check list
+// in the Makefile drops it).
 //
 // Port note — the C original's `goto validated`: Curlee has no goto, so the
 // shared validated tail is factored into `vbe_validated_fill` and reached
@@ -64,10 +68,10 @@
 //     and the merged kernel re-verifies it (`make check`).
 //   - Minimal footprint: no libc, no String/Vec; a flat register sequence.
 
-// Provided by kernel/vbe_state.c: fills the framebuffer globals
-// fb_addr/fb_pitch/fb_width/fb_height (C-visible .data owned by kernel/fb.c;
-// Curlee cannot address C globals — the one justified C residual, above).
-extern fn vbe_state_set(addr: Int, pitch: Int, width: Int, height: Int) -> Unit;
+// gh issue #20: the framebuffer state setter is a genuine Curlee function in
+// kernel/fb.curlee (fb_state_set — merged in before this module), replacing
+// the deleted kernel/vbe_state.c extern. The state itself is Curlee statics
+// in fb.curlee, read by the blitter directly.
 
 // The shared validated tail (the C original's `validated:` label): the LFB
 // base is the documented QEMU stdvga VBE LFB (0xFD000000 — verified on the
@@ -82,7 +86,7 @@ fn vbe_validated_fill() -> Int {
   if (lfb < 1048576 || lfb >= 4294967296) {   // 0x100000 .. 0x100000000
     return 0;
   }
-  vbe_state_set(lfb, 2560, 640, 480);   // 640 * 4 bytes per row
+  fb_state_set(lfb, 2560, 640, 480);   // 640 * 4 bytes per row
   return 1;
 }
 

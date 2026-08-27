@@ -5,14 +5,26 @@
 // The extern-heavy half of the former kernel/net_stack.c: genuine Curlee
 // functions replacing the C net_connect / net_send / net_stack_poll /
 // net_response_len / net_response_byte externs. The protocol byte math lives
-// in kernel/net_stack.curlee (pure, extern-free, VM-verified), the mutable
-// one-shot state + response byte store live in the C raw-state shim
-// (kernel/net_stack.c — net_state_*/net_resp_*/net_poll_*, the vbe_state.c
-// precedent), and THIS module is the only place the two meet (the
-// json_llm_bridge pattern). It is merged into the kernel TU before
-// kernel.curlee (scripts/build-kernel.sh) and is NOT verified standalone —
-// it calls net_stack.curlee's functions, so `curlee check` covers it via the
-// merged file (kernel.curlee's own standalone-verification note applies).
+// in kernel/net_stack.curlee (pure, extern-free, VM-verified), and — since
+// gh issue #20 — the mutable one-shot state + the 256-byte response body
+// store that the C raw-state shim (kernel/net_stack.c, deleted) used to own
+// are Curlee STATICS declared right here, with the net_state_*/net_resp_*/
+// net_poll_* externs replaced by genuine Curlee functions below (the
+// statics + [T; N] arrays feature, curlee #278 — the fb.curlee /
+// virtio_net.curlee pattern). THIS module is where the pure core meets the
+// mutable state (the json_llm_bridge pattern). It is merged into the kernel
+// TU before kernel.curlee (scripts/build-kernel.sh) and is NOT verified
+// standalone — it calls net_stack.curlee's functions, so `curlee check`
+// covers it via the merged file (kernel.curlee's own standalone-verification
+// note applies).
+//
+// State-owner note (gh issue #20): the C shim's PVH 1-byte response-store
+// stub (JOE_PVH_BOOT) is GONE — Curlee has no conditional compilation, so
+// the store is always 256 entries (2 KiB of BSS: [Int; 256] — well inside
+// the PVH LOAD budget, verified by the qemu-smoke gates). On the PVH path
+// net_probe() finds no NIC, so net_connect() never runs and every state
+// function keeps its zero default — identical observable behavior to the
+// old stub.
 //
 // Deterministic one-shot flow (LOCKED in issue #6 / docs/phase2d-wire.md §5):
 //   ARP: 1   net_connect() resolves gateway 10.0.2.2 -> MAC (by CONSTANT:
@@ -34,34 +46,152 @@
 
 // ---------------------------------------------------------------------------
 // Extern surface (declared HERE, once — the merged TU forbids duplicates):
-// the 2d-2 raw-state shim (kernel/net_stack.c). The 2d-1 NIC driver surface
-// (net_probe/net_init/net_link_up/net_rx_*/net_tx_*/net_mac_byte/
-// net_poll_tick/net_rx_wait/net_arp_request_gateway) is NOT declared here
-// anymore — since gh issue #14 it is implemented by GENUINE Curlee functions
-// in kernel/virtio_net.curlee (merged in before this module; codegen'd as the
-// static curlee_net_* symbols). This module calls them like any Curlee
-// function; the pm: cap phys.mem parameter (dropped by codegen) threads the
-// port/phys-memory capability the driver functions need. All return 0 / no-op
-// with no NIC present or on the PVH stub path.
+// NONE remain for the 2d-2 stack — the former raw-state shim externs
+// (net_state_*/net_resp_*/net_poll_*) are now the genuine Curlee functions
+// declared just below. The 2d-1 NIC driver surface (net_probe/net_init/
+// net_link_up/net_rx_*/net_tx_*/net_mac_byte/net_poll_tick/net_rx_wait/
+// net_arp_request_gateway) is NOT declared here either — since gh issue #14
+// it is implemented by GENUINE Curlee functions in kernel/virtio_net.curlee
+// (merged in before this module; codegen'd as the static curlee_net_*
+// symbols). This module calls them like any Curlee function; the
+// pm: cap phys.mem parameter (dropped by codegen) threads the port/phys-
+// memory capability the driver functions need. All return 0 / no-op with no
+// NIC present or on the PVH stub path.
 // ---------------------------------------------------------------------------
-// 2d-2 raw-state shim phase: 0 idle, 1 connected, 2 sent/in-flight,
-// 3 response ready, 4 failed (terminal).
-extern fn net_state_get() -> Int;
-extern fn net_state_reset(port: Int) -> Unit;
-extern fn net_state_connect(my_seq: Int, peer_seq: Int) -> Unit;
-extern fn net_state_sent() -> Unit;
-extern fn net_state_ready() -> Unit;
-extern fn net_state_failed() -> Unit;
-extern fn net_my_seq() -> Int;
-extern fn net_peer_seq() -> Int;
-extern fn net_dst_port() -> Int;
-extern fn net_resp_len() -> Int;              // stored body bytes (0 invalidated)
-extern fn net_resp_len_set(n: Int) -> Unit;   // n < 0 invalidates (truncated)
-extern fn net_resp_byte(i: Int) -> Int;       // byte i of the store (0 if OOB)
-extern fn net_resp_store(b: Int) -> Unit;     // append one body byte (bounded)
-extern fn net_poll_state() -> Int;            // packed http_step state (opaque)
-extern fn net_poll_state_set(st: Int) -> Unit;
-extern fn net_poll_fuel() -> Int;             // C-owned poll counter (bounded)
+// 2d-2 one-shot state (Curlee statics — gh issue #20; the former
+// kernel/net_stack.c raw-state shim is deleted). Mirrors the C shim's
+// fields exactly, with the same zero-initialized defaults and the same
+// semantics:
+//   - ns_state: 0 idle, 1 connected, 2 sent/in-flight, 3 response ready,
+//     4 failed (terminal).
+//   - ns_resp_body: the 256-byte response body byte store (wire-shape §3.2
+//     cap). [Int; 256] = 2 KiB of BSS — the C shim's PVH-conditional 1-byte
+//     stub is gone (Curlee has no conditional compilation; 2 KiB is well
+//     inside the PVH LOAD budget, verified by the qemu-smoke gates).
+//   - ns_resp_len: stored body bytes; < 0 invalidates (truncation path).
+//   - ns_http_state: the Curlee packed http_step state (opaque here).
+//   - ns_polls: net_stack_poll() fuel counter (bounds the Curlee poll loop).
+// ---------------------------------------------------------------------------
+static ns_state: Int = 0;
+static ns_my_seq: Int = 0;
+static ns_peer_seq: Int = 0;
+static ns_src_port: Int = 0;   // our ephemeral port (fixed 49152 on connect)
+static ns_dst_port: Int = 0;
+static ns_resp_len: Int = 0;   // stored body bytes; -1 = invalidated
+static ns_http_state: Int = 0; // Curlee packed http_step state (opaque)
+static ns_polls: Int = 0;      // net_stack_poll() fuel counter
+static ns_resp_body: [Int; 256] = [0; 256];   // response body byte store
+
+// One-shot phase: 0 idle, 1 connected, 2 sent/in-flight, 3 response ready,
+// 4 failed (terminal). The glue (kernel.curlee) owns the state machine; these
+// functions only store and report it (the C shim's exact surface, ported).
+fn net_state_get() -> Int {
+  return ns_state;
+}
+
+// Fresh one-shot: idle phase, src port 49152 (fixed ephemeral port — FIX 4,
+// 2d-2 review), dst port from the caller. The C shim truncated the port to
+// u16; the caller always passes 8080, so the direct Int store is identical.
+fn net_state_reset(port: Int) -> Unit {
+  ns_state = 0;
+  ns_my_seq = 0;
+  ns_peer_seq = 0;
+  ns_src_port = 49152;   // fixed ephemeral port (one-shot; FIX 4, 2d-2 review)
+  ns_dst_port = port;
+  ns_resp_len = 0;
+  ns_http_state = 0;
+  ns_polls = 0;
+  return;
+}
+
+// Handshake complete: record the sequence numbers and move to phase 1
+// (connected). The C shim narrowed to u32; the one-shot values
+// (0x10000000, peer ISN) always fit, so the direct Int stores are identical.
+fn net_state_connect(my_seq: Int, peer_seq: Int) -> Unit {
+  ns_my_seq = my_seq;
+  ns_peer_seq = peer_seq;
+  ns_state = 1;
+  return;
+}
+
+fn net_state_sent() -> Unit {
+  ns_state = 2;
+  return;
+}
+
+fn net_state_ready() -> Unit {
+  ns_state = 3;
+  return;
+}
+
+fn net_state_failed() -> Unit {
+  ns_state = 4;
+  return;
+}
+
+fn net_my_seq() -> Int {
+  return ns_my_seq;
+}
+
+fn net_peer_seq() -> Int {
+  return ns_peer_seq;
+}
+
+fn net_dst_port() -> Int {
+  return ns_dst_port;
+}
+
+// Stored body bytes; 0 when the store was invalidated (the truncation path
+// set ns_resp_len to -1), so a truncated body never masquerades as a valid
+// response (the C shim's semantics kept).
+fn net_resp_len() -> Int {
+  if (ns_resp_len < 0) {
+    return 0;
+  }
+  return ns_resp_len;
+}
+
+fn net_resp_len_set(n: Int) -> Unit {
+  ns_resp_len = n;
+  return;
+}
+
+// Byte i of the store (0 when invalidated, or out of range).
+fn net_resp_byte(i: Int) -> Int {
+  if (ns_resp_len < 0 || i < 0 || i >= ns_resp_len) {
+    return 0;
+  }
+  return ns_resp_body[i];
+}
+
+// Append one body byte. Bounded by the 256-byte cap and gated on the store
+// not being invalidated — the Curlee http_step already enforces the same
+// cap, so this is defense-in-depth (the C shim's exact bounds).
+fn net_resp_store(b: Int) -> Unit {
+  if (ns_resp_len >= 0 && ns_resp_len < 256) {
+    ns_resp_body[ns_resp_len] = b;
+    ns_resp_len = ns_resp_len + 1;
+  }
+  return;
+}
+
+// The packed http_step state slot (opaque here — the Curlee parser owns the
+// bit layout; this module only persists it across net_stack_poll calls).
+fn net_poll_state() -> Int {
+  return ns_http_state;
+}
+
+fn net_poll_state_set(st: Int) -> Unit {
+  ns_http_state = st;
+  return;
+}
+
+// Poll fuel: increments and returns the count (bounds the Curlee response
+// loop — mirrors the C shim's counter).
+fn net_poll_fuel() -> Int {
+  ns_polls = ns_polls + 1;
+  return ns_polls;
+}
 
 // (glue) 16-bit big-endian value at byte offset o of the held RX frame.
 fn rx_rd16(pm: cap phys.mem, o: Int) -> Int {

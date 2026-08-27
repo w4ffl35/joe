@@ -2,9 +2,10 @@
 //
 // net_stack.curlee — Phase 2d-2 TCP/IP stack: PURE protocol core (gh issue #12).
 //
-// This is the Curlee half of the former kernel/net_stack.c (1056 lines of C,
-// now reduced to a raw state/byte-store shim). Everything here is PURE and
-// extern-free:
+// This is the Curlee half of the former kernel/net_stack.c (1056 lines of C;
+// the raw state/byte-store shim it was reduced to is deleted in gh issue
+// #20 — the mutable state is Curlee statics in kernel/net_glue.curlee).
+// Everything here is PURE and extern-free:
 //   - big-endian 16/32-bit byte extraction (the ns_wr16/wr32/rd16/rd32
 //     pattern, bitwise — curlee issue #270)
 //   - the IPv4 header byte layout + Internet checksum (RFC 1071)
@@ -22,20 +23,20 @@
 //
 // WHY PURE (language constraints, verified against the compiler at this
 // workspace's commit sha=a8363761):
-//   - Curlee has NO module-level globals and NO function-static state: a
-//     function-local `let` resets on every call (verified: a counter returns
-//     1, not 2, across calls; codegen emits plain C locals). Cross-call state
-//     therefore cannot live in Curlee — it lives in the C shim
-//     (kernel/net_stack.c) and flows in/out through the net_state_* /
-//     net_resp_* externs declared in kernel.curlee.
-//   - Curlee has NO arrays (the fixed-size array feature, curlee #278, is NOT
-//     in this compiler build — `[T; N]` is rejected). The 512-byte TX frame,
-//     the 256-byte response body and the header scan buffer therefore cannot
-//     be Curlee data. The TX frame is replaced by per-offset byte functions
-//     (this module) staged one byte at a time through net_tx_stage_byte; the
-//     response body stays in a C raw byte store (net_resp_* externs); the
-//     header buffer is eliminated entirely by a streaming per-byte
-//     Content-Length matcher (the json.curlee per-byte state-machine idiom).
+//   - Cross-call mutable state does not belong here: the one-shot connection
+//     state + the 256-byte response body store are Curlee STATICS in
+//     kernel/net_glue.curlee (the toolchain's static + [T; N] arrays, curlee
+//     #278 — landed since this file's port; the kernel/net_stack.c raw-state
+//     shim they replaced is deleted in gh issue #20). This module stays
+//     extern-free and pure so the VM can drive it.
+//   - Arrays are avoided here for VM-testability (arrays are freestanding-
+//     only — `curlee run` rejects them), not because they are unavailable:
+//     the 512-byte TX frame is replaced by per-offset byte functions (this
+//     module) staged one byte at a time through net_tx_stage_byte; the
+//     response body lives in net_glue.curlee's static store (net_resp_*
+//     functions); the header buffer is eliminated entirely by a streaming
+//     per-byte Content-Length matcher (the json.curlee per-byte state-machine
+//     idiom).
 //   - No structs in fn signatures/returns (verified: `-> Pair` is rejected),
 //     so multi-value results are packed into one Int (the json.curlee packed-
 //     state pattern, but with bitwise shifts instead of multiply/divide).
@@ -44,12 +45,12 @@
 // checksums, byte layout and HTTP state machine with the EXACT wire bytes the
 // former C implementation emitted (kernel/net_stack_test.curlee asserts them;
 // the expected constants were captured from the C code with a host harness).
-// kernel/net_glue.curlee (merged after this module) supplies the extern-heavy
-// glue — genuine Curlee net_connect/net_send/net_stack_poll/
-// net_response_len/net_response_byte — and kernel/net_stack.c is reduced to a
-// raw state/byte-store shim (net_state_*/net_resp_*/net_poll_* externs).
-// scripts/run-net-stack-codegen.sh host-tests the glue + this core against a
-// scripted NIC (the json-codegen-run precedent).
+// kernel/net_glue.curlee (merged after this module) supplies the glue — the
+// genuine Curlee net_connect/net_send/net_stack_poll/net_response_len/
+// net_response_byte — and owns the mutable one-shot state + response byte
+// store as Curlee statics (gh issue #20). scripts/run-net-stack-codegen.sh
+// host-tests the glue + this core against a scripted NIC (the json-codegen-
+// run precedent).
 //
 // Bit layout of the HTTP response state (one packed Int; see http_step):
 //   bit 0      hdr_done (1 = header phase over, body phase active)
