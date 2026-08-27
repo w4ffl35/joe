@@ -29,14 +29,13 @@
 //     #278 — landed since this file's port; the kernel/net_stack.c raw-state
 //     shim they replaced is deleted in gh issue #20). This module stays
 //     extern-free and pure so the VM can drive it.
-//   - Arrays are avoided here for VM-testability (arrays are freestanding-
-//     only — `curlee run` rejects them), not because they are unavailable:
-//     the 512-byte TX frame is replaced by per-offset byte functions (this
-//     module) staged one byte at a time through net_tx_stage_byte; the
-//     response body lives in net_glue.curlee's static store (net_resp_*
-//     functions); the header buffer is eliminated entirely by a streaming
-//     per-byte Content-Length matcher (the json.curlee per-byte state-machine
-//     idiom).
+//   - The 512-byte TX frame is built into a real fixed-size [U8; 512] array
+//     (tcp_frame_byte, curlee #300 — the VM now runs arrays, so the old
+//     per-offset if/else chain is gone) and staged one byte at a time through
+//     net_tx_stage_byte; the response body lives in net_glue.curlee's static
+//     store (net_resp_* functions); the header buffer is eliminated entirely
+//     by a streaming per-byte Content-Length matcher (the json.curlee
+//     per-byte state-machine idiom).
 //   - No structs in fn signatures/returns (verified: `-> Pair` is rejected),
 //     so multi-value results are packed into one Int (the json.curlee packed-
 //     state pattern, but with bitwise shifts instead of multiply/divide).
@@ -1317,55 +1316,105 @@ fn gw_mac_byte(k: Int) -> Int {
 //   The C ns_tcp_send_segment additionally padded frames shorter than the
 //   60-byte Ethernet minimum; use tcp_frame_pad_byte (below) for the exact
 //   wire bytes.
-// Pure and total: out-of-range i returns 0. VM-asserted in
-// net_stack_test.curlee probe 11 (SYN/REQ frame bytes, the C ground truth).
+// Built into a real fixed-size [U8; 512] TX-frame buffer (curlee #300 — the
+// per-offset if/else chain this replaces) and indexed at i; the zero-filled
+// tail IS the OOB 0, exactly like the old chain's default. payload_len is
+// bounded by the 512-byte buffer (54 + payload_len <= 512); out-of-range i
+// returns 0 (pure and total). VM-asserted in net_stack_test.curlee probe 11
+// (SYN/REQ frame bytes, the C ground truth).
 fn tcp_frame_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int, m5: Int,
                   src_port: Int, dst_port: Int, seq: Int, ack: Int, flags: Int,
-                  payload_len: Int, ck: Int) -> Int {
+                  payload_len: Int, ck: Int) -> Int
+  [ requires payload_len >= 0 && payload_len <= 458; ]
+{
+  let f: [U8; 512] = [0; 512];
   let tcp_len: Int = 20 + payload_len;
   let ick: Int = ip_checksum(tcp_len);
-  if (i < 6) {
-    return gw_mac_byte(i);
-  } else {
-    if (i < 12) {
-      if (i == 6) {
-        return m0;
-      } else {
-        if (i == 7) {
-          return m1;
-        } else {
-          if (i == 8) {
-            return m2;
-          } else {
-            if (i == 9) {
-              return m3;
-            } else {
-              if (i == 10) {
-                return m4;
-              } else {
-                return m5;
-              }
-            }
-          }
-        }
-      }
-    } else {
-      if (i < 14) {
-        if (i == 12) {
-          return 8;   // ethertype 0x0800: high byte
-        } else {
-          return 0;
-        }
-      } else {
-        if (i < 34) {
-          return ip_byte_frame(i - 14, tcp_len, ick);
-        } else {
-          return tcp_seg_byte(i - 34, src_port, dst_port, seq, ack, flags,
-                              payload_len, ck);
-        }
-      }
-    }
+  // Ethernet II (14 bytes): gw MAC dst, guest MAC src, ethertype 0x0800.
+  f[0] = 82;    // 0x52
+  f[1] = 85;    // 0x55
+  f[2] = 10;    // 0x0A
+  f[3] = 0;
+  f[4] = 2;
+  f[5] = 2;
+  f[6] = m0;
+  f[7] = m1;
+  f[8] = m2;
+  f[9] = m3;
+  f[10] = m4;
+  f[11] = m5;
+  f[12] = 8;
+  f[13] = 0;
+  // IPv4 header (20 bytes; the ip_byte_ck layout with the checksum filled).
+  f[14] = 69;   // 0x45: v4 + 5 words
+  f[15] = 0;    // DSCP/ECN
+  f[16] = (20 + tcp_len) >> 8 & 255;
+  f[17] = (20 + tcp_len) & 255;
+  f[18] = 18;   // 0x1234 identification: high
+  f[19] = 52;   // 0x1234: low
+  f[20] = 64;   // 0x4000 flags DF: high
+  f[21] = 0;
+  f[22] = 64;   // TTL
+  f[23] = 6;    // proto TCP
+  f[24] = (ick >> 8) & 255;
+  f[25] = ick & 255;
+  f[26] = 10;   // src IP 10.0.2.15
+  f[27] = 0;
+  f[28] = 2;
+  f[29] = 15;
+  f[30] = 10;   // dst IP 10.0.2.2
+  f[31] = 0;
+  f[32] = 2;
+  f[33] = 2;
+  // TCP segment (20-byte header; the tcp_seg_byte layout) + the payload.
+  // (The verifier quirk: call results are bound to `let`s before use.)
+  let sp_hi: Int = be16_hi(src_port);
+  let sp_lo: Int = be16_lo(src_port);
+  let dp_hi: Int = be16_hi(dst_port);
+  let dp_lo: Int = be16_lo(dst_port);
+  let seq0: Int = be32_k(seq, 0);
+  let seq1: Int = be32_k(seq, 1);
+  let seq2: Int = be32_k(seq, 2);
+  let seq3: Int = be32_k(seq, 3);
+  let ack0: Int = be32_k(ack, 0);
+  let ack1: Int = be32_k(ack, 1);
+  let ack2: Int = be32_k(ack, 2);
+  let ack3: Int = be32_k(ack, 3);
+  let ck_hi: Int = be16_hi(ck);
+  let ck_lo: Int = be16_lo(ck);
+  f[34] = sp_hi;
+  f[35] = sp_lo;
+  f[36] = dp_hi;
+  f[37] = dp_lo;
+  f[38] = seq0;
+  f[39] = seq1;
+  f[40] = seq2;
+  f[41] = seq3;
+  f[42] = ack0;
+  f[43] = ack1;
+  f[44] = ack2;
+  f[45] = ack3;
+  f[46] = 80;   // data offset 5 (5 << 4)
+  f[47] = flags;
+  f[48] = 255;  // window 0xFFFF
+  f[49] = 255;
+  f[50] = ck_hi;
+  f[51] = ck_lo;
+  f[52] = 0;    // urgent pointer
+  f[53] = 0;
+  let j: Int = 0;
+  while (j < payload_len) {
+    let pb: Int = req_payload_byte(j);
+    f[54 + j] = pb;
+    j = j + 1;
   }
+  if (i < 0) {
+    return 0;
+  }
+  if (i >= 512) {
+    return 0;
+  }
+  return f[i] + 0;
 }
 
 // Byte i of the PADDED wire frame — the C ns_tcp_send_segment padded any
@@ -1376,7 +1425,9 @@ fn tcp_frame_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int, m5: Int,
 // 0..send_len-1 with tcp_frame_pad_byte gives EXACTLY the C's wire bytes.
 fn tcp_frame_pad_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int,
                       m5: Int, src_port: Int, dst_port: Int, seq: Int,
-                      ack: Int, flags: Int, payload_len: Int, ck: Int) -> Int {
+                      ack: Int, flags: Int, payload_len: Int, ck: Int) -> Int
+  [ requires payload_len >= 0 && payload_len <= 458; ]
+{
   let flen: Int = 54 + payload_len;
   if (i < flen) {
     return tcp_frame_byte(i, m0, m1, m2, m3, m4, m5, src_port, dst_port, seq,
