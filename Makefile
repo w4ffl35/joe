@@ -45,7 +45,6 @@ JSON_TEST     := kernel/json_test.curlee
 NET_STACK_TEST := kernel/net_stack_test.curlee
 BOOT_ASM      := kernel/boot.S
 MB2_SRC       := kernel/mb2.curlee
-MB2_STATE_C   := kernel/mb2_state.c
 LINKER_GRUB   := scripts/linker-grub.ld
 MERGE_SCRIPT  := scripts/build-kernel.sh
 
@@ -112,7 +111,7 @@ $(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
-$(KERNEL_ELF): $(MERGED_SRC) $(MB2_STATE_C)
+$(KERNEL_ELF): $(MERGED_SRC)
 	@mkdir -p $(BUILD_DIR)
 	# PVH path (qemu -kernel): the large Curlee buffers (asset region, frame
 	# ring, net ring/buffer memory) are sized to 1-element stubs by the PVH
@@ -123,20 +122,19 @@ $(KERNEL_ELF): $(MERGED_SRC) $(MB2_STATE_C)
 	# flip actually runs (gh issue #296).
 	$(CURLEE) build --target freestanding-c $(PVH_DEFINES) -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel.o
-	# gh issue #15 + #20: the multiboot2 tag walk is Curlee (kernel/mb2.curlee,
-	# merged into kernel.c above). The only C residual is the raw-state shim
-	# (kernel/mb2_state.c): mb2_info_addr_get (reads boot.S's .data global —
-	# a C-level linkage requirement: boot.S is 32-bit assembly writing a
-	# strong .data definition over the weak default, which a file-local Curlee
-	# static cannot express). The framebuffer state the parse fills is Curlee
-	# statics in fb.curlee (fb_state_set) — the mb2_state_set setter and the
-	# vbe_state.c shim were deleted in gh issue #20, and the runtime-address
-	# phys_read_u8/u32 reads are Curlee compiler builtins (curlee #279).
-	# Linked into every ELF because curlee_main -> curlee_mb2_parse references
-	# mb2_info_addr_get in ALL builds (mb2_parse is always called on the GRUB
-	# path; on the PVH path the info addr reads 0 and the parse no-ops — the
-	# symbol must resolve).
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_STATE_C) -o $(BUILD_DIR)/mb2_state.o
+	# gh issue #15 + #20 + #31: the multiboot2 tag walk is Curlee
+	# (kernel/mb2.curlee, merged into kernel.c above) — the C residual is
+	# GONE. The boot-handoff info pointer is now a Curlee extern static
+	# (`extern static mb2_info_addr: Int = 0;` in mb2.curlee, curlee #297):
+	# the codegen emits it as a plain `int64_t mb2_info_addr = 0;` global
+	# (external linkage, verbatim name) inside kernel.c, so kernel/mb2_state.c
+	# (weak .data global + mb2_info_addr_get) is DELETED and nothing C links
+	# for it. On this PVH path no boot stub writes the symbol, so it stays at
+	# its 0 default and mb2_parse no-ops; the GRUB path (kernel-grub.elf)
+	# links boot.S, whose `movl %ebx, mb2_info_addr` stores into the same
+	# codegen global. The framebuffer state the parse fills is Curlee statics
+	# in fb.curlee (fb_state_set); the runtime-address phys_read_u8/u32 reads
+	# are Curlee compiler builtins (curlee #279).
 	# Phase 2f: Bochs VBE probe — ported to Curlee in gh issue #11
 	# (kernel/vbe.curlee, merged into kernel.c above). No C residual remains
 	# (gh issue #20): the framebuffer state it fills is Curlee statics in
@@ -157,7 +155,6 @@ $(KERNEL_ELF): $(MERGED_SRC) $(MB2_STATE_C)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
 	  $(BUILD_DIR)/kernel.o \
-	  $(BUILD_DIR)/mb2_state.o \
 	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 	@echo "Built $@"
@@ -274,7 +271,7 @@ iso: $(ISO)
 # deleted).
 #
 # The 64-bit PVH/QEMU path (kernel.elf via crt0.S) is completely unchanged.
-$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(MB2_STATE_C) $(LIBGCC32_HELPERS_C) $(NET_H) $(LINKER_GRUB)
+$(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(LIBGCC32_HELPERS_C) $(NET_H) $(LINKER_GRUB)
 	@mkdir -p $(BUILD_DIR)
 	# GRUB/ISO path (gh issue #296): the GRUB --define set (JOE_PVH_BOOT=0)
 	# sizes the Curlee buffers to the FULL geometry — 128x128 asset region,
@@ -283,15 +280,18 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(MB2_STATE_C) $(LIBGCC3
 	# kernel/virtio_net.c are DELETED; nothing C links for them.
 	$(CURLEE) build --target freestanding-c $(GRUB_DEFINES) -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
 	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel.c -o $(BUILD_DIR)/kernel-grub.o
-	# gh issue #15 + #20: the multiboot2 tag walk is Curlee (kernel/mb2.curlee,
-	# merged into kernel.c). The raw-state shim (kernel/mb2_state.c —
-	# mb2_info_addr_get only) links here too; on THIS path it is the LIVE one
-	# (boot.S fills mb2_info_addr from %ebx and mb2_parse finds the
-	# framebuffer tag — the GRUB acceptance path). The framebuffer state the
-	# parse fills is Curlee statics in fb.curlee (fb_state_set — the former
-	# mb2_state_set setter is deleted, gh issue #20); the phys_read_u8/u32
-	# reads are Curlee compiler builtins.
-	$(CC) -m32 -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_STATE_C) -o $(BUILD_DIR)/mb2_state.o
+	# gh issue #15 + #20 + #31: the multiboot2 tag walk is Curlee
+	# (kernel/mb2.curlee, merged into kernel.c) — the raw-state shim is GONE.
+	# The boot-handoff info pointer is a Curlee extern static in mb2.curlee
+	# (`extern static mb2_info_addr: Int = 0;`, curlee #297): the codegen in
+	# kernel-grub.o defines the plain `int64_t mb2_info_addr` global, and
+	# boot.S's `movl %ebx, mb2_info_addr` / `movl $0, mb2_info_addr + 4`
+	# stores into it AFTER zeroing .bss (the zero-initialized global lands in
+	# .bss — a store before the zeroing would be wiped). This is the LIVE
+	# path: mb2_parse finds the framebuffer tag (the GRUB acceptance path).
+	# The framebuffer state the parse fills is Curlee statics in fb.curlee
+	# (fb_state_set — the former mb2_state_set setter is deleted, gh issue
+	# #20); the phys_read_u8/u32 reads are Curlee compiler builtins.
 	# Phase 2d-1 (gh issue #296): the VirtIO-net driver is GENUINE Curlee with
 	# the full option-2 rings (the GRUB define set) — this is where
 	# qemu-net-smoke boots. The former ring/buffer shim (kernel/virtio_net.c)
@@ -308,7 +308,6 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(MB2_STATE_C) $(LIBGCC3
 	$(AS) --32 $(BOOT_ASM) -o $(BUILD_DIR)/boot.o
 	$(LD) -m elf_i386 -nostdlib -static -T $(LINKER_GRUB) \
 	  $(BUILD_DIR)/kernel-grub.o \
-	  $(BUILD_DIR)/mb2_state.o \
 	  $(BUILD_DIR)/libgcc32.o $(BUILD_DIR)/rt.o $(BUILD_DIR)/boot.o \
 	  -o $@
 	@echo "Built $@ (GRUB multiboot2, 32-bit entry)"
@@ -370,12 +369,12 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	# kernel/virtio_net.c are DELETED; nothing C links for them.
 	$(CURLEE) build --target freestanding-c $(PVH_DEFINES) -o $(BUILD_DIR)/kernel-smoke.c $(MERGED_SRC)
 	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -Iruntime -c $(BUILD_DIR)/kernel-smoke.c -o $(BUILD_DIR)/kernel-smoke.o
-	# gh issue #15 + #20: the multiboot2 tag walk is Curlee (merged into
-	# kernel-smoke.c); only the raw-state shim is C (mb2_info_addr_get — see
-	# the kernel.elf rule). The framebuffer state it fills is Curlee statics
-	# in fb.curlee (fb_state_set); the phys_read_u8/u32 reads are Curlee
-	# compiler builtins.
-	$(CC) -ffreestanding -fno-builtin -nostdlib -std=c11 -c $(MB2_STATE_C) -o $(BUILD_DIR)/mb2_state.o
+	# gh issue #15 + #20 + #31: the multiboot2 tag walk is Curlee (merged
+	# into kernel-smoke.c) and the boot-handoff info pointer is a Curlee
+	# extern static in mb2.curlee (curlee #297) — no mb2 C shim links
+	# anywhere (see the kernel.elf rule). The framebuffer state it fills is
+	# Curlee statics in fb.curlee (fb_state_set); the phys_read_u8/u32 reads
+	# are Curlee compiler builtins.
 	# Phase 2d-2 (gh issue #12): TCP/IP stack — the one-shot state + response
 	# store are Curlee statics in net_glue.curlee (gh issue #20), so nothing
 	# C links here; on the no-NIC-safe smoke gates the glue's net_link_up()
@@ -385,7 +384,6 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 	$(CC) -ffreestanding -fno-builtin -nostdlib -c $(CURLEE_RT)/crt0.S -o $(BUILD_DIR)/crt0.o
 	$(LD) -nostdlib -T $(CURLEE_RT)/linker.ld \
 	  $(BUILD_DIR)/kernel-smoke.o \
-	  $(BUILD_DIR)/mb2_state.o \
 	  $(BUILD_DIR)/rt.o $(BUILD_DIR)/crt0.o \
 	  -o $@
 
@@ -611,14 +609,19 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	# curlee_fb_state_set symbol); the former vbe_state.c shim is deleted and
 	# no C symbol links.
 	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_state_set$$' && echo "PASS: curlee_fb_state_set linked (Curlee framebuffer-state setter, gh issue #20)"
-	# gh issue #15 + #20: the multiboot2 tag walk is now GENUINE Curlee
+	# gh issue #15 + #20 + #31: the multiboot2 tag walk is now GENUINE Curlee
 	# (ported from kernel/mb2.c) — the codegen emits it as curlee_mb2_parse,
-	# and the raw-state shim (kernel/mb2_state.c: mb2_info_addr_get only — the
-	# mb2_state_set setter is deleted, gh issue #20) must be linked for the
-	# boot.S interposition. The runtime-address reads (phys_read_u8/u32) are
-	# Curlee compiler builtins (inline volatile loads — no C symbol).
+	# and the boot-handoff info pointer is a Curlee extern static
+	# (kernel/mb2.curlee's `extern static mb2_info_addr: Int = 0;`, curlee
+	# #297): the codegen emits the plain `int64_t mb2_info_addr` global
+	# (external linkage, verbatim name) in kernel.o — the kernel/mb2_state.c
+	# shim (weak .data global + mb2_info_addr_get) is DELETED (gh issue #31),
+	# so no C object provides the symbol. On this PVH build it stays at its 0
+	# default (no boot.S); on the GRUB build boot.S stores %ebx into it. The
+	# runtime-address reads (phys_read_u8/u32) are Curlee compiler builtins
+	# (inline volatile loads — no C symbol).
 	@nm $(KERNEL_ELF) | grep -q ' curlee_mb2_parse$$' && echo "PASS: curlee_mb2_parse linked (multiboot2 parser, gh issue #15)"
-	@nm $(KERNEL_ELF) | grep -q ' mb2_info_addr_get$$' && echo "PASS: mb2_info_addr_get linked (mb2 state shim)"
+	@nm $(KERNEL_ELF) | grep -q ' mb2_info_addr$$' && echo "PASS: mb2_info_addr linked (Curlee extern static, gh issue #31)"
 	@echo "All verification gates passed."
 
 clean:

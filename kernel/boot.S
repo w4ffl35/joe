@@ -16,9 +16,10 @@
 //     with %ebx = trusted info pointer (the documented case), flat segments
 //     (CS/DS base 0, limit 0xFFFFFFFF) and paging disabled.
 //
-// This stub captures %ebx into the .data global mb2_info_addr (which
-// kernel/mb2.curlee's mb2_parse reads through kernel/mb2_state.c's
-// mb2_info_addr_get to find the framebuffer tag — gh issue #15), zeroes .bss,
+// This stub captures %ebx into the global mb2_info_addr (which
+// kernel/mb2.curlee's mb2_parse reads directly — the extern static declared
+// there, gh issue #31; the old kernel/mb2_state.c shim + mb2_info_addr_get
+// are deleted — to find the framebuffer tag — gh issue #15), zeroes .bss,
 // sets the stack, calls curlee_main, and halts. No GDT or page tables are
 // needed: the
 // multiboot2 handoff already provides flat 32-bit segments with paging off,
@@ -66,15 +67,12 @@ multiboot2_header_end:
 .type _start, @function
 .code32
 _start:
-    /* 0. Save the multiboot2 info pointer (%ebx, spec-guaranteed for 32-bit
-          entries) into the .data global mb2_info_addr. Explicitly zero the
-          high dword: never trust memory initializers before we have written
-          them ourselves (GRUB's ELF loading of .data is not assumed). */
-    movl %ebx, mb2_info_addr
-    movl $0, mb2_info_addr + 4
-
-    /* 1. Zero .bss. __bss_start/__bss_end are absolute symbols from
-          linker.ld; the size is computed at link time. */
+    /* 0. Zero .bss. __bss_start/__bss_end are absolute symbols from
+          linker-grub.ld; the size is computed at link time. This MUST run
+          before the %ebx store below: the codegen's extern-static global
+          mb2_info_addr (kernel/mb2.curlee, gh issue #31) is
+          zero-initialized, so gcc places it in .bss — a store before this
+          loop would be wiped by it. */
     movl $__bss_start, %edi
     movl $__bss_end, %ecx
     subl %edi, %ecx              /* ecx = bss size in bytes */
@@ -86,6 +84,18 @@ _start:
     decl %ecx
     jmp 1b
 2:
+    /* 1. Save the multiboot2 info pointer (%ebx, spec-guaranteed for 32-bit
+          entries) into the global mb2_info_addr. Explicitly zero the high
+          dword: never trust memory initializers before we have written them
+          ourselves (GRUB's ELF loading of .data is not assumed). The symbol
+          is DEFINED by the Curlee codegen (kernel/mb2.curlee's
+          `extern static mb2_info_addr: Int = 0;` — a plain int64_t global
+          under this exact name, no curlee_ mangle, curlee #297); the old
+          weak .data definition in kernel/mb2_state.c is deleted (gh issue
+          #31), so this object only REFERENCES the symbol. */
+    movl %ebx, mb2_info_addr
+    movl $0, mb2_info_addr + 4
+
     /* 2. Stack pointer to the top of the reserved stack region. */
     movl $__stack_top, %esp
     xorl %ebp, %ebp              /* clear frame pointer */
@@ -99,16 +109,5 @@ _start:
 3:  hlt
     jmp 3b
 .size _start, . - _start
-
-/* .data global holding the multiboot2 info pointer (set from %ebx above;
-   read by kernel/mb2_state.c's mb2_info_addr_get as unsigned long long —
-   gh issue #15). The weak default in kernel/fb.c (0, for the PVH path) is
-   overridden by this strong definition on the GRUB/ISO path. */
-.section .data
-.global mb2_info_addr
-.balign 8
-mb2_info_addr:
-    .quad 0
-.size mb2_info_addr, 8
 
 .section .note.GNU-stack, "", @progbits
