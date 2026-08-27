@@ -30,7 +30,6 @@ MAX_LINES=200
 # drivers that predate the policy. They are exempt from the line cap until
 # migration (Curlee gains assignment + bitwise + port I/O).
 GRANDFATHERED=(
-  "virtio_net.c"  # 798 lines — ring math, migrate with assignment+port I/O
   "libgcc32.c"    # 322 lines — GCC ABI shim, NEVER migrates
 )
 

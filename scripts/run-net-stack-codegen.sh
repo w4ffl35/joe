@@ -68,19 +68,41 @@ PROBE="$BUILD/net_stack_codegen_probe.curlee"
   grep -v '^// SPDX-License-Identifier:' "$ROOT/kernel/net_glue.curlee"
   cat <<'EOF'
 
+// The 2d-1 NIC driver surface. gh issue #14: kernel/net_glue.curlee no longer
+// declares these (they are GENUINE Curlee functions in kernel/virtio_net.curlee
+// in the kernel TU), so this probe re-declares them for the host harness to
+// MOCK — this harness tests the GLUE, not the driver (the driver itself is
+// verified by `make check` + the qemu-net-smoke live gate). The signatures
+// mirror the real driver (pm: cap phys.mem first); the codegen drops pm, so
+// the harness's plain C mocks (net_rx_byte(long long i) etc.) still match.
+extern fn net_probe(pm: cap phys.mem) -> Int;
+extern fn net_init(pm: cap phys.mem) -> Int;
+extern fn net_link_up() -> Int;
+extern fn net_rx_len(pm: cap phys.mem) -> Int;
+extern fn net_rx_byte(pm: cap phys.mem, i: Int) -> Int;
+extern fn net_rx_done(pm: cap phys.mem) -> Unit;
+extern fn net_tx_stage_byte(pm: cap phys.mem, i: Int, b: Int) -> Int;
+extern fn net_tx_send(pm: cap phys.mem, len: Int) -> Int;
+extern fn net_mac_byte(i: Int) -> Int;
+extern fn net_poll_tick(pm: cap phys.mem) -> Int;
+extern fn net_rx_wait(pm: cap phys.mem) -> Int;
+extern fn net_arp_request_gateway(pm: cap phys.mem) -> Int;
+
 // The round-trip drive (mirrors kernel.curlee's net_llm_roundtrip + the 2d-3
 // body read): connect to 8080, send the fixed 36-byte request, poll until the
 // response body is ready, then read it back. Returns a UNIQUE non-zero code
-// per failed step so the harness can pinpoint a break.
-fn main() -> Int {
-  let c: Int = net_connect(8080);
+// per failed step so the harness can pinpoint a break. `pm` is dropped by the
+// codegen (the glue functions compile to plain C signatures — the harness's
+// curlee_main() call is unchanged).
+fn main(pm: cap phys.mem) -> Int {
+  let c: Int = net_connect(pm, 8080);
   if (c != 1) { return 1; }
-  let s: Int = net_send(36);
+  let s: Int = net_send(pm, 36);
   if (s != 1) { return 2; }
   let p: Int = 0;
   let guard: Int = 0;
   while (guard < 64) {
-    let r: Int = net_stack_poll();
+    let r: Int = net_stack_poll(pm);
     if (r != 0) {
       p = r;
       guard = 64;

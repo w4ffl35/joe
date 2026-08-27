@@ -3,10 +3,14 @@
 // net.h — shared net constants + RX/TX buffer API for the Phase 2d bridge.
 //
 // Single source of truth for the byte-buffer contract between the NIC driver
-// (2d-1, kernel/virtio_net.c) and the TCP layer (2d-2, future). The Curlee
-// window into this API is declared in kernel/kernel.curlee with the exact
-// extern names below; this header is the C side (implemented by
-// virtio_net.c, consumed by 2d-2).
+// (2d-1) and the TCP layer (2d-2). Since gh issue #14 the driver is GENUINE
+// Curlee (kernel/virtio_net.curlee — codegen'd as the static curlee_net_*
+// symbols; kernel/virtio_net.c is reduced to a ring/buffer shim that no
+// longer implements these), and the Curlee window into the API is the same
+// function set as the externs declared below (threaded with `pm: cap
+// phys.mem` in Curlee, dropped by codegen). The declarations below remain as
+// the C-visible contract documentation; the 2d-2 stack consumes the surface
+// through kernel/net_glue.curlee.
 //
 // RX handoff (fixed-slot, driver -> stack):
 //   net_rx_len()          bytes in the CURRENT held RX frame (0 = none)

@@ -13,13 +13,18 @@ Curlee into the pure, verified Curlee layer.
 
 C exists for exactly two reasons in JOE:
 
-1. **I/O ports** — `outb`/`inb`/`outw`/`inw`/`outl`/`inl` and the inline-asm
-   wrappers (`virtio_net.c`). `putc_driver.c` was the first migration (COM1
-   driver → `serial.curlee`, issue #9); `vga_setup.c` was the second: the
-   24-write VGA text-mode-3 register sequence is now a genuine Curlee
-   function (`vga_setup.curlee`, issue #10); `vbe.c` was the third: the
-   whole Bochs VBE probe (ports 0x1CE/0x1CF) is now a genuine Curlee
-   function (`vbe.curlee`, issue #11).
+1. **I/O ports** — `outb`/`inb`/`outw`/`inw`/`outl`/`inl` are now Curlee
+   compiler builtins (inline x86 in/out asm in the freestanding codegen).
+   `putc_driver.c` was the first migration (COM1 driver → `serial.curlee`,
+   issue #9); `vga_setup.c` was the second: the 24-write VGA text-mode-3
+   register sequence is now a genuine Curlee function (`vga_setup.curlee`,
+   issue #10); `vbe.c` was the third: the whole Bochs VBE probe (ports
+   0x1CE/0x1CF) is now a genuine Curlee function (`vbe.curlee`, issue #11);
+   `virtio_net.c` was the last (issue #14): the entire 798-line VirtIO-net
+   driver — PCI config-space probe, legacy virtqueue setup, RX/TX, frame
+   I/O — is now `virtio_net.curlee`, with only the PVH-conditional
+   ring/buffer memory + the base-address getters + the sfence left in C
+   (see §3).
 2. **Raw memory moves** — volatile framebuffer writes, ring DMA, and the
    mutable driver *state* (frame counter, ring indices) that the Curlee layer
    does not express (no globals, no arrays). The 0xB8000 text-buffer clear
@@ -101,8 +106,22 @@ The current offenders (grandfathered, tracked for migration):
 
 | File | Lines | Pure-logic estimate | Migrate when |
 |---|---|---|---|
-| `virtio_net.c` | 798 | ~300 (ring math) | Curlee gains assignment + port I/O |
 | `libgcc32.c` | 322 | 0 (compiler shim) | never (GCC ABI) |
+
+(`virtio_net.c` is gone from this table: its 798 lines — PCI config-space
+scanning, legacy virtqueue setup, RX/TX ring math, frame I/O — migrated to
+`virtio_net.curlee` in issue #14, leaving a ~90-line raw ring/buffer shim in
+the exempt category above: the two large PVH-conditional buffer groups
+(5-page qmem + 2x2048 data buffers per queue, compiled OUT on the PVH build
+exactly like `fb.c`'s asset region / frame ring — Curlee has no conditional
+compilation and both builds compile the same merged kernel.c), the four
+base-address getters that let the Curlee layer address the C-owned buffers as
+runtime addresses (the `fb_asset_region_base_get` pattern), the
+`virtio_net_pvh_build` discriminator, and the `virtio_net_sfence` ring-
+publication fence. The "address-of a Curlee-owned array" language gap the
+port originally depended on was sidestepped by this buffer-owner pattern —
+the buffers must be C-owned for the PVH-size reason, and their addresses flow
+into Curlee through the getter externs.)
 
 (`net_stack.c` is gone from this table: its ~700 lines of protocol logic
 migrated to `net_stack.curlee` + the kernel.curlee glue in issue #12, and
@@ -121,33 +140,40 @@ buffers + the base-address getters) in the exempt category above.)
 
 ## 4. Migration roadmap (what unblocks what)
 
-The C surface collapses to a thin I/O shim once three Curlee features land
+The C surface collapses to a thin I/O shim once the Curlee features land
 (tracked as GitHub issues in `w4ffl35/curlee`):
 
 1. **Assignment / affine mutation** — unblocked `fb.c`'s blitter loops (the
    pixel primitives, Bresenham, the tool-call queue and the loop control
-   migrated to `fb.curlee` in issue #13) and remains the unlock for the
-   state machines in `virtio_net.c`. (The `mb2.c` tag walk used this — the
-   mutable cursor in `mb2.curlee`, issue #15.)
-2. **Port I/O (`outb`/`inb`/`outw`/`inw`/`outl`/`inl`)** — unblocks the
+   migrated to `fb.curlee` in issue #13) and the state machines in
+   `virtio_net.c` (migrated in issue #14: every ring loop, the PCI probe
+   walk, and the RX/TX state are Curlee assignment + statics). (The `mb2.c`
+   tag walk used this — the mutable cursor in `mb2.curlee`, issue #15.)
+2. **Port I/O (`outb`/`inb`/`outw`/`inw`/`outl`/`inl`)** — unblocked the
    PCI config half of `virtio_net.c`.
    `putc_driver.c` migrated first on this feature (issue #9, now
    `serial.curlee`); `vga_setup.c`'s register sequence followed (issue #10,
    now `vga_setup.curlee`); `vbe.c`'s Bochs VBE probe followed (issue #11,
    now `vbe.curlee` — its only C residual is the `vbe_state_set` state shim,
-   the globals-write half of the raw-state category above).
+   the globals-write half of the raw-state category above); `virtio_net.c`
+   followed last (issue #14, now `virtio_net.curlee` — the let-bound I/O-BAR
+   base + constant-offset ports, curlee #276, cover the whole register set).
    **Runtime-address physical writes** (the `phys_read_u*` counterpart)
    LANDED as Curlee COMPILER BUILTINS and unblocked the `fb.c` blitter in
    issue #13: `phys_write_u32` is now an inline volatile store in the
    freestanding codegen (no C symbol — the `fb.c` shim definition was
    deleted in the 2026-08 revision), so the Curlee pixel primitives write
-   the hardware framebuffer at its boot-discovered runtime address.
+   the hardware framebuffer at its boot-discovered runtime address. Issue
+   #14 uses the full `phys_write_u8/u16/u32/u64` surface to fill the legacy
+   vring structures (desc/avail/used) at their runtime 4096-aligned bases.
 3. **Bitwise ops + shifts** — unblocked big-endian packing, checksums,
    descriptor flags, and alignment math. Landed in the compiler ahead of
    issue #12, which used it to migrate the whole `net_stack.c` protocol core
    (byte layout, RFC 1071/793 checksums, the HTTP framing state machine) to
    `net_stack.curlee` — only the raw-state shim remains in C. Issue #15 used
-   it for the `(size + 7) & ~7` tag-alignment math in `mb2.curlee`.
+   it for the `(size + 7) & ~7` tag-alignment math in `mb2.curlee`; issue
+   #14 uses it for the PCI config address assembly and the `(raw + 4095) &
+   ~4095` queue-base alignment in `virtio_net.curlee`.
 4. **Runtime-address physical reads (`phys_read_u8/u16/u32/u64`, curlee issue
    #279)** — the last piece that unblocked the `mb2.c` tag walk: the
    multiboot2 info structure lives at a RUNTIME address captured by the boot
@@ -157,7 +183,14 @@ The C surface collapses to a thin I/O shim once three Curlee features land
    COMPILER BUILTINS (inline volatile loads — the `mb2_state.c` definitions
    were deleted); a runtime-address physical write counterpart (also now a
    builtin, `phys_write_u32`) additionally unblocks the `vga_text_clear.c`
-   raw memory move.
+   raw memory move. Issue #14 uses them for the RX-frame byte reads and the
+   used-ring idx/elem reads in `virtio_net.curlee`.
+5. **Fixed-size arrays + statics + Int->U64 widening (curlee #278/#277)** —
+   landed in the 2026-08 toolchain. `fb.curlee` (issue #13) moved the small
+   mutable blitter state into Curlee `static` + `[T; N]` state; issue #14
+   does the same for the whole driver state (rx_buf_state/rx_frame_len/
+   guest_mac/ring heads). The descriptor `addr` u64 field is built with the
+   `Int -> U64` widening for values < 2^32 (curlee #277).
 
 Until then, **do not add new pure logic to C**. If a feature needs pure
 logic, write it as a Curlee module (even if the driver can't yet be
