@@ -22,12 +22,11 @@ C exists for exactly two reasons in JOE:
    function (`vbe.curlee`, issue #11).
 2. **Raw memory moves** — volatile framebuffer writes, ring DMA, and the
    mutable driver *state* (frame counter, ring indices) that the Curlee layer
-   does not express yet (assignment exists — issue #268 — but these drivers
-   are not yet migrated). The 0xB8000 text-buffer clear is a raw memory move
-   that *cannot* migrate: Curlee `Phys<T>` addresses must be compile-time
-   literals and there is no runtime-address physical **write** builtin (only
-   the `phys_read_u*` reads of curlee issue #279), so a sequential
-   2000-cell clear is not expressible as a bounded Curlee loop
+   does not express (no globals, no arrays). The 0xB8000 text-buffer clear
+   is a raw memory move that *cannot* migrate: Curlee `Phys<T>` addresses
+   must be compile-time literals and there is no runtime-address physical
+   **write** builtin (only the `phys_read_u*` reads of curlee issue #279), so
+   a sequential 2000-cell clear is not expressible as a bounded Curlee loop
    (`vga_text_clear.c` stays in C for this reason). The framebuffer globals
    the VBE probe fills (`fb_addr/pitch/width/height`) are C-visible `.data`
    state owned by `fb.c`, and Curlee has no globals, so those four stores
@@ -37,7 +36,14 @@ C exists for exactly two reasons in JOE:
    `net_stack.curlee` (pure, VM-verified) + the kernel.curlee glue, and the
    file is now a raw-state shim in the same class — the mutable one-shot
    connection state and the 256-byte response byte store Curlee cannot own
-   (no globals, no arrays), with no protocol logic left.
+   (no globals, no arrays), with no protocol logic left. The framebuffer
+   blitter (`fb.c`, 664 lines) migrated in issue #13: the pixel primitives,
+   Bresenham, the Phase 2c ring flip, the tool-call queue and the loop
+   control became `fb.curlee` (genuine Curlee, merged into the kernel TU),
+   and `fb.c` is now a raw-state + memory-move shim in the same class —
+   with the added **runtime-address physical write** `phys_write_u32` (the
+   `#279` read family's write counterpart, raw volatile stores) that lets
+   the Curlee blitter write the boot-discovered framebuffer address.
 
 Everything else — parsers, protocol logic, checksums, layout math, glyph
 tables, geometry — belongs in the **pure, verified Curlee layer**
@@ -92,7 +98,7 @@ The current offenders (grandfathered, tracked for migration):
 | File | Lines | Pure-logic estimate | Migrate when |
 |---|---|---|---|
 | `virtio_net.c` | 798 | ~300 (ring math) | Curlee gains assignment + port I/O |
-| `fb.c` | 664 | ~150 (Bresenham, loops) | Curlee gains assignment |
+| `fb.c` | 270 | 0 (raw state + memory moves) | grandfathered for the line cap only — gh issue #13 migrated the blitter/event-loop logic |
 | `libgcc32.c` | 322 | 0 (compiler shim) | never (GCC ABI) |
 
 (`net_stack.c` is gone from this table: its ~700 lines of protocol logic
@@ -102,25 +108,37 @@ the file is now a ~110-line raw-state shim in the exempt category above.
 #15, leaving a ~50-line raw-state shim (`mb2_state.c` — the info-addr
 getter, the four framebuffer-global stores, and the runtime-address
 `phys_read_u8/u32` raw volatile loads, curlee issue #279) in the exempt
-category above.)
+category above. `fb.c` is now the same class — gh issue #13 migrated its
+~150 lines of blitter/event-loop logic (pixel primitives, Bresenham, the
+tool-call queue, the loop control) to `fb.curlee`; the ~270-line residual is
+the raw-state + memory-move shim (framebuffer globals, the static ring/
+region arrays, the `phys_write_u32`/`fb_mem_read_u32` runtime-address
+memory moves — the write counterpart of the #279 reads) in the exempt
+category above, grandfathered for the line cap only because the 26-symbol
+extern window keeps it over 200 lines.)
 
 ## 4. Migration roadmap (what unblocks what)
 
 The C surface collapses to a thin I/O shim once three Curlee features land
 (tracked as GitHub issues in `w4ffl35/curlee`):
 
-1. **Assignment / affine mutation** — unblocks `fb.c` (blitter loops),
-   the state machines in `virtio_net.c`. (The `mb2.c` tag walk used this —
-   the mutable cursor in `mb2.curlee`, issue #15.)
+1. **Assignment / affine mutation** — unblocked `fb.c`'s blitter loops (the
+   pixel primitives, Bresenham, the tool-call queue and the loop control
+   migrated to `fb.curlee` in issue #13) and remains the unlock for the
+   state machines in `virtio_net.c`. (The `mb2.c` tag walk used this — the
+   mutable cursor in `mb2.curlee`, issue #15.)
 2. **Port I/O (`outb`/`inb`/`outw`/`inw`/`outl`/`inl`)** — unblocks the
    PCI config half of `virtio_net.c`.
    `putc_driver.c` migrated first on this feature (issue #9, now
    `serial.curlee`); `vga_setup.c`'s register sequence followed (issue #10,
    now `vga_setup.curlee`); `vbe.c`'s Bochs VBE probe followed (issue #11,
    now `vbe.curlee` — its only C residual is the `vbe_state_set` state shim,
-   the globals-write half of the raw-state category above). A
-   **runtime-address physical write** (the `phys_read_u*` counterpart) would
-   additionally unblock the `vga_text_clear.c` raw memory move.
+   the globals-write half of the raw-state category above).
+   **Runtime-address physical writes** (the `phys_read_u*` counterpart)
+   LANDED and unblocked the `fb.c` blitter in issue #13: `phys_write_u32`
+   (defined in `fb.c`'s shim — raw volatile stores, the same class as the
+   `#279` reads) is what lets the Curlee pixel primitives write the hardware
+   framebuffer at its boot-discovered runtime address.
 3. **Bitwise ops + shifts** — unblocked big-endian packing, checksums,
    descriptor flags, and alignment math. Landed in the compiler ahead of
    issue #12, which used it to migrate the whole `net_stack.c` protocol core

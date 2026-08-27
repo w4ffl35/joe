@@ -12,14 +12,14 @@
 # the codegen accepts.
 #
 # Order matters (dependencies first): canvas.curlee -> glyphs.curlee ->
-# assets.curlee -> json.curlee -> serial.curlee -> vga_setup.curlee ->
-# vbe.curlee -> net_stack.curlee -> net_glue.curlee -> mb2.curlee ->
-# kernel.curlee. Each pure module contains NO `main`, so the merged file has
-# exactly one `main` (from kernel.curlee). All modules are already
-# individually verified by `make check` (net_glue.curlee and mb2.curlee are
-# verified via the merged file too — the glue calls net_stack.curlee's
-# functions and kernel.curlee's main calls mb2.curlee's mb2_parse; both are
-# checked standalone as well).
+# assets.curlee -> fb.curlee -> json.curlee -> serial.curlee ->
+# vga_setup.curlee -> vbe.curlee -> net_stack.curlee -> net_glue.curlee ->
+# mb2.curlee -> kernel.curlee. Each pure module contains NO `main`, so the
+# merged file has exactly one `main` (from kernel.curlee). All modules are
+# already individually verified by `make check` (net_glue.curlee is verified
+# via the merged file too — it calls net_stack.curlee's functions; fb.curlee
+# is standalone-checkable because it inlines its ring/geometry constants
+# rather than calling assets.curlee — the C-#define pattern it replaces).
 #
 # When the Curlee codegen import fix lands, this script is deleted and
 # kernel.curlee imports the modules natively.
@@ -37,6 +37,7 @@ MODULES=(
   "$ROOT/kernel/canvas.curlee"
   "$ROOT/kernel/glyphs.curlee"
   "$ROOT/kernel/assets.curlee"
+  "$ROOT/kernel/fb.curlee"
   "$ROOT/kernel/json.curlee"
   "$ROOT/kernel/serial.curlee"
   "$ROOT/kernel/vga_setup.curlee"
@@ -66,7 +67,7 @@ done
   echo "// and re-run the merge. When the Curlee codegen import bug is fixed,"
   echo "// this script is deleted and kernel.curlee imports the modules."
   echo "//"
-  echo "// Modules (in dependency order): canvas, glyphs, assets, json, serial, vga_setup, vbe, net_stack, net_glue, mb2, kernel."
+  echo "// Modules (in dependency order): canvas, glyphs, assets, fb, json, serial, vga_setup, vbe, net_stack, net_glue, mb2, kernel."
   echo
   for f in "${MODULES[@]}"; do
     echo "// ==== $(basename "$f") ===="

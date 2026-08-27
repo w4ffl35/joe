@@ -35,10 +35,12 @@
 #include <stdint.h>
 
 // The multiboot2 info pointer captured by kernel/boot.S (%ebx on entry).
-// Weak default defined in kernel/fb.c (0 on the PVH path, which has no
-// multiboot2 info); boot.S's strong .data definition overrides it on the
-// GRUB/ISO path (GNU weak/strong interposition).
-extern unsigned long long mb2_info_addr;
+// The WEAK default (0) lives here (moved from kernel/fb.c in gh issue #13 —
+// this module's mb2_info_addr_get is its only reader, so it is the genuine
+// owner): on the PVH path (qemu -kernel, crt0.S — no boot.S) it provides the
+// symbol as 0; on the GRUB/ISO path boot.S's strong .data definition
+// overrides it (GNU weak/strong interposition).
+unsigned long long mb2_info_addr __attribute__((weak)) = 0;
 
 // Framebuffer state owned by kernel/fb.c (non-static .data globals so this
 // shim can fill them — the blitter reads them).

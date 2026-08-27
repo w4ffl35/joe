@@ -276,6 +276,17 @@ fn main(pm: cap phys.mem) -> Unit {
 
 ### 4.5 `kernel/fb.c` — extended blitter (C driver, owns state)
 
+> **Superseded by gh issue #13** (2026-08): the ENTIRE blitter + event loop
+> below migrated to genuine Curlee (`kernel/fb.curlee`, merged into the kernel
+> TU — the codegen emits the functions as `curlee_fb_*` static symbols and the
+> C externs were removed). `kernel/fb.c` is now a raw-state + memory-move shim
+> in the `net_stack.c`/`vbe_state.c` class: the framebuffer globals, the
+> static ring/region arrays, the ring/draw-target/tool-queue counters, and the
+> runtime-address memory moves `phys_write_u32` / `fb_mem_read_u32` (the
+> `phys_read_u*` family's write counterpart, curlee #279) that Curlee reads
+> and writes through the thin extern window declared in `fb.curlee`. This
+> section is kept as the historical design record.
+
 Extends the existing glyph renderer with a full primitive surface. All functions
 bounds-check against `fb_width`/`fb_height` (defense-in-depth over Curlee geometry).
 

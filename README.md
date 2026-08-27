@@ -43,10 +43,12 @@ to the screen, with serial output for verification.
   buffer (`Phys<U16>` writes at `0xB8000`, attribute 0x0F), after programming
   VGA text mode 3 (`vga_setup.curlee`, ported from the deleted
   `vga_setup.c`, issue #10). Under QEMU this renders perfectly.
-  A framebuffer renderer (`fb.c`, 5x7 glyphs as 32bpp pixels) is included and
-  is selected when a real linear framebuffer is available; it is not yet
-  reachable because the multiboot2 framebuffer address (passed in registers
-  only for 32-bit entries) is not exposed to Curlee's freestanding codegen.
+  A framebuffer renderer (blitter + 5x7 glyphs as 32bpp pixels) is included
+  and is selected when a real linear framebuffer is available — the Phase 2
+  demo scene (a panel rectangle, a line, "JOE" in scaled glyphs) renders to
+  the framebuffer via the Curlee blitter (`fb.curlee`, gh issue #13) and the
+  serial `FB: 1` / `RING: 1` markers prove it under QEMU
+  (`make qemu-pvh-fb-smoke` / `make qemu-fb-smoke`).
 - **VirtualBox display note (known limitation)**: VirtualBox's VGA emulation
   does not reliably present a bare-metal kernel's text plane or framebuffer
   after a GRUB handoff — attempts with text mode, mode-3 reset, gfxterm, and
@@ -187,10 +189,13 @@ OS with a freestanding software renderer targeting the linear framebuffer.
 
 ### Architecture
 
-- **Two layers**: Curlee computes geometry/intent (pure, Z3-verified, VM-tested);
-  the C driver ([`kernel/fb.c`](kernel/fb.c)) owns mutable state and executes the
-  pixel loops. Curlee has no assignment and a small verifier fragment, so
-  imperative blitting lives in C while provable math lives in Curlee.
+- **Two layers**: Curlee computes geometry/intent (pure, Z3-verified, VM-tested)
+  AND executes the pixel loops ([`kernel/fb.curlee`](kernel/fb.curlee) — the
+  blitter + 60 FPS event loop, gh issue #13); the C shim
+  ([`kernel/fb.c`](kernel/fb.c)) owns ONLY the mutable state and raw memory
+  moves (framebuffer globals, the static ring/region arrays, the
+  runtime-address `phys_write_u32`/`fb_mem_read_u32` memory moves — Curlee
+  has no globals/arrays).
 - **Single-TU merge**: the freestanding codegen crashes on `import`, so
   [`scripts/build-kernel.sh`](scripts/build-kernel.sh) concatenates the pure
   modules + `kernel.curlee` into one self-contained translation unit.
@@ -202,17 +207,17 @@ OS with a freestanding software renderer targeting the linear framebuffer.
   - [`kernel/assets.curlee`](kernel/assets.curlee) — blit-fit OOB gate + frame
     ring-buffer slot math, static asset-region geometry, runtime fit gates
     (rect/line/char/asset), frame-ring geometry (Phase 2c)
-- **Blitter** ([`kernel/fb.c`](kernel/fb.c)): `fb_clear`, `fb_pixel`,
-  `fb_fill_rect`, `fb_line`, `fb_blit_asset`,
-  `fb_present`, plus the Phase 2b 60 FPS loop + tool ring
-  (glyph text rendering moved to Curlee — `draw_glyph` in
+- **Blitter** ([`kernel/fb.curlee`](kernel/fb.curlee)): genuine Curlee
+  functions `fb_clear`, `fb_pixel`, `fb_fill_rect`, `fb_line`,
+  `fb_blit_asset`, `fb_present`, plus the Phase 2b 60 FPS loop + tool ring
+  (`fb_loop_init`/`fb_loop_frame`/`fb_run_loop`/`fb_tool_enqueue`/...),
+  all bounds-checked. Glyph text rendering is Curlee too — `draw_glyph` in
   [`kernel/kernel.curlee`](kernel/kernel.curlee) reads `glyph_pixel` from
-  [`kernel/glyphs.curlee`](kernel/glyphs.curlee) and drives `fb_pixel`; the
-  C driver no longer carries a glyph-table copy)
-  (`fb_loop_init`/`fb_loop_frame`/`fb_run_loop`/`fb_tool_enqueue`/...).
-  All bounds-checked; the tool ring + asset region + frame ring are
-  fixed-slot static arrays (no malloc). Phase 2c: `fb_present()` performs a
-  real back-buffer flip on the GRUB framebuffer path (serial `RING: 1`).
+  [`kernel/glyphs.curlee`](kernel/glyphs.curlee) and drives `fb_pixel` (no C
+  glyph-table copy). The tool ring + asset region + frame ring stay
+  fixed-slot static arrays owned by the C shim ([`kernel/fb.c`](kernel/fb.c))
+  — no malloc. Phase 2c: `fb_present()` performs a real back-buffer flip on
+  the GRUB framebuffer path (serial `RING: 1`).
 - **Declarative scene**: `render_frame(frame)` in
   [`kernel/kernel.curlee`](kernel/kernel.curlee) describes one frame (colors
   bound to `let`s — the verifier rejects calls as call arguments); every

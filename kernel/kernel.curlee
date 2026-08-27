@@ -36,66 +36,19 @@
 // cannot coexist in one translation unit.
 extern fn curlee_halt() -> Unit;
 
-// Provided by kernel/fb.c — linear framebuffer software blitter.
-// NOTE: there is NO `extern fn fb_init` since gh issue #15 — the old fb_init
-// was C logic (parse the multiboot2 tag, then wire the draw target); both
-// halves now live in the Curlee layer. main drives mb2_parse(pm)
-// (kernel/mb2.curlee, ported from kernel/mb2.c) then fb_wire_draw_target()
-// itself, exactly like the gh issue #11 vbe_probe pattern.
-// gh issue #11/#15: re-wires the draw target after the Curlee mb2_parse /
-// vbe_probe fill the framebuffer globals — main calls this once after the
-// multiboot2 parse, and AGAIN after the Curlee vbe_probe on the PVH path
-// (the first wiring ran while fb_addr was still 0). Same gate as the old
-// fb_init's: wires only when fb_addr != 0.
-extern fn fb_wire_draw_target() -> Unit;
-extern fn fb_ready() -> Int;
-extern fn fb_clear(color: Int) -> Unit;
-extern fn fb_pixel(x: Int, y: Int, color: Int) -> Unit;
-extern fn fb_fill_rect(x: Int, y: Int, w: Int, h: Int, color: Int) -> Unit;
-extern fn fb_line(x0: Int, y0: Int, x1: Int, y1: Int, color: Int) -> Unit;
-// NOTE: fb_draw_char / fb_draw_char_color externs REMOVED — glyph rendering
-// moved to Curlee (draw_glyph below reads glyph_pixel from glyphs.curlee and
-// drives fb_pixel per set pixel). fb.c no longer defines them (no C copy of
-// the tables — docs/c-boundary-policy.md).
-extern fn fb_blit_asset(src: Int, src_w: Int, src_h: Int, dst_x: Int, dst_y: Int) -> Unit;
-extern fn fb_present() -> Unit;
-extern fn fb_run_loop() -> Unit;
-
-// Phase 2c — memory & asset management contracts. Accessor/geometry externs
-// (kernel/fb.c owns the static asset region + frame ring; these externs are
-// the runtime window Curlee's render_frame uses to enforce the verified
-// gates with the ACTUAL framebuffer/region sizes):
-//   fb_get_width()/fb_get_height()      -> current framebuffer size
-//   fb_asset_region_w/h()               -> static asset region geometry
-//   fb_asset_region_base()              -> base address of the asset region
-//   fb_ring_active()                    -> 1 when the frame ring is active
-//   fb_ring_slot()                      -> current back-buffer slot index
-extern fn fb_get_width() -> Int;
-extern fn fb_get_height() -> Int;
-extern fn fb_asset_region_w() -> Int;
-extern fn fb_asset_region_h() -> Int;
-extern fn fb_asset_region_base() -> Int;
-extern fn fb_ring_active() -> Int;
-extern fn fb_ring_slot() -> Int;
-
-// Phase 2b 60 FPS loop control + kernel tool-call queue (kernel/fb.c owns the
-// mutable state; these externs are the only window Curlee has into it).
-//   fb_loop_init()      -> reset the frame counter + tool ring
-//   fb_loop_frame()     -> current frame counter (the loop's fuel)
-//   fb_tool_enqueue(k,a)-> enqueue a (kind, arg) tool intent; 1 ok, 0 full
-//   fb_tool_drained()   -> intents consumed by the last fb_run_loop tick
-//   fb_tool_pending()   -> intents currently queued
-//
-// The PRODUCER API (fb_tool_enqueue / fb_tool_drained / fb_tool_pending) is
-// exercised live by main's loop (one "frame-tick" intent per frame) and is
-// the same entry point future producers (LLM bridge, input handler — Phase
-// 2d) will use. The producer-side frame -> slot mapping is `tool_queue_slot`
-// (assets.curlee), VM-asserted by canvas_test.curlee §13.
-extern fn fb_loop_init() -> Unit;
-extern fn fb_loop_frame() -> Int;
-extern fn fb_tool_enqueue(kind: Int, arg: Int) -> Int;
-extern fn fb_tool_drained() -> Int;
-extern fn fb_tool_pending() -> Int;
+// gh issue #13: the ENTIRE framebuffer blitter + 60 FPS event loop moved to
+// genuine Curlee (kernel/fb.curlee, merged in before this file) — the
+// fb_wire_draw_target / fb_ready / fb_clear / fb_pixel / fb_fill_rect /
+// fb_line / fb_blit_asset / fb_present / fb_get_width / fb_get_height /
+// fb_ring_active / fb_ring_slot / fb_asset_region_w/h/base / fb_loop_init /
+// fb_loop_frame / fb_tool_enqueue / fb_tool_drained / fb_tool_pending /
+// fb_run_loop externs are GONE (the codegen emits them as curlee_fb_* static
+// symbols). kernel/fb.c is now only the raw-state + memory-move shim
+// (globals, the static ring/region arrays, phys_write_u32/fb_mem_read_u32/
+// fb_pvh_build) that the Curlee blitter reads/writes through the extern
+// window declared in fb.curlee — this file declares NO fb_* externs at all.
+// main gates the ring loop on fb_asset_region_w()==0 below — the PVH/GRUB
+// discriminator (fb_pvh_build in the shim).
 
 // Phase 2d-1/2d-2 — VirtIO-net + TCP/IP stack extern surface. Declared in
 // kernel/net_glue.curlee (merged in before this file by
