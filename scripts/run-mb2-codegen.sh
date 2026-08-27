@@ -21,9 +21,9 @@
 #      framebuffer-state setter; the mb2_state_set C extern is gone), so the
 #      probe prepends its extern declaration for the harness to mock.
 #   2. Codegens it with `curlee build --target freestanding-c`.
-#   3. Compiles it with a host harness that provides the two extern windows
-#      (mb2_info_addr_get / fb_state_set) and a 1 MiB byte array standing in
-#      for physical memory:
+#   3. Compiles it with a host harness that provides the extern windows
+#      (mb2_info_addr — the extern static's codegen'd global — / fb_state_set)
+#      and a 1 MiB byte array standing in for physical memory:
 #        - phys_read_u8/u32 are now Curlee COMPILER BUILTINS (inline volatile
 #          loads), so the harness writes the synthetic multiboot2 info
 #          structure into the array at its REAL address (MEM_BASE + offset,
@@ -53,17 +53,18 @@
 #      original truncated the u64 to the u32 fb_addr global and would have
 #      returned 1 with an unusable fb_addr = 0 for this tag; the port is
 #      strictly saner, see kernel/mb2.curlee's port notes).
-#  12. info addr NEGATIVE (a u64 with bit 63 set, cast to signed Int by
-#      mb2_info_addr_get): rc 0 — the C original's UNSIGNED `>= 0x100000000ULL`
-#      rejects it, and the Curlee gate must too (`base < 0`), BEFORE any
-#      physical read (a wild dereference at (uintptr_t)-1 would now segfault
-#      the harness — the builtin reads inline the deref, so a gate regression
-#      fails the run, just less gracefully than the old mocks).
+#  12. info addr NEGATIVE (a u64 with bit 63 set — gh issue #31: the extern
+#      static is a signed int64_t, so the value arrives negative): rc 0 — the
+#      C original's UNSIGNED `>= 0x100000000ULL` rejects it, and the Curlee
+#      gate must too (`base < 0`), BEFORE any physical read (a wild
+#      dereference at (uintptr_t)-1 would now segfault the harness — the
+#      builtin reads inline the deref, so a gate regression fails the run,
+#      just less gracefully than the old mocks).
 #
-# The boot gates then prove the real path (kernel/mb2_state.c's
-# mb2_info_addr_get + boot.S's mb2_info_addr + the live GRUB tag filling the
-# Curlee framebuffer state via fb_state_set) produces the same result in the
-# VM.
+# The boot gates then prove the real path (kernel/mb2.curlee's extern static
+# mb2_info_addr + boot.S's %ebx store into that codegen'd global + the live
+# GRUB tag filling the Curlee framebuffer state via fb_state_set) produces
+# the same result in the VM.
 
 set -euo pipefail
 
@@ -163,15 +164,16 @@ static void put_u64(unsigned long addr, unsigned long v)
 }
 
 /* ---- the parser's extern windows (mocked) ---- */
-static long long current_addr = 0;
+/* gh issue #31: mb2.curlee declares `extern static mb2_info_addr: Int = 0;`,
+ * which the freestanding codegen emits as a plain global `int64_t
+ * mb2_info_addr = 0;` (curlee #297 — external linkage, verbatim name). The
+ * harness re-arms that global per scenario, exactly like boot.S's
+ * `movl %ebx, mb2_info_addr` does on the GRUB path; the deleted
+ * mb2_info_addr_get() C getter no longer exists to mock. */
+extern long long mb2_info_addr;
 static int state_called = 0;
 static unsigned int state_addr, state_pitch, state_width, state_height;
 static int failures = 0;
-
-long long mb2_info_addr_get(void)
-{
-    return current_addr;
-}
 
 /* gh issue #20: mb2.curlee fills the framebuffer state through fb.curlee's
  * fb_state_set (a genuine Curlee function in the kernel TU; the deleted
@@ -277,7 +279,7 @@ static void run_case(const char* name, long long base, long long mem_off,
         put_u32((unsigned long)mem_off, total);
         put_u32((unsigned long)mem_off + 4, 0);   /* reserved */
     }
-    current_addr = base;
+    mb2_info_addr = base;
     rc = curlee_main();
     CHECK(rc == expect_rc, name);
     if (expect_state)
@@ -372,11 +374,12 @@ int main(void)
     run_case("fb_addr_hi", MEM_BASE, 0, 40, 0, 0, 0, 0, 0, 0);
 
     /* 12. Info addr NEGATIVE (a u64 with bit 63 set — e.g. a corrupted
-     * global — cast to signed Int by mb2_info_addr_get): the C original's
-     * UNSIGNED `mb2_info_addr >= 0x100000000ULL` rejects it, and the Curlee
-     * gate must too (base < 0), BEFORE any physical read. With the builtin
-     * reads a gate regression would deref (uintptr_t)-1 and segfault — this
-     * case proves the trust gate, not the mock. */
+     * global; gh issue #31 the extern static is a signed int64_t, so the
+     * value arrives negative): the C original's UNSIGNED
+     * `mb2_info_addr >= 0x100000000ULL` rejects it, and the Curlee gate must
+     * too (base < 0), BEFORE any physical read. With the builtin reads a
+     * gate regression would deref (uintptr_t)-1 and segfault — this case
+     * proves the trust gate, not the mock. */
     reset_mem();
     run_case("negative_addr", -1LL, -1, 0, 0, 0, 0, 0, 0, 0);
 

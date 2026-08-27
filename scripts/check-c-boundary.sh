@@ -15,6 +15,12 @@
 #   3. No kernel/*.c calls back into Curlee (calls a curlee_* / fb_* / net_*
 #      function that the codegen would emit — the C layer must never call up).
 #
+# The C-to-Curlee migration is COMPLETE (gh issue #31): kernel/ now holds ZERO
+# .c files, so the empty-glob case below is the normal, passing state — a bare
+# `for f in kernel/*.c` would expand to the literal pattern and break under
+# `set -e`, so the loop is driven from a nullglob array with an explicit
+# zero-file early exit.
+#
 # Reports (warning) per-file line counts so the trend is visible in CI.
 #
 # Exit 0 on pass, 1 on any violation (so `make c-boundary` fails the build).
@@ -31,7 +37,15 @@ violations=0
 
 echo "=== C boundary check (docs/c-boundary-policy.md) ==="
 
-for f in "$KERNEL_DIR"/*.c; do
+shopt -s nullglob
+c_files=("$KERNEL_DIR"/*.c)
+if (( ${#c_files[@]} == 0 )); then
+    echo "  [ok]   no kernel/*.c files — kernel/ is ZERO C files (C-to-Curlee migration complete, gh issue #31)"
+    echo "=== C boundary: OK (zero C files; no grandfathered files) ==="
+    exit 0
+fi
+
+for f in "${c_files[@]}"; do
     name="$(basename "$f")"
     lines="$(wc -l < "$f")"
 

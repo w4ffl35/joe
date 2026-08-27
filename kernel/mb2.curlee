@@ -4,10 +4,14 @@
 // from the former kernel/mb2.c (deleted in gh issue #15).
 //
 // Phase 2e: GRUB hands the kernel a multiboot2 info structure whose pointer
-// is passed in %ebx on entry. kernel/boot.S saves that pointer into the .data
-// global `mb2_info_addr` (before zeroing .bss), and this module walks the
-// info structure to find the framebuffer tag (type 8), filling the
-// framebuffer globals that kernel/fb.c's blitter uses. The read is a
+// is passed in %ebx on entry. kernel/boot.S saves that pointer into the
+// module-level global `mb2_info_addr` (the extern static declared below —
+// curlee #297 external-linkage state, emitted as a plain `int64_t
+// mb2_info_addr = 0;` global under the identifier verbatim so the 32-bit
+// boot stub can write it before curlee_main runs — replacing the deleted
+// kernel/mb2_state.c shim, gh issue #31), and this module walks the info
+// structure to find the framebuffer tag (type 8), filling the framebuffer
+// globals that kernel/fb.c's blitter uses. The read is a
 // runtime-address physical read (curlee gh issue #279's phys_read_u* surface)
 // — the info structure lives at a runtime address captured by the boot stub,
 // so a compile-time-literal Phys<T> cannot address it.
@@ -42,12 +46,11 @@
 //     (`t->fb_addr != 0`) for every real GRUB framebuffer (always < 4 GiB),
 //     and strictly saner for a pathological tag whose high dword is non-zero
 //     while the low dword is 0 (C would return 1 with an unusable fb_addr=0).
-//   - `phys_read_u8`/`phys_read_u32` are declared extern here and DEFINED in
-//     kernel/mb2_state.c as raw volatile loads (the second pillar of the C
-//     boundary policy: "I/O touches and raw memory moves" — docs/
-//     c-boundary-policy.md §1). The curlee runtime (rt.c) does not carry the
-//     symbols in the current toolchain build, so the raw memory move lives
-//     with the rest of the mb2 state shim, mirroring vbe_state.c (gh #11).
+//   - `phys_read_u8`/`phys_read_u32` are Curlee COMPILER BUILTINS (inline
+//     volatile loads in the freestanding codegen — the former mb2_state.c
+//     definitions were deleted with the gh issue #15/#20 residuals), opaque
+//     to the verifier; they require `unsafe` + `cap phys.mem` (see the
+//     mb2_parse body below).
 //
 // Trust model (matches the C original): the boot info pointer is TRUSTED —
 // it comes from the 32-bit multiboot2 entry's %ebx (spec-guaranteed), stored
@@ -55,11 +58,14 @@
 // the 32-bit address space (GRUB places the structure right after the kernel
 // image, e.g. 0x109A78 for a kernel loaded at 0x100000 — NOT below 1 MiB).
 // The C original compared the u64 global UNSIGNED (`mb2_info_addr >=
-// 0x100000000ULL`), which also rejects any value with bit 63 set; the signed
-// Int getter renders those negative, so the gate below adds `base < 0` to
-// keep the exact C semantics (a negative base would otherwise dereference a
-// wild address in phys_read_u32). The total_size check below bounds every
-// walk, so a bad pointer can never run away. The framebuffer tag is
+// 0x100000000ULL`), which also rejects any value with bit 63 set. The extern
+// static below is declared Int (signed int64_t) — the compiler has NO U64 ->
+// Int widening (empirically: "U8/U16/U32 implicitly widen to Int; U64
+// widening is out of scope") — so a bit-63-set value arrives NEGATIVE and
+// the gate below adds `base < 0` to keep the exact C semantics (a negative
+// base would otherwise dereference a wild address in phys_read_u32). The
+// total_size check below bounds every walk, so a bad pointer can never run
+// away. The framebuffer tag is
 // additionally gated (32bpp AND non-zero address) as defense-in-depth
 // against a bogus tag from a corrupt info.
 //
@@ -71,19 +77,22 @@
 //     and the merged kernel re-verifies it (`make check`).
 //   - Minimal footprint: no libc, no String/Vec; the walk is ~40 lines.
 
-// Provided by kernel/mb2_state.c:
-//   - mb2_info_addr_get() reads the .data global `mb2_info_addr` that
-//     kernel/boot.S fills from %ebx on the GRUB path (0 on the PVH path via
-//     the shim's weak default). This is the ONE remaining C residual of the
-//     mb2 port (gh issue #20): the value is written by 32-bit assembly
-//     (boot.S) BEFORE curlee_main runs, via a strong .data definition that
-//     overrides the weak default — a C-level linkage requirement (Curlee
-//     statics are file-local in the codegen, so boot.S cannot write one).
-//   - phys_read_u8()/phys_read_u32() — runtime-address physical reads,
-//     Curlee COMPILER BUILTINS (inline volatile loads); raw volatile loads,
-//     opaque to the verifier. They require `unsafe` + `cap phys.mem` (see
-//     the mb2_parse body below).
-extern fn mb2_info_addr_get() -> Int;
+// The multiboot2 info pointer captured by kernel/boot.S (%ebx on entry) —
+// gh issue #31: this extern static REPLACES the former kernel/mb2_state.c C
+// shim (weak .data global + mb2_info_addr_get getter). curlee #297 added
+// `extern static name: Type = expr;`: the freestanding codegen emits a plain
+// file-scope C global (NO `static`, external linkage) under the identifier
+// VERBATIM (no `curlee_` mangle), so boot.S's `movl %ebx, mb2_info_addr` /
+// `movl $0, mb2_info_addr + 4` write this exact symbol and Curlee reads it
+// back as a normal name reference. The initializer is the DEFAULT for the
+// PVH build (no boot.S): 0, so mb2_parse no-ops exactly as it did with the
+// shim's weak default. Declared Int (not U64) because the trust gate and
+// tag walk below are Int arithmetic and the compiler has no U64 -> Int
+// widening (see the trust-model note); the emitted int64_t matches the
+// shim's `long long` getter semantics (bit-63-set values arrive negative
+// and `base < 0` rejects them, exactly like the C original's unsigned
+// >= 0x100000000ULL gate).
+extern static mb2_info_addr: Int = 0;
 
 // gh issue #20: the framebuffer state setter is a genuine Curlee function in
 // kernel/fb.curlee (fb_state_set — merged in before this module), replacing
@@ -108,13 +117,13 @@ static mb2_tag_scratch: [U32; 4] = [0; 4];
 // address, < 4 GiB, total_size bounds, size != 0, 8-byte alignment) are the
 // same ones the C original enforced, ported verbatim.
 fn mb2_parse(pm: cap phys.mem) -> Int {
-  let base: Int = mb2_info_addr_get();
+  let base: Int = mb2_info_addr;
   // Same trust gate as the C original (`mb2_info_addr == 0 ||
   // mb2_info_addr >= 0x100000000ULL`, an UNSIGNED u64 comparison). The
-  // getter casts the u64 global to a signed Int, so a value with bit 63 set
-  // arrives NEGATIVE — `base < 0` restores the exact C rejection for those
-  // BEFORE any physical read (a wild dereference at (uintptr_t)-1 would
-  // otherwise follow).
+  // extern static is a signed Int, so a value with bit 63 set arrives
+  // NEGATIVE — `base < 0` restores the exact C rejection for those BEFORE
+  // any physical read (a wild dereference at (uintptr_t)-1 would otherwise
+  // follow).
   if (base < 0 || base == 0 || base >= 4294967296) {   // >= 0x100000000 (4 GiB)
     return 0;
   }

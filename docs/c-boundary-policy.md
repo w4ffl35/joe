@@ -70,9 +70,10 @@ ground truth) plus the kernel.curlee glue. The multiboot2 parser in `mb2.c`
 was the *same class of code* and migrated in issue #15 as the language gained
 assignment + bitwise ops + the runtime-address `phys_read_u*` reads (curlee
 issues #268/#270/#279): the tag walk is now `mb2.curlee`, host-verified
-against scripted physical memory (`make mb2-codegen-run`), with only the
-raw-state shim (`mb2_state.c`: the info-addr getter, the four global stores,
-and the raw volatile reads) left in C (see §3).
+against scripted physical memory (`make mb2-codegen-run`), and the final
+raw-state half — the boot-handoff info pointer (`mb2_state.c`) — was DELETED
+in gh issue #31 once curlee #297's `extern static` gave Curlee
+external-linkage module state that boot assembly can write (see §3).
 
 ## 2. What "no logic" means concretely (review checklist)
 
@@ -105,13 +106,14 @@ A C file **satisfies** the policy if it is:
 | Max pure-logic lines per `.c` file | **0** | Pure logic belongs in Curlee, period |
 | Max new `.c`/`.h` files added per feature | **1** | A new device should be one driver + Curlee modules |
 
-The current C surface under `kernel/` — ALL files below the cap and in the
-exempt category (raw memory moves / build geometry / linkage shims), with
-zero pure logic and **no grandfathered files**: the last one,
-`libgcc32.c` (322 lines, "never migrates — GCC ABI"), was DELETED in gh
-issue #21 once curlee #288 bundled the equivalent 32-bit helpers into the
-curlee toolchain runtime (`runtime/libgcc32_helpers.c` — the GRUB/ISO path
-links that toolchain-owned file now instead of a kernel-local copy).
+The current C surface under `kernel/` is **ZERO files** — the C-to-Curlee
+migration is complete. No `.c`/`.h` files remain under `kernel/`: no pure
+logic, no raw-state/linkage shims, and **no grandfathered files** (the
+last one, `libgcc32.c` (322 lines, "never migrates — GCC ABI"), was
+DELETED in gh issue #21 once curlee #288 bundled the equivalent 32-bit
+helpers into the curlee toolchain runtime
+(`runtime/libgcc32_helpers.c` — the GRUB/ISO path links that
+toolchain-owned file now instead of a kernel-local copy)).
 
 The former **`fb.c`** and **`virtio_net.c`** entries are DELETED (gh issue
 #296): Curlee gained per-build-target static array sizing (`curlee build
@@ -124,19 +126,10 @@ geometry. Their base-address getters are Curlee `addr_of` reads (issue
 #286), and the ring-publication sfence moved into the Curlee runtime as
 `curlee_sfence`. Nothing C links for either driver on either build.
 
-The remaining files are exactly:
-
-- **`mb2_state.c`** (~25 lines) — gh issue #20 reduced it to the single
-  raw-state half Curlee cannot express: the multiboot2 info pointer.
-  `mb2_info_addr` is a WEAK `.data` global that kernel/boot.S (32-bit
-  assembly, running BEFORE curlee_main) overwrites with its strong `.data`
-  definition on the GRUB path (GNU weak/strong interposition); the Curlee
-  window is `mb2_info_addr_get()`. Curlee statics are file-local in the
-  codegen (static C symbols), so boot.S cannot write one — a C-level
-  linkage requirement, the same class as the sfence. The former
-  `mb2_state_set` setter (the four framebuffer-global stores) is DELETED —
-  the state is Curlee statics in `fb.curlee` (gh issue #20). Migrates when
-  Curlee gains a boot-assembly-visible global.
+The remaining files are exactly: — **none**. The last entry, `mb2_state.c`
+(the multiboot2 info-pointer shim, gh issue #31 — see the DELETED list
+below), is gone: `kernel/*.c` is now **ZERO files**, completing the
+C-to-Curlee migration.
 
 Also DELETED in gh issue #20 (all three residuals the issue tracked):
 - **`vga_text_clear.c`** (29 lines) — the 0xB8000 text-buffer clear is now
@@ -156,6 +149,23 @@ Also DELETED in gh issue #21 (the compiler-runtime residual, not a driver):
   the curlee toolchain runtime (`runtime/libgcc32_helpers.c`), so the GRUB/
   ISO build links the toolchain-owned object — the kernel no longer carries
   its own copy, and `kernel/` has no grandfather list left.
+
+Also DELETED in gh issue #31 (the mb2_state.c half — external-linkage state):
+- **`mb2_state.c`** (55 lines) — the multiboot2 info pointer shim (weak
+  `.data` global + `mb2_info_addr_get` getter, the last mb2 C residual) is
+  GONE. curlee #297 added `extern static name: Type = expr;`, which the
+  freestanding codegen emits as a plain, non-static C global under the
+  identifier VERBATIM (no `curlee_` mangle); `kernel/mb2.curlee` now declares
+  `extern static mb2_info_addr: Int = 0;` (Int, not U64 — the compiler has no
+  U64→Int widening, and the signed read preserves the getter's semantics:
+  bit-63-set values arrive negative and the `base < 0` trust gate rejects
+  them, matching the C original's unsigned `>= 0x100000000ULL`). The 32-bit
+  `kernel/boot.S` stores `%ebx` into that exact codegen'd symbol (after
+  zeroing `.bss` — the zero-initialized global lands in `.bss`), and the PVH
+  build reads the 0 default. With PR #33 (gh issue #296) having deleted
+  `fb.c` and `virtio_net.c` in the same migration, `kernel/*.c` is now
+  **ZERO files** — the grandfather list above is empty and the C-to-Curlee
+  boundary is complete.
 
 ## 4. Migration roadmap (what unblocks what)
 
