@@ -32,6 +32,7 @@ PACK_SRC      := kernel/pack.curlee
 CANVAS_SRC    := kernel/canvas.curlee
 GLYPHS_SRC    := kernel/glyphs.curlee
 ASSETS_SRC    := kernel/assets.curlee
+FB_SRC        := kernel/fb.curlee
 JSON_SRC      := kernel/json.curlee
 SERIAL_SRC    := kernel/serial.curlee
 VGA_SETUP_SRC := kernel/vga_setup.curlee
@@ -80,7 +81,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
@@ -146,11 +147,12 @@ $(KERNEL_ELF): $(MERGED_SRC) $(VGA_CLEAR_C) $(FB_C) $(MB2_STATE_C) $(VBE_STATE_C
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(NET_STACK_SRC) $(MB2_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(NET_STACK_SRC) $(MB2_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
 	$(CURLEE) check $(ASSETS_SRC)
+	$(CURLEE) check $(FB_SRC)
 	$(CURLEE) check $(JSON_SRC)
 	$(CURLEE) check $(SERIAL_SRC)
 	$(CURLEE) check $(VGA_SETUP_SRC)
@@ -540,7 +542,16 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' net_poll_fuel$$' && echo "PASS: net_poll_fuel linked (state shim)"
 	# Phase 2d-4: the tool-queue producer API the LLM bridge drives
 	# (fb_tool_enqueue(2, arg) — the 2d-3 contract, wired into the 2b ring).
-	@nm $(KERNEL_ELF) | grep -q ' fb_tool_enqueue$$' && echo "PASS: fb_tool_enqueue linked"
+	# gh issue #13: the blitter + event loop moved to Curlee (kernel/fb.curlee),
+	# so the codegen emits the queue producer as the static curlee_fb_tool_enqueue
+	# symbol (the C extern was removed); the ring flip + the runtime-address
+	# memory moves are now ALL Curlee (the phys builtins inline in the codegen —
+	# no C symbols), so the gates check the Curlee statics and the C getters.
+	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_tool_enqueue$$' && echo "PASS: curlee_fb_tool_enqueue linked (Curlee tool queue)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_present$$' && echo "PASS: curlee_fb_present linked (Curlee blitter)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_ring_activate$$' && echo "PASS: curlee_fb_ring_activate linked (Curlee ring flip)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_fb_ring_advance$$' && echo "PASS: curlee_fb_ring_advance linked (Curlee ring advance)"
+	@nm $(KERNEL_ELF) | grep -q ' fb_frame_ring_slot_base$$' && echo "PASS: fb_frame_ring_slot_base linked (frame-ring base getter)"
 	# Phase 2f (gh issue #11): the Curlee Bochs VBE probe (kernel/vbe.curlee)
 	# fills the framebuffer globals through the C state shim — the shim must be
 	# linked (the codegen references it 1:1; a missing symbol fails at link
@@ -548,13 +559,11 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' vbe_state_set$$' && echo "PASS: vbe_state_set linked (VBE probe state shim)"
 	# gh issue #15: the multiboot2 tag walk is now GENUINE Curlee (ported
 	# from kernel/mb2.c) — the codegen emits it as curlee_mb2_parse, and the
-	# raw-state shim (kernel/mb2_state.c: mb2_info_addr_get / mb2_state_set /
-	# phys_read_u8/u32, the curlee #279 runtime-address reads) must be linked
-	# (the codegen references it 1:1; a missing symbol fails at link time,
-	# but this gate makes the wiring explicit).
+	# raw-state shim (kernel/mb2_state.c: mb2_info_addr_get / mb2_state_set)
+	# must be linked. The runtime-address reads (phys_read_u8/u32) are now
+	# Curlee compiler builtins (inline volatile loads — no C symbol).
 	@nm $(KERNEL_ELF) | grep -q ' curlee_mb2_parse$$' && echo "PASS: curlee_mb2_parse linked (multiboot2 parser, gh issue #15)"
 	@nm $(KERNEL_ELF) | grep -q ' mb2_state_set$$' && echo "PASS: mb2_state_set linked (mb2 state shim)"
-	@nm $(KERNEL_ELF) | grep -q ' phys_read_u32$$' && echo "PASS: phys_read_u32 linked (runtime-address read, curlee #279)"
 	@echo "All verification gates passed."
 
 clean:

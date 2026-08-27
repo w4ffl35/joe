@@ -180,6 +180,23 @@ fn tool_ring_next(cur: Int) -> Int {
   return ring_next(cur, slots);
 }
 
+// Index of the OLDEST live tool intent in the ring: the producer cursor is
+// `head` (next write position) and `count` intents are live, so the oldest is
+// at (head - count) mod 8. Division-free wrap (no `%` operator — rejected):
+// head + 8 - count lands in [0, 16), so one conditional subtract wraps it.
+// Added for the fb.c port (gh issue #13): kernel/fb.curlee's fb_run_loop
+// drains the oldest slot with an INLINE twin of this function (fb.curlee is
+// standalone-checkable and cannot call this module) — this is the
+// VM-asserted reference for that drain math, cross-checked by the VM test.
+fn tool_ring_oldest(head: Int, count: Int) -> Int {
+  let t: Int = head + 8 - count;
+  if (t >= 8) {
+    return t - 8;
+  } else {
+    return t;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2c: memory & asset management contracts
 // ---------------------------------------------------------------------------

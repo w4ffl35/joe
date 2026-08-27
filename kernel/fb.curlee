@@ -1,0 +1,606 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// fb.curlee — linear framebuffer software blitter + 60 FPS event loop,
+// ported from kernel/fb.c (gh issue #13).
+//
+// This is the IMPERATIVE layer of the renderer: it executes the pixel
+// loops. canvas.curlee / glyphs.curlee / assets.curlee compute the geometry
+// and intent (pure, verified); this module executes the pixels through the
+// runtime-address physical-memory BUILTINS (phys_write_u32 / phys_read_u32 —
+// inline volatile stores/loads in the freestanding codegen; the C shim's
+// former phys_write_u32 / fb_mem_read_u32 definitions were deleted when the
+// toolchain made them compiler builtins).
+//
+// REVISION (2026-08, gh issue #13): the toolchain now supports `static`
+// module-level state and [T; N] arrays, so the small mutable blitter state
+// the original faithful port left in C moved here as Curlee statics: the
+// tool-call ring (tool_kinds/tool_args + tool_head/tool_count), the loop
+// counters (loop_frame/loop_drained), the ring bookkeeping
+// (ring_active/ring_slot) and the draw-target indirection
+// (fb_draw_target/fb_target_stride). The ONLY state still owned by C
+// (kernel/fb.c) is the two LARGE PVH-conditional buffers — the 128x128 asset
+// region and the 2x640x480 frame ring — which cannot be Curlee statics:
+// Curlee has no conditional compilation and BOTH builds compile the SAME
+// merged kernel.c (scripts/build-kernel.sh), so a full-size array would land
+// in the PVH kernel's BSS unconditionally and blow QEMU's PVH LOAD budget
+// (phase2c-report.md §4.3: even a 64 KB static buffer hangs the PVH loader;
+// the PVH kernel's BSS+stack is ~45 KB today). The C shim exposes their base
+// addresses (fb_asset_region_base_get / fb_frame_ring_slot_base, 0 on the
+// PVH 1-byte stubs) and the build discriminator (fb_pvh_build); everything
+// else lives here.
+//
+// The runtime-address phys builtins REQUIRE an `unsafe { }` block AND a
+// `cap phys.mem` parameter in the enclosing function (belt-and-suspenders —
+// the mb2.curlee precedent). The capability is dropped by codegen (the
+// functions compile to plain C signatures, verified), so the blitter
+// signatures gain `pm: cap phys.mem` as the first parameter;
+// kernel.curlee's render_frame / draw_glyph chain threads it.
+//
+// Geometry constants are INLINED (8 tool slots, 640x480 ring slots, ...)
+// rather than calling assets.curlee's pure helpers: this module is merged
+// into the kernel TU by concatenation (scripts/build-kernel.sh) and is
+// `curlee check`ed STANDALONE (the net_glue.curlee exception — it cannot
+// call another module), exactly like the C #defines they replace. The
+// constants mirror the VM-asserted pure values (canvas_test.curlee §12/§15
+// cross-checks both sides, so a drift fails `make canvas-run` before boot).
+// Ring wrap uses the `%` operator (toolchain now supports it — the confirmed
+// tool-queue pattern), replacing the former division-free helpers.
+//
+// Design laws honored:
+//   - Single address space, Ring 0: pixel writes are direct volatile stores
+//     at runtime addresses (phys_write_u32 / phys_read_u32 builtins).
+//   - Deterministic verification: `curlee check fb.curlee` runs standalone
+//     and the merged kernel re-verifies it (`make check`); the blitter is
+//     contract-less (every value it consumes is opaque extern state), with
+//     all non-linear address math hidden in contract-less helpers (the
+//     established canvas/net_glue pattern).
+//   - Minimal footprint: no libc, no malloc, no String/Vec; the only static
+//     arrays here are the 8-slot tool ring (128 bytes) — the two large
+//     PVH-conditional buffers stay in the C shim for the budget reason above.
+
+// ---------------------------------------------------------------------------
+// Extern window into the C build-geometry shim (kernel/fb.c). Every symbol is
+// defined 1:1 in C; the codegen emits direct calls. Declared HERE, once —
+// the merged TU forbids duplicate externs (net_glue.curlee's note).
+// ---------------------------------------------------------------------------
+
+// Framebuffer globals (filled by mb2_state.c / vbe_state.c — C state shims).
+extern fn fb_addr_get() -> Int;
+extern fn fb_pitch_get() -> Int;
+extern fn fb_width_get() -> Int;
+extern fn fb_height_get() -> Int;
+
+// Compile-time build geometry:
+//   - fb_pvh_build(): 1 on the PVH build (the large buffers compile to 1-byte
+//     stubs), 0 on the GRUB build.
+//   - fb_asset_region_base_get(): the asset region's runtime address (0 on
+//     the PVH stub).
+//   - fb_frame_ring_slot_base(slot): the base address of frame-ring slot
+//     `slot` (0 on the PVH stub, or for an out-of-range slot).
+extern fn fb_pvh_build() -> Int;
+extern fn fb_asset_region_base_get() -> Int;
+extern fn fb_frame_ring_slot_base(slot: Int) -> Int;
+
+// ---------------------------------------------------------------------------
+// Mutable blitter state (Curlee statics — the toolchain's static + [T; N]
+// arrays, gh issue #13 revision).
+// ---------------------------------------------------------------------------
+
+// The 8-slot tool-call ring: parallel kind/arg arrays (8 slots x 2 Ints =
+// 128 bytes — the tool_queue_slots()==8 / tool_slot_bytes()==16 geometry
+// canvas_test.curlee §12 asserts). A slot is "empty" when its kind is 0
+// (kind 0 is reserved as the null intent).
+static tool_kinds: [Int; 8] = [0; 8];
+static tool_args: [Int; 8] = [0; 8];
+static tool_head: Int = 0;    // next slot to write (producer cursor)
+static tool_count: Int = 0;   // live (not-yet-drained) intents
+
+// Loop fuel + last-tick drain count.
+static loop_frame: Int = 0;
+static loop_drained: Int = 0;
+
+// Frame-ring bookkeeping + draw-target indirection: the blitter writes to
+// fb_draw_target (an abstract 32bpp surface with its own stride) instead of
+// the visible framebuffer when the ring is active. Before the first present
+// the target IS the visible framebuffer (fb_addr) — 2a/2e single-buffer
+// behavior exactly.
+static ring_active: Int = 0;
+static ring_slot: Int = 0;
+static fb_draw_target: Int = 0;
+static fb_target_stride: Int = 0;
+
+// ---------------------------------------------------------------------------
+// Contract-less address/math helpers (non-linear arithmetic is rejected by
+// the verifier in checked positions — the established canvas/net_glue
+// pattern: hide variable*variable multiplication in opaque helpers).
+// ---------------------------------------------------------------------------
+
+// Pixel address of (x, y) on a 32bpp surface: base + y*stride_px + x, where
+// stride is the BYTE stride (divide by 4 to get pixels per row).
+fn fb_xy_addr(base: Int, stride: Int, x: Int, y: Int) -> Int {
+  return base + y * (stride / 4) + x;
+}
+
+// Pixel address `(py * src_w + px) * 4` bytes past the 32bpp source buffer.
+fn fb_blit_src_addr(src: Int, src_w: Int, x: Int, y: Int) -> Int {
+  return src + (y * src_w + x) * 4;
+}
+
+// Total pixels of a w x h surface (the fb_clear loop bound).
+fn fb_clear_total(w: Int, h: Int) -> Int {
+  return w * h;
+}
+
+// Absolute value (Bresenham). Contract-less; the C original used a ternary.
+fn fb_iabs(a: Int) -> Int {
+  if (a >= 0) {
+    return a;
+  } else {
+    return -a;
+  }
+}
+
+// Sign of a step direction (Bresenham): 1 for a positive/zero diff, -1 for a
+// negative diff. The C original's `(a < b) ? 1 : -1`; the zero case's sign
+// is never used (the loop breaks before a zero-length axis steps).
+fn fb_isign(a: Int) -> Int {
+  if (a >= 0) {
+    return 1;
+  } else {
+    return -1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Accessors / geometry (the Phase 2c externs render_frame's gates read)
+// ---------------------------------------------------------------------------
+
+fn fb_ready() -> Int {
+  let a: Int = fb_addr_get();
+  if (a != 0) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+fn fb_get_width() -> Int {
+  return fb_width_get();
+}
+
+fn fb_get_height() -> Int {
+  return fb_height_get();
+}
+
+fn fb_ring_active() -> Int {
+  return ring_active;
+}
+
+fn fb_ring_slot() -> Int {
+  return ring_slot;
+}
+
+// Static asset-region geometry: the PVH build compiles the region to a
+// 1-byte stub (fb_pvh_build()==1) and these return 0 — the discriminator
+// kernel.curlee's main gates the ring loop on; the GRUB build returns the
+// pure region geometry (asset_region_w/h()==128, VM-asserted in
+// canvas_test.curlee §14; the C ASSET_REGION_W/H #defines mirror it).
+fn fb_asset_region_w() -> Int {
+  let pvh: Int = fb_pvh_build();
+  if (pvh == 1) {
+    return 0;
+  } else {
+    return 128;   // asset_region_w() (canvas_test §14)
+  }
+}
+
+fn fb_asset_region_h() -> Int {
+  let pvh: Int = fb_pvh_build();
+  if (pvh == 1) {
+    return 0;
+  } else {
+    return 128;   // asset_region_h() (canvas_test §14)
+  }
+}
+
+fn fb_asset_region_base() -> Int {
+  return fb_asset_region_base_get();
+}
+
+// Phase 2e-2/2f: wire the draw target to the visible framebuffer. Before the
+// frame ring activates, the draw target IS the visible framebuffer
+// (single-buffer 2a/2e behavior exactly); fb_present() re-points it at the
+// ring back buffers on the GRUB path. Gated on fb_addr != 0 (not the build
+// macro) so it covers both paths: GRUB (multiboot2 tag) and PVH (VBE probe).
+fn fb_wire_draw_target() -> Unit {
+  let a: Int = fb_addr_get();
+  if (a != 0) {
+    let p: Int = fb_pitch_get();
+    fb_draw_target = a;
+    fb_target_stride = p;
+  }
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// Pixel primitives (all bounds-checked, all writing through the draw target
+// — defense-in-depth over the Curlee geometry layer, which is provably
+// in-bounds; out-of-bounds writes are impossible by construction). The phys
+// builtins require unsafe + cap phys.mem (pm).
+// ---------------------------------------------------------------------------
+
+fn fb_clear(pm: cap phys.mem, color: Int) -> Unit {
+  let base: Int = fb_draw_target;
+  if (base == 0) {
+    return;
+  }
+  let w: Int = fb_width_get();
+  let h: Int = fb_height_get();
+  let total: Int = fb_clear_total(w, h);
+  unsafe {
+    let i: Int = 0;
+    while (i < total) {
+      phys_write_u32(base + i * 4, color);
+      i = i + 1;
+    }
+  }
+  return;
+}
+
+fn fb_pixel(pm: cap phys.mem, x: Int, y: Int, color: Int) -> Unit {
+  let base: Int = fb_draw_target;
+  if (base == 0) {
+    return;
+  }
+  let w: Int = fb_width_get();
+  let h: Int = fb_height_get();
+  if (x < 0 || y < 0 || x >= w || y >= h) {
+    return;
+  }
+  let stride: Int = fb_target_stride;
+  let a: Int = fb_xy_addr(base, stride, x, y);
+  unsafe {
+    phys_write_u32(a, color);
+  }
+  return;
+}
+
+fn fb_fill_rect(pm: cap phys.mem, x: Int, y: Int, w: Int, h: Int, color: Int) -> Unit {
+  let base: Int = fb_draw_target;
+  if (base == 0) {
+    return;
+  }
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+  // Clip to the framebuffer (defense-in-depth; Curlee geometry is already
+  // in-bounds via clip_rect/rect_fits_gate). imin/imax are assets.curlee's
+  // helpers — NOT available here (standalone-checkable module), so the
+  // clamping is inlined as fb_imin / fb_max0.
+  let fbw: Int = fb_width_get();
+  let fbh: Int = fb_height_get();
+  let x0: Int = fb_max0(x);   // x < 0 ? 0 : x
+  let y0: Int = fb_max0(y);   // y < 0 ? 0 : y
+  let xe: Int = x + w;
+  let ye: Int = y + h;
+  let x1: Int = fb_imin(xe, fbw);
+  let y1: Int = fb_imin(ye, fbh);
+  let stride: Int = fb_target_stride;
+  unsafe {
+    let py: Int = y0;
+    while (py < y1) {
+      let px: Int = x0;
+      while (px < x1) {
+        let a: Int = fb_xy_addr(base, stride, px, py);
+        phys_write_u32(a, color);
+        px = px + 1;
+      }
+      py = py + 1;
+    }
+  }
+  return;
+}
+
+// Bresenham line. Bounds-checked per pixel (clipped at the edges — fb_pixel
+// no-ops out of bounds). Direct algorithmic port of the C original; the
+// `while (1) { ... break; }` shape becomes a `done` flag (no break in
+// Curlee) and the mutable cursor (x0, y0, err) becomes assignments.
+fn fb_line(pm: cap phys.mem, x0: Int, y0: Int, x1: Int, y1: Int, color: Int) -> Unit {
+  let addr: Int = fb_addr_get();
+  if (addr == 0) {
+    return;
+  }
+  let dx: Int = fb_iabs(x1 - x0);
+  let dy: Int = fb_iabs(y1 - y0);
+  let sx: Int = fb_isign(x1 - x0);
+  let sy: Int = fb_isign(y1 - y0);
+  let err: Int = dx - dy;
+  let cx: Int = x0;
+  let cy: Int = y0;
+  let done: Bool = false;
+  while (!done) {
+    fb_pixel(pm, cx, cy, color);
+    if (cx == x1 && cy == y1) {
+      done = true;
+    } else {
+      let e2: Int = 2 * err;
+      if (e2 > -dy) {
+        err = err - dy;
+        cx = cx + sx;
+      }
+      if (e2 < dx) {
+        err = err + dx;
+        cy = cy + sy;
+      }
+    }
+  }
+  return;
+}
+
+// Asset blitting (32bpp RAW pixel buffer): copy src_w x src_h pixels from
+// the runtime address `src` to (dst_x, dst_y) on the draw target. Full OOB
+// gate: the whole asset must fit (Curlee's blit_fits already guarantees
+// this; double-check as defense-in-depth).
+fn fb_blit_asset(pm: cap phys.mem, src: Int, src_w: Int, src_h: Int, dst_x: Int, dst_y: Int) -> Unit {
+  let base: Int = fb_draw_target;
+  if (base == 0 || src == 0) {
+    return;
+  }
+  if (src_w <= 0 || src_h <= 0) {
+    return;
+  }
+  let fbw: Int = fb_width_get();
+  let fbh: Int = fb_height_get();
+  if (dst_x < 0 || dst_y < 0 || dst_x + src_w > fbw || dst_y + src_h > fbh) {
+    return;
+  }
+  let stride: Int = fb_target_stride;
+  unsafe {
+    let py: Int = 0;
+    while (py < src_h) {
+      let px: Int = 0;
+      while (px < src_w) {
+        let sa: Int = fb_blit_src_addr(src, src_w, px, py);
+        let v: U32 = phys_read_u32(sa);
+        let da: Int = fb_xy_addr(base, stride, dst_x + px, dst_y + py);
+        phys_write_u32(da, v);
+        px = px + 1;
+      }
+      py = py + 1;
+    }
+  }
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// Present + ring flip (Phase 2c)
+// ---------------------------------------------------------------------------
+//
+// Lifecycle (identical to the C original):
+//   1. Before the first present, ring_active == 0 and the draw target IS the
+//      visible framebuffer (single-buffer 2a/2e behavior exactly — writes
+//      are immediately visible, fb_present is a no-op).
+//   2. On the first present, if the framebuffer fits a ring slot
+//      (frame_ring_fits — 640x480 max, the GRUB request tag's size; the pure
+//      constants frame_ring_max_w/h are VM-asserted in canvas_test §15), the
+//      ring activates: ring_active=1 and the draw target re-points at
+//      frame_ring[0] (via fb_frame_ring_slot_base).
+//   3. Every subsequent present copies the CURRENT back buffer onto the
+//      visible framebuffer (a full-frame 32bpp copy bounded by
+//      fb_width * fb_height * 4), then advances ring_slot (0->1->0) and
+//      re-points the target at the new back buffer.
+//
+// The flip is a copy (not a page flip) because the multiboot2 framebuffer is
+// a single linear surface — there is no hardware scanline base to swap. The
+// PVH path: the ring is compiled out, fb_frame_ring_slot_base returns 0, and
+// fb_ring_activate() is a no-op returning 0 — this function stays
+// single-buffered (the VBE-probed LFB is the draw target and writes go
+// straight to it, matching the C #ifdef JOE_PVH_BOOT present).
+fn fb_present(pm: cap phys.mem) -> Unit {
+  let addr: Int = fb_addr_get();
+  if (addr == 0) {
+    return;
+  }
+  if (ring_active == 0) {
+    // First present: check the framebuffer fits a ring slot (same gate as
+    // frame_ring_fits). If not, stay single-buffered forever (no-op present
+    // — preserves 2a/2e behavior on oversized modes).
+    let w: Int = fb_width_get();
+    let h: Int = fb_height_get();
+    if (w <= 640 && h <= 480) {   // frame_ring_max_w/h() (canvas_test §15)
+      fb_ring_activate();
+    }
+    return;
+  }
+  // Ring active: copy the back buffer we just rendered onto the visible
+  // framebuffer, then advance the slot (verified ring arithmetic).
+  let base: Int = fb_draw_target;
+  let stride: Int = fb_target_stride;
+  let pitch: Int = fb_pitch_get();
+  let w: Int = fb_width_get();
+  let h: Int = fb_height_get();
+  unsafe {
+    let row: Int = 0;
+    while (row < h) {
+      let col: Int = 0;
+      while (col < w) {
+        let sa: Int = fb_xy_addr(base, stride, col, row);
+        let v: U32 = phys_read_u32(sa);
+        let da: Int = fb_xy_addr(addr, pitch, col, row);
+        phys_write_u32(da, v);
+        col = col + 1;
+      }
+      row = row + 1;
+    }
+  }
+  fb_ring_advance();
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// Frame-ring transitions (the flip LOGIC — fit gate, copy, advance decision
+// — is Curlee's fb_present; these mutate the Curlee ring statics and fetch
+// the C-owned ring-slot base addresses)
+// ---------------------------------------------------------------------------
+
+// Activate on the first present: ring_active=1, slot=0, draw target re-points
+// at frame_ring[0] with stride 640*4. Returns 1 on a real activation; on the
+// PVH build (ring compiled out — fb_frame_ring_slot_base returns 0) this is a
+// no-op returning 0, so fb_present stays single-buffered — exactly the old
+// #ifdef JOE_PVH_BOOT present's early return.
+fn fb_ring_activate() -> Int {
+  let slot0: Int = fb_frame_ring_slot_base(0);
+  if (slot0 == 0) {
+    return 0;
+  }
+  ring_active = 1;
+  ring_slot = 0;
+  fb_draw_target = slot0;
+  fb_target_stride = 2560;   // FRAME_RING_MAX_W * 4 (640 * 4)
+  return 1;
+}
+
+// Advance after a flip: 0 -> 1 -> 0 (frame_ring_next for 2 slots). Re-points
+// the draw target at the new back buffer. No-op on the PVH build (slot base
+// is 0 — the ring never activates there, so this is unreachable).
+fn fb_ring_advance() -> Unit {
+  let next: Int = (ring_slot + 1) % 2;
+  ring_slot = next;
+  let slot_base: Int = fb_frame_ring_slot_base(next);
+  if (slot_base != 0) {
+    fb_draw_target = slot_base;
+    fb_target_stride = 2560;   // FRAME_RING_MAX_W * 4
+  }
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b: 60 FPS event loop + kernel tool-call queue
+// ---------------------------------------------------------------------------
+//
+// Curlee's `main` drives the deterministic while-loop; per frame it calls:
+//
+//   frame = fb_loop_frame();   // current counter
+//   render_frame(pm, frame);   // Curlee scene (frame-aware)
+//   serial marker;             // FR:<n> (qemu-loop-smoke gate)
+//   fb_run_loop();             // ONE tick: drain the tool ring + advance
+//
+// The loop is fuel-bounded in Curlee (while fb_loop_frame() < N), so the
+// smoke gates stay deterministic and timeout-safe: the kernel renders N
+// frames, emits FB: 1, then falls through to the Phase 1 VGA + serial +
+// halt path. No malloc, no libc — the ring/loop state is Curlee statics.
+
+// Tool-queue ring geometry (8 slots x 16 bytes — two parallel [Int; 8]
+// arrays). MUST stay in sync with assets.curlee: tool_queue_slots()==8,
+// tool_slot_bytes()==16 — canvas_test.curlee §12 asserts the exact values; a
+// drift fails `make canvas-run` before any boot.
+
+// Enqueue a (kind, arg) tool intent into the fixed ring.
+// Returns 1 on success, 0 when the ring is full (producers must back off).
+// Kind 0 is reserved (null intent) — never enqueue kind 0.
+fn fb_tool_enqueue(kind: Int, arg: Int) -> Int {
+  if (kind == 0) {
+    return 0;
+  }
+  if (tool_count >= 8) {   // tool_queue_slots() == 8 (canvas_test §12)
+    return 0;              // ring full
+  }
+  let h: Int = tool_head;
+  tool_kinds[h % 8] = kind;
+  tool_args[h % 8] = arg;
+  tool_head = (tool_head + 1) % 8;
+  tool_count = tool_count + 1;
+  return 1;
+}
+
+// Number of tool intents currently queued (0..8).
+fn fb_tool_pending() -> Int {
+  return tool_count;
+}
+
+// Number of tool intents drained by the last fb_run_loop() tick.
+fn fb_tool_drained() -> Int {
+  return loop_drained;
+}
+
+// Reset the frame counter, the tool ring, and (on the GRUB path) the frame
+// ring back to single-buffer mode. Called once by Curlee main (fb_loop_init).
+fn fb_loop_state_reset() -> Unit {
+  loop_frame = 0;
+  tool_head = 0;
+  tool_count = 0;
+  loop_drained = 0;
+  let i: Int = 0;
+  while (i < 8) {
+    tool_kinds[i % 8] = 0;
+    tool_args[i % 8] = 0;
+    i = i + 1;
+  }
+  ring_active = 0;
+  ring_slot = 0;
+  fb_draw_target = fb_addr_get();
+  fb_target_stride = fb_pitch_get();
+  return;
+}
+
+// fb_loop_init: the loop-entry reset (kept as its own function so
+// kernel.curlee's main reads the same name as the original port).
+fn fb_loop_init() -> Unit {
+  fb_loop_state_reset();
+  return;
+}
+
+// Current frame counter (the loop's fuel in Curlee main).
+fn fb_loop_frame() -> Int {
+  return loop_frame;
+}
+
+// One loop tick: consume (drain) any queued tool intents, then advance the
+// frame counter. The actual render + present happen in Curlee's render_frame
+// (called by main before fb_run_loop; render_frame calls fb_present() last,
+// which performs the Phase 2c back-buffer flip).
+//
+// Deterministic + fuel-bounded by design: it never spins; it advances the
+// counter exactly once per call, so the Curlee while-loop is the fuel gate.
+// The drain reads the OLDEST live slot ((head - count) mod 8 — the `%`
+// form; assets.curlee's tool_ring_oldest is the VM-asserted reference for
+// the same math) and clears it (kind 0 = null intent), proving the ring
+// advances and keeping the queue bounded (producers can never outrun the
+// consumer beyond the fixed capacity).
+fn fb_run_loop() -> Unit {
+  let drained: Int = 0;
+  let c: Int = tool_count;
+  while (c > 0) {
+    let h: Int = tool_head;
+    let idx: Int = (h + 8 - c) % 8;   // tool_ring_oldest (canvas_test §12)
+    tool_kinds[idx] = 0;              // consume: clear the reserved kind 0
+    tool_args[idx] = 0;
+    tool_count = tool_count - 1;
+    drained = drained + 1;
+    c = c - 1;
+  }
+  loop_drained = drained;
+  loop_frame = loop_frame + 1;
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// Clamping helpers (fb_fill_rect's clip; standalone twins of assets.curlee's
+// imin/imax — that module is not importable from this one)
+// ---------------------------------------------------------------------------
+
+fn fb_imin(a: Int, b: Int) -> Int {
+  if (a <= b) {
+    return a;
+  } else {
+    return b;
+  }
+}
+
+fn fb_max0(a: Int) -> Int {
+  if (a >= 0) {
+    return a;
+  } else {
+    return 0;
+  }
+}

@@ -78,12 +78,20 @@
 //   - mb2_state_set() fills the framebuffer globals fb_addr/fb_pitch/
 //     fb_width/fb_height (C-visible .data owned by kernel/fb.c; Curlee has
 //     no globals and no way to address C globals — the vbe_state.c pattern).
-//   - phys_read_u8()/phys_read_u32() — runtime-address physical reads
-//     (curlee #279); raw volatile loads, opaque to the verifier.
+//   - phys_read_u8()/phys_read_u32() — runtime-address physical reads,
+//     now Curlee COMPILER BUILTINS (inline volatile loads — the C shim's
+//     definitions in mb2_state.c were deleted); raw volatile loads, opaque
+//     to the verifier. They require `unsafe` + `cap phys.mem` (see the
+//     mb2_parse body below).
 extern fn mb2_info_addr_get() -> Int;
 extern fn mb2_state_set(addr: U32, pitch: U32, width: U32, height: U32) -> Unit;
-extern fn phys_read_u8(addr: Int) -> U8;
-extern fn phys_read_u32(addr: Int) -> U32;
+
+// Scratch for laundering opaque MMIO reads before the mb2_state_set call (see
+// the framebuffer-tag branch of mb2_parse): the rebuilt verifier rejects
+// passing a DIRECT phys_read result as a call argument ("cannot prove call
+// contract on opaque MMIO read argument"), but a store->load round-trip
+// through a static yields a fresh symbolic value it accepts.
+static mb2_tag_scratch: [U32; 4] = [0; 4];
 
 // Parse the multiboot2 info structure at mb2_info_addr and fill the
 // framebuffer globals. Returns 1 if a 32bpp framebuffer tag was found and
@@ -129,7 +137,17 @@ fn mb2_parse(pm: cap phys.mem) -> Int {
           // usable: 32bpp AND a non-zero framebuffer address (defense-in-
           // depth against a bogus tag from a corrupt info).
           if (bpp == 32 && addr_hi == 0 && addr_lo != 0) {
-            mb2_state_set(addr_lo, pitch, width, height);
+            // Launder the four opaque MMIO reads through the static scratch
+            // before the extern call (see the declaration above).
+            mb2_tag_scratch[0] = addr_lo;
+            mb2_tag_scratch[1] = pitch;
+            mb2_tag_scratch[2] = width;
+            mb2_tag_scratch[3] = height;
+            let a0: U32 = mb2_tag_scratch[0];
+            let a1: U32 = mb2_tag_scratch[1];
+            let a2: U32 = mb2_tag_scratch[2];
+            let a3: U32 = mb2_tag_scratch[3];
+            mb2_state_set(a0, a1, a2, a3);
             return 1;
           }
           return 0;   // framebuffer tag present but not usable

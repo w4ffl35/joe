@@ -276,6 +276,23 @@ fn main(pm: cap phys.mem) -> Unit {
 
 ### 4.5 `kernel/fb.c` — extended blitter (C driver, owns state)
 
+> **Superseded by gh issue #13** (2026-08): the ENTIRE blitter + event loop
+> below migrated to genuine Curlee (`kernel/fb.curlee`, merged into the kernel
+> TU — the codegen emits the functions as `curlee_fb_*` static symbols and the
+> C externs were removed). The 2026-08 revision then moved the small mutable
+> blitter state (tool ring, loop counters, ring bookkeeping, draw-target
+> indirection) into Curlee `static` module state (toolchain static + `[T; N]`
+> arrays) and the runtime-address memory moves became Curlee compiler builtins
+> (`phys_write_u32` / `phys_read_u8/u32` — inline volatile stores/loads).
+> `kernel/fb.c` is now a ~140-line build-geometry shim: the four framebuffer
+> globals (filled by `mb2_state.c` / `vbe_state.c`) and the two LARGE
+> PVH-conditional buffers (128x128 asset region + 2x640x480 frame ring — sized
+> per build with `#ifndef JOE_PVH_BOOT` because Curlee has no conditional
+> compilation and the PVH loader rejects a large BSS, `docs/phase2c-report.md`
+> §4.3), plus `fb_pvh_build`/`fb_asset_region_base_get`/
+> `fb_frame_ring_slot_base`. This section is kept as the historical design
+> record.
+
 Extends the existing glyph renderer with a full primitive surface. All functions
 bounds-check against `fb_width`/`fb_height` (defense-in-depth over Curlee geometry).
 

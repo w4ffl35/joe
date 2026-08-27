@@ -36,66 +36,21 @@
 // cannot coexist in one translation unit.
 extern fn curlee_halt() -> Unit;
 
-// Provided by kernel/fb.c — linear framebuffer software blitter.
-// NOTE: there is NO `extern fn fb_init` since gh issue #15 — the old fb_init
-// was C logic (parse the multiboot2 tag, then wire the draw target); both
-// halves now live in the Curlee layer. main drives mb2_parse(pm)
-// (kernel/mb2.curlee, ported from kernel/mb2.c) then fb_wire_draw_target()
-// itself, exactly like the gh issue #11 vbe_probe pattern.
-// gh issue #11/#15: re-wires the draw target after the Curlee mb2_parse /
-// vbe_probe fill the framebuffer globals — main calls this once after the
-// multiboot2 parse, and AGAIN after the Curlee vbe_probe on the PVH path
-// (the first wiring ran while fb_addr was still 0). Same gate as the old
-// fb_init's: wires only when fb_addr != 0.
-extern fn fb_wire_draw_target() -> Unit;
-extern fn fb_ready() -> Int;
-extern fn fb_clear(color: Int) -> Unit;
-extern fn fb_pixel(x: Int, y: Int, color: Int) -> Unit;
-extern fn fb_fill_rect(x: Int, y: Int, w: Int, h: Int, color: Int) -> Unit;
-extern fn fb_line(x0: Int, y0: Int, x1: Int, y1: Int, color: Int) -> Unit;
-// NOTE: fb_draw_char / fb_draw_char_color externs REMOVED — glyph rendering
-// moved to Curlee (draw_glyph below reads glyph_pixel from glyphs.curlee and
-// drives fb_pixel per set pixel). fb.c no longer defines them (no C copy of
-// the tables — docs/c-boundary-policy.md).
-extern fn fb_blit_asset(src: Int, src_w: Int, src_h: Int, dst_x: Int, dst_y: Int) -> Unit;
-extern fn fb_present() -> Unit;
-extern fn fb_run_loop() -> Unit;
-
-// Phase 2c — memory & asset management contracts. Accessor/geometry externs
-// (kernel/fb.c owns the static asset region + frame ring; these externs are
-// the runtime window Curlee's render_frame uses to enforce the verified
-// gates with the ACTUAL framebuffer/region sizes):
-//   fb_get_width()/fb_get_height()      -> current framebuffer size
-//   fb_asset_region_w/h()               -> static asset region geometry
-//   fb_asset_region_base()              -> base address of the asset region
-//   fb_ring_active()                    -> 1 when the frame ring is active
-//   fb_ring_slot()                      -> current back-buffer slot index
-extern fn fb_get_width() -> Int;
-extern fn fb_get_height() -> Int;
-extern fn fb_asset_region_w() -> Int;
-extern fn fb_asset_region_h() -> Int;
-extern fn fb_asset_region_base() -> Int;
-extern fn fb_ring_active() -> Int;
-extern fn fb_ring_slot() -> Int;
-
-// Phase 2b 60 FPS loop control + kernel tool-call queue (kernel/fb.c owns the
-// mutable state; these externs are the only window Curlee has into it).
-//   fb_loop_init()      -> reset the frame counter + tool ring
-//   fb_loop_frame()     -> current frame counter (the loop's fuel)
-//   fb_tool_enqueue(k,a)-> enqueue a (kind, arg) tool intent; 1 ok, 0 full
-//   fb_tool_drained()   -> intents consumed by the last fb_run_loop tick
-//   fb_tool_pending()   -> intents currently queued
-//
-// The PRODUCER API (fb_tool_enqueue / fb_tool_drained / fb_tool_pending) is
-// exercised live by main's loop (one "frame-tick" intent per frame) and is
-// the same entry point future producers (LLM bridge, input handler — Phase
-// 2d) will use. The producer-side frame -> slot mapping is `tool_queue_slot`
-// (assets.curlee), VM-asserted by canvas_test.curlee §13.
-extern fn fb_loop_init() -> Unit;
-extern fn fb_loop_frame() -> Int;
-extern fn fb_tool_enqueue(kind: Int, arg: Int) -> Int;
-extern fn fb_tool_drained() -> Int;
-extern fn fb_tool_pending() -> Int;
+// gh issue #13: the ENTIRE framebuffer blitter + 60 FPS event loop + the
+// small mutable blitter state moved to genuine Curlee (kernel/fb.curlee,
+// merged in before this file) — the fb_wire_draw_target / fb_ready /
+// fb_clear / fb_pixel / fb_fill_rect / fb_line / fb_blit_asset / fb_present
+// / fb_get_width / fb_get_height / fb_ring_active / fb_ring_slot /
+// fb_asset_region_w/h/base / fb_loop_init / fb_loop_frame / fb_tool_enqueue
+// / fb_tool_drained / fb_tool_pending / fb_run_loop externs are GONE (the
+// codegen emits them as curlee_fb_* static symbols), and the tool ring, loop
+// counters, ring bookkeeping and draw-target indirection are Curlee `static`
+// state (toolchain static + [T; N] arrays). kernel/fb.c is now only the
+// build-geometry shim (framebuffer globals + the two large PVH-conditional
+// ring/region arrays + fb_pvh_build/fb_asset_region_base_get/
+// fb_frame_ring_slot_base) — this file declares NO fb_* externs at all.
+// main gates the ring loop on fb_asset_region_w()==0 below — the PVH/GRUB
+// discriminator (fb_pvh_build in the shim).
 
 // Phase 2d-1/2d-2 — VirtIO-net + TCP/IP stack extern surface. Declared in
 // kernel/net_glue.curlee (merged in before this file by
@@ -162,7 +117,7 @@ fn serial_hello(pm: cap phys.mem) -> Unit {
 // treats the contract-less callers as opaque, so the pixel addresses and the
 // glyph_pixel requires are guarded by explicit full-range checks (the verifier
 // is path-sensitive: it picks up `col >= 0 && col < 5` etc. from the guards).
-fn draw_glyph_px(ch: Int, x: Int, y: Int, scale: Int, color: Int,
+fn draw_glyph_px(pm: cap phys.mem, ch: Int, x: Int, y: Int, scale: Int, color: Int,
                  row: Int, col: Int) -> Unit {
   if (row < 0 || row >= 7) {
     return;
@@ -180,11 +135,11 @@ fn draw_glyph_px(ch: Int, x: Int, y: Int, scale: Int, color: Int,
           // Top-left of the scale x scale block: px = x + col*scale.
           let px0: Int = x + col * scale;
           let py0: Int = y + row * scale;
-          fb_pixel(px0, py0, color);
-          draw_glyph_block(ch, x, y, scale, color, row, col, 0, 1);
+          fb_pixel(pm, px0, py0, color);
+          draw_glyph_block(pm, ch, x, y, scale, color, row, col, 0, 1);
         }
         // Advance to the next column (immutable index recursion).
-        draw_glyph_px(ch, x, y, scale, color, row, col + 1);
+        draw_glyph_px(pm, ch, x, y, scale, color, row, col + 1);
       } else {
         return;
       }
@@ -195,24 +150,24 @@ fn draw_glyph_px(ch: Int, x: Int, y: Int, scale: Int, color: Int,
 // The scale x scale block of glyph pixel (row, col): draw each (dx, dy) cell.
 // px = x + col*scale + dx is accumulated additively (x + col*scale is a
 // constant base per pixel, then + dx).
-fn draw_glyph_block(ch: Int, x: Int, y: Int, scale: Int, color: Int,
+fn draw_glyph_block(pm: cap phys.mem, ch: Int, x: Int, y: Int, scale: Int, color: Int,
                     row: Int, col: Int, dx: Int, dy: Int) -> Unit {
   if (dy >= scale) {
     return;
   } else {
     if (dx >= scale) {
       // Next row of the block.
-      draw_glyph_block(ch, x, y, scale, color, row, col, 0, dy + 1);
+      draw_glyph_block(pm, ch, x, y, scale, color, row, col, 0, dy + 1);
     } else {
       // (0,0) was already drawn by the caller; skip it here.
       if (dx == 0 && dy == 0) {
-        draw_glyph_block(ch, x, y, scale, color, row, col, 1, 0);
+        draw_glyph_block(pm, ch, x, y, scale, color, row, col, 1, 0);
       } else {
         // px = x + col*scale + dx — same linear form as draw_glyph_px.
         let px1: Int = x + col * scale + dx;
         let py1: Int = y + row * scale + dy;
-        fb_pixel(px1, py1, color);
-        draw_glyph_block(ch, x, y, scale, color, row, col, dx + 1, dy);
+        fb_pixel(pm, px1, py1, color);
+        draw_glyph_block(pm, ch, x, y, scale, color, row, col, dx + 1, dy);
       }
     }
   }
@@ -222,8 +177,8 @@ fn draw_glyph_block(ch: Int, x: Int, y: Int, scale: Int, color: Int,
 // caller to have gated the bounding box (char_fits_gate). Contract-less:
 // the recursion bounds (row/col < 7/5) are enforced by the immutable-index
 // recursion above, matching the total-function style of glyph_row.
-fn draw_glyph(ch: Int, x: Int, y: Int, scale: Int, color: Int) -> Unit {
-  draw_glyph_px(ch, x, y, scale, color, 0, 0);
+fn draw_glyph(pm: cap phys.mem, ch: Int, x: Int, y: Int, scale: Int, color: Int) -> Unit {
+  draw_glyph_px(pm, ch, x, y, scale, color, 0, 0);
   return;
 }
 
@@ -600,39 +555,40 @@ fn render_frame(pm: cap phys.mem, frame: Int) -> Unit {
   let fbw: Int = fb_get_width();
   let fbh: Int = fb_get_height();
   // Clear to a dark background (full-screen: always in-bounds).
-  fb_clear(bg);
+  fb_clear(pm, bg);
   // A panel rectangle. The y position alternates between two rows with the
-  // frame index (pure Int math — frame is the loop counter from fb.c, opaque
-  // to the verifier, so the arithmetic here is contract-less by design). No
-  // modulo (rejected): fold the parity into a subtraction, then scale.
+  // frame index (pure Int math — frame is the loop counter from fb.curlee,
+  // opaque to the verifier, so the arithmetic here is contract-less by
+  // design). No modulo (rejected): fold the parity into a subtraction, then
+  // scale.
   let panel_parity: Int = frame - (frame / 2) * 2;
   let panel_y: Int = 40 + panel_parity * 60;
   // Gate the fill rect (200x120 at (40, panel_y)): skip if it doesn't fit.
   let panel_fits: Bool = rect_fits_gate(200, 120, 40, panel_y, fbw, fbh);
   if (panel_fits) {
-    fb_fill_rect(40, panel_y, 200, 120, panel);
+    fb_fill_rect(pm, 40, panel_y, 200, 120, panel);
   }
   // Gate the line (1px at y=170 from x=40 to x=240).
   let line_fits: Bool = line_fits_gate(40, 170, 240, 170, fbw, fbh);
   if (line_fits) {
-    fb_line(40, 170, 240, 170, line);
+    fb_line(pm, 40, 170, 240, 170, line);
   }
   // "JOE" in 4x-scale glyphs at (60, 60) in white — gate each char (5*4 x
   // 7*4 = 20x28 bounding box).
   let j_fits: Bool = char_fits_gate(60, 60, 4, fbw, fbh);
   if (j_fits) {
-    draw_glyph(74, 60, 60, 4, white);   // J
+    draw_glyph(pm, 74, 60, 60, 4, white);   // J
   }
   let o_fits: Bool = char_fits_gate(96, 60, 4, fbw, fbh);
   if (o_fits) {
-    draw_glyph(79, 96, 60, 4, white);   // O
+    draw_glyph(pm, 79, 96, 60, 4, white);   // O
   }
   let e_fits: Bool = char_fits_gate(132, 60, 4, fbw, fbh);
   if (e_fits) {
-    draw_glyph(69, 132, 60, 4, white);  // E
+    draw_glyph(pm, 69, 132, 60, 4, white);  // E
   }
   // Present the frame (Phase 2c: the ring flip).
-  fb_present();
+  fb_present(pm);
   return;
 }
 
