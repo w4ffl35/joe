@@ -158,312 +158,145 @@ fn glyph_row(ch: Int, row: Int) -> Int {
 
 // 'H' — rows 0..6: |  |  |  |##|  |  |  |
 fn glyph_h(row: Int) -> Int {
-  if (row == 0) {
-    return 17;
-  } else {
-    if (row == 1) {
-      return 17;
-    } else {
-      if (row == 2) {
-        return 17;
-      } else {
-        if (row == 3) {
-          return 31;
-        } else {
-          if (row == 4) {
-            return 17;
-          } else {
-            if (row == 5) {
-              return 17;
-            } else {
-              return 17;
-            }
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 7] = [0; 7];
+  arr[0] = 17;
+  arr[1] = 17;
+  arr[2] = 17;
+  arr[3] = 31;
+  arr[4] = 17;
+  arr[5] = 17;
+  arr[6] = 17;
+  return arr[row];
 }
 
 // 'e' — rows 0..6:  ###  #  # #### #      ###
 fn glyph_e(row: Int) -> Int {
-  if (row == 0) {
-    return 14;
-  } else {
-    if (row == 1) {
-      return 17;
-    } else {
-      if (row == 2) {
-        return 31;
-      } else {
-        if (row == 3) {
-          return 16;
-        } else {
-          if (row == 4) {
-            return 14;
-          } else {
-            return 0;
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 6] = [0; 6];
+  arr[0] = 14;
+  arr[1] = 17;
+  arr[2] = 31;
+  arr[3] = 16;
+  arr[4] = 14;
+  return arr[row];
 }
 
 // 'l' — rows 0..6:  #    #    #    #   ###
 fn glyph_l(row: Int) -> Int {
-  if (row == 0) {
-    return 4;
-  } else {
-    if (row == 1) {
-      return 4;
-    } else {
-      if (row == 2) {
-        return 4;
-      } else {
-        if (row == 3) {
-          return 4;
-        } else {
-          if (row == 4) {
-            return 7;
-          } else {
-            return 0;
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 6] = [0; 6];
+  arr[0] = 4;
+  arr[1] = 4;
+  arr[2] = 4;
+  arr[3] = 4;
+  arr[4] = 7;
+  arr[5] = 0;
+  return arr[row];
 }
 
 // 'o' — rows 0..6:  ###  #  # #  # #  #  ###
 fn glyph_o(row: Int) -> Int {
-  if (row == 0) {
-    return 14;
-  } else {
-    if (row == 1) {
-      return 17;
-    } else {
-      if (row == 2) {
-        return 17;
-      } else {
-        if (row == 3) {
-          return 17;
-        } else {
-          if (row == 4) {
-            return 14;
-          } else {
-            return 0;
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 6] = [0; 6];
+  arr[0] = 14;
+  arr[1] = 17;
+  arr[2] = 17;
+  arr[3] = 17;
+  arr[4] = 14;
+  arr[5] = 0;
+  return arr[row];
 }
 
 // 'W' — rows 0..6: #  # #  # #  # # # # ##### #  #
 fn glyph_w(row: Int) -> Int {
-  if (row == 0) {
-    return 17;
-  } else {
-    if (row == 1) {
-      return 17;
-    } else {
-      if (row == 2) {
-        return 17;
-      } else {
-        if (row == 3) {
-          return 21;
-        } else {
-          if (row == 4) {
-            return 27;
-        } else {
-            if (row == 5) {
-              return 17;
-            } else {
-              return 17;
-            }
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 7] = [17; 7];
+  arr[0] = 17;
+  arr[1] = 17;
+  arr[2] = 17;
+  arr[3] = 21;
+  arr[4] = 27;
+  arr[5] = 17;
+  arr[6] = 17;
+  return arr[row];
 }
 
 // 'r' — rows 0..6:  ##   #    #    #   ###
 fn glyph_r(row: Int) -> Int {
-  if (row == 0) {
-    return 6;
-  } else {
-    if (row == 1) {
-      return 4;
-    } else {
-      if (row == 2) {
-        return 4;
-      } else {
-        if (row == 3) {
-          return 4;
-        } else {
-          if (row == 4) {
-            return 7;
-          } else {
-            return 0;
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 6] = [0; 6];
+  arr[0] = 6;
+  arr[1] = 4;
+  arr[2] = 4;
+  arr[3] = 4;
+  arr[4] = 7;
+  arr[5] = 0;
+  return arr[row];
 }
 
 // 'd' — rows 0..6:    #    #  ### #  # #  #  ###
 fn glyph_d(row: Int) -> Int {
-  if (row == 0) {
-    return 1;
-  } else {
-    if (row == 1) {
-      return 1;
-    } else {
-      if (row == 2) {
-        return 7;
-      } else {
-        if (row == 3) {
-          return 9;
-        } else {
-          if (row == 4) {
-            return 9;
-          } else {
-            if (row == 5) {
-              return 7;
-            } else {
-              return 0;
-            }
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 7] = [0; 7];
+  arr[0] = 1;
+  arr[1] = 1;
+  arr[2] = 7;
+  arr[3] = 9;
+  arr[4] = 9;
+  arr[5] = 7;
+  arr[6] = 0;
+  return arr[row];
 }
 
 // 'f' — rows 0..6:  ###  #  # #### #    #
 fn glyph_f(row: Int) -> Int {
-  if (row == 0) {
-    return 6;
-  } else {
-    if (row == 1) {
-      return 9;
-    } else {
-      if (row == 2) {
-        return 14;
-      } else {
-        if (row == 3) {
-          return 8;
-        } else {
-          if (row == 4) {
-            return 8;
-          } else {
-            return 0;
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 6] = [0; 6];
+  arr[0] = 6;
+  arr[1] = 9;
+  arr[2] = 14;
+  arr[3] = 8;
+  arr[4] = 8;
+  return arr[row];
 }
 
 // 'm' — rows 0..6: # # # # # # # # # ##
 fn glyph_m(row: Int) -> Int {
-  if (row == 0) {
-    return 21;
-  } else {
-    if (row == 1) {
-      return 21;
-    } else {
-      if (row == 2) {
-        return 21;
-      } else {
-        if (row == 3) {
-          return 21;
-        } else {
-          if (row == 4) {
-            return 27;
-          } else {
-            return 0;
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 6] = [0; 6];
+  arr[0] = 21;
+  arr[1] = 21;
+  arr[2] = 21;
+  arr[3] = 21;
+  arr[4] = 27;
+  arr[5] = 0;
+  return arr[row];
 }
 
 // 'C' — rows 0..6:  ###  #  # #    #    ###
 fn glyph_c(row: Int) -> Int {
-  if (row == 0) {
-    return 14;
-  } else {
-    if (row == 1) {
-      return 17;
-    } else {
-      if (row == 2) {
-        return 16;
-      } else {
-        if (row == 3) {
-          return 16;
-        } else {
-          if (row == 4) {
-            return 14;
-          } else {
-            return 0;
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 6] = [0; 6];
+  arr[0] = 14;
+  arr[1] = 17;
+  arr[2] = 16;
+  arr[3] = 16;
+  arr[4] = 14;
+  arr[5] = 0;
+  return arr[row];
 }
 
 // 'u' — rows 0..6: #  # #  # #  # #  #  ###
 fn glyph_u(row: Int) -> Int {
-  if (row == 0) {
-    return 5;
-  } else {
-    if (row == 1) {
-      return 9;
-    } else {
-      if (row == 2) {
-        return 9;
-      } else {
-        if (row == 3) {
-          return 9;
-        } else {
-          if (row == 4) {
-            return 7;
-          } else {
-            return 0;
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 6] = [0; 6];
+  arr[0] = 5;
+  arr[1] = 9;
+  arr[2] = 9;
+  arr[3] = 9;
+  arr[4] = 7;
+  arr[5] = 0;
+  return arr[row];
 }
 
 // '!' — rows 0..6:  #    #    #        #
 fn glyph_bang(row: Int) -> Int {
-  if (row == 0) {
-    return 4;
-  } else {
-    if (row == 1) {
-      return 4;
-    } else {
-      if (row == 2) {
-        return 4;
-      } else {
-        if (row == 3) {
-          return 0;
-        } else {
-          if (row == 4) {
-            return 4;
-          } else {
-            return 0;
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 6] = [0; 6];
+  arr[0] = 4;
+  arr[1] = 4;
+  arr[2] = 4;
+  arr[3] = 0;
+  arr[4] = 4;
+  arr[5] = 0;
+  return arr[row];
 }
