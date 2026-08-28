@@ -1,0 +1,599 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// virtio_blk.curlee — Phase 2g virtio-blk storage driver (raw sector read,
+// no filesystem), gh issue #26.
+//
+// Boot path & transport (mirrors the 2d-1 virtio-net LOCKED decisions):
+//   Legacy virtio 0.9.5 over the PCI I/O BAR. The smoke path boots QEMU with
+//   `-device virtio-blk-pci,disable-modern=on,drive=blk0`, which makes the
+//   device present the legacy ID 0x1001 and the legacy-only register layout
+//   (QueuePFN / legacy status / device config at BAR0+0x14). No capability
+//   walk, no MSI-X, no modern registers. The driver NEVER offers
+//   VIRTIO_F_VERSION_1 (bit 32) — impossible anyway, the legacy guest-features
+//   register is 32 bits wide — which is what keeps the device in legacy mode.
+//
+// Probe IDs (virtio spec, mirroring the net driver's comment):
+//   0x1AF4:0x1001 — legacy block (QEMU with disable-modern=on forces this)
+//   0x1AF4:0x1042 — modern transitional block (recognized but only driven
+//                    when it presents a legacy I/O BAR — not the smoke path)
+//   0x1AF4:0x1FE8 — modern-only block (never initialized here: no legacy
+//                    transport)
+//   The net driver's 0x1000/0x1041 IDs are NET devices and never matched.
+//
+// Ring layout (matches Linux vring_init + QEMU legacy exactly — identical to
+// virtio-net's, with ONE queue instead of RX/TX):
+//   queue base (4096-aligned) -> PFN register = phys >> 12
+//     page 0: vring_desc[256]   (16 B each)
+//     page 1: vring_avail       (flags + idx + ring[256])
+//     page 2: vring_used        (flags + idx + ring[256] of {id,len})
+//   There is no GuestPageSize register in the shipped legacy layout (see the
+//   virtio_net.curlee header note); the PFN unit is fixed at 4096 bytes.
+//
+// Request shape (virtio_blk_outhdr, read path only):
+//   desc 0: the 16-byte request header {type u32 = 0 (VIRTIO_BLK_T_IN),
+//           reserved u32 = 0, sector u64 = LBA} — 4 + 4 + 8 = 16 bytes; the
+//           sector u64 is naturally aligned at offset 8 and the struct ends
+//           at 16 (QEMU's VirtIOBlockOutHdr is not packed; the Linux driver
+//           uses the same 16-byte layout — verified live: a 12-byte header
+//           draws "virtio-blk request outhdr too short" from QEMU).
+//   desc 1: the data buffer (sectors * 512 bytes), device writes it.
+//   desc 2: 1-byte status (0 = VIRTIO_BLK_S_OK), device writes it.
+//   The three descriptors form a NEXT chain (head 0 -> 1 -> 2); the used
+//   ring reports the head id 0 with len = sectors*512 + 1.
+//   No write support (VIRTIO_BLK_T_OUT is out of scope for the MVP), no
+//   filesystem — a raw "read N sectors at LBA into a fixed buffer" contract
+//   (see blk_read/blk_sector_byte), enough to load a single embedded model
+//   blob from a disk image (the Native Inference milestone's need).
+//
+// Build-side disk image (gh issue #26, criterion 4): scripts/make-blk-disk.sh
+// creates the raw image and writes a model blob (or the built-in "JOE-BLK!"
+// test pattern over LBA 64..71) at a known LBA — no filesystem.
+//
+// PVH sizing mode (mirrors virtio_net.curlee's option 1/option 2 LOCK):
+//   GRUB build (no JOE_PVH_BOOT) — OPTION 2 ACTIVE: 5-page queue memory +
+//   8-sector (4096 B) data buffer. The device runs on the GRUB/ISO path,
+//   which is where qemu-blk-smoke boots (the PVH `-kernel` machine exposes
+//   no legacy PCI config space — docs/phase2f-report.md §4).
+//   PVH build (JOE_PVH_BOOT) — OPTION 1 ACTIVE: the queue memory stubs to 1
+//   page and the data buffer to 1 sector, every base getter returns 0, and
+//   blk_init() bails — blk_probe() finds nothing there anyway (no PCI config
+//   space), keeping the image inside the PVH LOAD budget. The getter surface
+//   is identical on both paths.
+//
+// PORT NOTE — per-build-target static array sizing (gh issue #296): the queue
+// memory and the data buffer are Curlee statics sized by `--define` build
+// constants (BLK_QMEM_PAGES, BLK_BUF_SECTORS), exactly like virtio_net's
+// NET_QMEM_PAGES/NET_RX_BUFS. The base addresses flow in through Curlee
+// `addr_of` reads (issue #286). The descriptor addr fields (u64) are built
+// with the Int -> U64 widening for values < 2^32 (curlee #277); the pages
+// were pre-zeroed by the queue setup, so the high dwords are 0 for every
+// buffer below 4 GiB.
+//
+// PORT NOTE — memory barriers: the same rationale as virtio_net.curlee's
+// PORT NOTE — every ring access is a phys_write_u*/phys_read_u* builtin
+// (volatile loads/stores, never reordered by GCC relative to each other), so
+// device-visible order is program order; the curlee_sfence before each idx
+// publication is behavior-preserving belt-and-braces for the QEMU TCG
+// kick-ordering concern (one extern call per publication, from the Curlee
+// runtime's rt.c). NOTE: the extern is declared ONCE in the merged TU by
+// kernel/virtio_net.curlee (the merged TU forbids duplicate externs — the
+// compiler rejects a second declaration); the standalone check supplies it
+// via a generated wrapper (see the Makefile's blk-check.curlee rule).
+//
+// No-blk-safe (acceptance criterion 6, mirror of virtio-net's): with no
+// virtio-blk device, blk_probe() finds nothing (config reads return
+// 0xFFFFFFFF), blk_init()/blk_read()/blk_sector_byte() all return 0, and
+// boot continues to VGA + serial + halt. No hang, no crash.
+//
+// Trust model (mirrors Phys<T> discipline): port I/O and ring DMA are raw,
+// trusted access gated by this driver being the only toucher. The read
+// contract is single-in-flight: blk_read() waits for completion before
+// returning, so the caller owns the data buffer from the return until the
+// next blk_read() call.
+//
+// Design laws honored:
+//   - Single address space, Ring 0: port I/O is direct x86 in/out asm (the
+//     port_inb/outb/inw/outw/inl/outl builtins); ring memory is written via
+//     the phys_write_u8/u16/u32/u64 builtins (inline volatile stores).
+//   - Deterministic verification: `curlee check` on the generated
+//     blk-check.curlee (virtio_blk.curlee + the curlee_sfence extern wrapper)
+//     runs standalone and the merged kernel re-verifies it (`make check`).
+//   - Minimal footprint: no libc, no String/Vec; every buffer is a Curlee
+//     static — the small driver-state statics plus the queue/buffer memory,
+//     sized per build via --define (gh issue #296).
+
+// ---------------------------------------------------------------------------
+// Queue/buffer memory + build-geometry getters (gh issue #296 — per-build-
+// target static array sizing via `curlee build --define NAME=VALUE`).
+// ---------------------------------------------------------------------------
+
+// Queue memory: 3 x 4096 for the single request queue. QEMU aligns the used
+// ring to 4096 relative to the queue base (align_up in its legacy vring
+// code), so the BASE MUST be 4096-aligned — the same over-allocated buffer +
+// manual-alignment approach as virtio_net (raw + 4095) & ~4095. 5 pages
+// (20480) is safe on both sides. Sized per build: BLK_QMEM_PAGES=5 on the
+// GRUB build, 1 on the PVH build (1-element-stub semantics — the getters
+// return 0 and blk_init() bails on virtio_blk_pvh_build()==1).
+static blk_qmem: [U8; BLK_QMEM_PAGES * 4096] = [0; BLK_QMEM_PAGES * 4096];
+
+// Data buffer (static, no malloc): the raw sector bytes land here. Addressed
+// via the base getter; the desc addr field is the buffer address (like the C
+// original's (uint64_t)(unsigned long)buf). BLK_BUF_SECTORS=8 (4096 B) on
+// the GRUB build — enough for the 8-sector smoke pattern region and small
+// model blobs; 1 sector on the PVH build (stub semantics).
+static blk_buf: [U8; BLK_BUF_SECTORS * 512] = [0; BLK_BUF_SECTORS * 512];
+
+// Request header (16 bytes: type u32 + reserved u32 + sector u64 — QEMU's
+// VirtIOBlockOutHdr layout, see the file-header comment) and the 1-byte
+// completion status, both owned by the driver (device reads the header,
+// writes the status).
+static blk_hdr: [U8; 16] = [0; 16];
+static blk_status: [U8; 1] = [0; 1];
+
+// Build discriminator: 1 on the PVH build (the buffers above are stubs and
+// every base getter returns 0), 0 on the GRUB build. blk_init() bails on
+// this returning 1 (option 1, see the header).
+fn virtio_blk_pvh_build() -> Int {
+  return JOE_PVH_BOOT;
+}
+
+// Base of the request queue's ring memory (0 on the PVH stub). addr_of
+// (issue #286) yields the physical address of the Curlee-owned static; the
+// kernel runs with identity paging so virtual == physical. Requires unsafe +
+// cap phys.mem (the phys-builtin gate); pm is dropped by codegen.
+fn virtio_blk_qmem_base(pm: cap phys.mem) -> Int {
+  if (JOE_PVH_BOOT == 1) {
+    return 0;
+  }
+  unsafe {
+    return addr_of(blk_qmem);
+  }
+  return 0;
+}
+
+// Base address of the data buffer (0 on the PVH stub).
+fn virtio_blk_buf_base(pm: cap phys.mem) -> Int {
+  if (JOE_PVH_BOOT == 1) {
+    return 0;
+  }
+  unsafe {
+    return addr_of(blk_buf);
+  }
+  return 0;
+}
+
+// Base address of the request header (0 on the PVH stub).
+fn virtio_blk_hdr_base(pm: cap phys.mem) -> Int {
+  if (JOE_PVH_BOOT == 1) {
+    return 0;
+  }
+  unsafe {
+    return addr_of(blk_hdr);
+  }
+  return 0;
+}
+
+// Base address of the completion-status byte (0 on the PVH stub).
+fn virtio_blk_status_base(pm: cap phys.mem) -> Int {
+  if (JOE_PVH_BOOT == 1) {
+    return 0;
+  }
+  unsafe {
+    return addr_of(blk_status);
+  }
+  return 0;
+}
+
+// Ring-publication store fence (see the PORT NOTE above). Declared once in
+// the merged TU by kernel/virtio_net.curlee (duplicate externs are rejected
+// by the compiler — verified at this workspace's commit); the standalone
+// check wrapper supplies it.
+//   extern fn curlee_sfence() -> Unit;
+
+// ---------------------------------------------------------------------------
+// Driver state (all Curlee statics — the toolchain's static + [T; N] arrays).
+// Every value is Int: U8/U16/U32 are used only for ephemeral port/phys reads
+// and widened with + 0 into Int at the read site (the virtio_net discipline).
+// ---------------------------------------------------------------------------
+
+static blk_io_base: Int = 0;    // legacy I/O BAR base of the block device
+static blk_found: Int = 0;      // blk_probe() cache
+static blk_ready: Int = 0;      // blk_init() completed (queue live)
+static blk_ring_base: Int = 0;  // 4096-aligned queue base (the C ring ptrs)
+static blk_ring_num: Int = 0;   // QUEUE_NUM read at setup (3..256)
+static blk_avail_head: Int = 0; // descs added to the avail ring
+// used-ring idx we have consumed. The device's used->idx is a u16 wrapping
+// mod 65536; the Curlee counter wraps explicitly with % 65536 (the
+// virtio_net rx_used_last discipline).
+static blk_used_last: Int = 0;
+static blk_last_len: Int = 0;   // bytes of the last successful read (0 = none)
+// Diagnostic: why the last blk_read() failed. 0 = none (or success), 1 = the
+// device never completed (wait timeout), 2 = the completion was rejected
+// (used-ring id/len mismatch or a non-OK status byte), 3 = bad arguments.
+// Reported by the qemu-blk-smoke gate's failure markers (BLK: 4 + this).
+static blk_last_err: Int = 0;
+
+// ---------------------------------------------------------------------------
+// Ring-geometry helpers (pure Int math; the bases are opaque extern reads so
+// these are contract-less — the established canvas/net_glue pattern).
+// ---------------------------------------------------------------------------
+
+// Base of vring_desc[s] (16-byte entries on page 0): addr u64 @0, len u32 @8,
+// flags u16 @12, next u16 @14.
+fn blk_desc_base(base: Int, s: Int) -> Int {
+  return base + s * 16;
+}
+
+// Address of the avail ring entry for slot s (page 1): flags u16 @0, idx u16
+// @2, ring[256] u16 @4.
+fn blk_avail_entry(base: Int, s: Int) -> Int {
+  return base + 4096 + 4 + s * 2;
+}
+
+// Address of the avail/used idx fields (page 1 @2 / page 2 @2).
+fn blk_avail_idx_addr(base: Int) -> Int {
+  return base + 4096 + 2;
+}
+
+fn blk_used_idx_addr(base: Int) -> Int {
+  return base + 8192 + 2;
+}
+
+// Addresses of used-ring element k's id/len (page 2): flags u16 @0, idx u16
+// @2, ring[256] of {id u32 @4, len u32 @8} — 8 bytes per element.
+fn blk_used_elem_id_addr(base: Int, k: Int) -> Int {
+  return base + 8192 + 4 + k * 8;
+}
+
+fn blk_used_elem_len_addr(base: Int, k: Int) -> Int {
+  return base + 8192 + 8 + k * 8;
+}
+
+// ---------------------------------------------------------------------------
+// PCI config space (legacy ports 0xCF8/0xCFC) — a blk-local copy of the
+// virtio_net helper (distinct name: the merged TU forbids duplicate
+// functions).
+// ---------------------------------------------------------------------------
+
+// 32-bit config read: address assembly is direct bitwise translation of the C
+// (0x80000000 | bus<<16 | dev<<11 | func<<8 | (off & 0xFC)). Port reads are
+// opaque to the verifier, so the function is contract-less.
+fn blk_pci_config_read32(pm: cap phys.mem, bus: Int, dev: Int, func: Int, off: Int) -> Int {
+  unsafe {
+    let addr: Int = 2147483648 | (bus << 16) | (dev << 11) | (func << 8) | (off & 252);
+    port_outl(3320, addr);    // PCI_ADDR_PORT 0xCF8
+    let d: U32 = port_inl(3324);   // PCI_DATA_PORT 0xCFC
+    let di: Int = d + 0;
+    return di;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Virtqueue helpers
+// ---------------------------------------------------------------------------
+
+// Kick the device: a new request is available on queue 0.
+fn blk_queue_notify(pm: cap phys.mem) -> Unit {
+  unsafe {
+    port_outw(blk_io_base + 16, 0);   // VIRTIO_PCI_QUEUE_NOTIFY 0x10, qsel 0
+  }
+  return;
+}
+
+// Program the legacy virtqueue: select queue 0, read QUEUE_NUM, zero the 3
+// pages, write QueuePFN = phys >> 12, read back, install the ring base + num.
+// `raw` is the over-allocated qmem address (5 pages); the working base is the
+// first 4096-aligned address inside it (the virtio_net rationale — QEMU
+// aligns the used ring to 4096 relative to this base). The `raw == 0` guard
+// is defense-in-depth for the PVH stub path (the getter returns 0 there;
+// blk_init never reaches queue_setup on that path — see the header).
+fn blk_queue_setup(pm: cap phys.mem, raw: Int) -> Int {
+  if (raw == 0) {
+    return 0;
+  }
+  unsafe {
+    port_outw(blk_io_base + 14, 0);          // VIRTIO_PCI_QUEUE_SEL 0x0E, qsel 0
+    let num: U16 = port_inw(blk_io_base + 12);  // VIRTIO_PCI_QUEUE_NUM 0x0C
+    let numi: Int = num + 0;
+    if (numi < 3) {   // need at least 3 descs for one request chain
+      return 0;
+    }
+    if (numi > 256) {   // device wants more than we sized for
+      return 0;
+    }
+    // Manual 4096-alignment of the working base (see the ring-memory comment).
+    let base: Int = (raw + 4095) & ~4095;
+    // Zero the 3 pages (3072 x u32 = 12288 bytes).
+    let i: Int = 0;
+    while (i < 3072) {
+      phys_write_u32(base + i * 4, 0);
+      i = i + 1;
+    }
+    let pfn: Int = base >> 12;
+    port_outl(blk_io_base + 8, pfn);            // VIRTIO_PCI_QUEUE_PFN 0x08
+    let rb: U32 = port_inl(blk_io_base + 8);
+    let rbi: Int = rb + 0;
+    if (rbi != pfn) {
+      return 0;
+    }
+    blk_ring_num = numi;
+  }
+  blk_ring_base = (raw + 4095) & ~4095;
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Extern surface (the gh issue #26 contract — genuine Curlee functions,
+// codegen'd as curlee_blk_*; no C shim exists or links)
+// ---------------------------------------------------------------------------
+
+// 1 = a legacy-capable virtio-blk PCI device was found (I/O BAR readable).
+fn blk_probe(pm: cap phys.mem) -> Int {
+  if (blk_found == 1) {
+    return 1;
+  }
+  // Legacy PCI: bus 0 only. Nonexistent devices read 0xFFFFFFFF — safe.
+  let dev: Int = 0;
+  while (dev < 32) {
+    let func: Int = 0;
+    while (func < 8) {
+      let id: Int = blk_pci_config_read32(pm, 0, dev, func, 0);
+      if (id != 4294967295 && id != 0) {   // != 0xFFFFFFFF, != 0
+        let vendor: Int = id & 65535;
+        let device: Int = (id >> 16) & 65535;
+        if (vendor == 6900) {   // 0x1AF4
+          if (device == 4097 || device == 4162) {   // 0x1001 legacy, 0x1042 modern
+            let bar: Int = blk_pci_config_read32(pm, 0, dev, func, 16);   // 0x10
+            if ((bar & 1) != 0) {
+              // I/O BAR (legacy transport — the smoke path forces this with
+              // disable-modern=on). An MMIO BAR (bit 0 clear) is recognized
+              // but not driven on the legacy path (documented fallback).
+              let io: Int = bar & 65532;   // 0xFFFC
+              if (io != 0) {   // BAR assigned
+                blk_io_base = io;
+                blk_found = 1;
+                return 1;
+              }
+            }
+          }
+          // 0x1FE8 (modern-only) and the net IDs (0x1000/0x1041/0x1FE9) are
+          // intentionally never initialized here: 0x1FE8 has no legacy
+          // transport, the net IDs are not block devices.
+        }
+      }
+      func = func + 1;
+    }
+    dev = dev + 1;
+  }
+  return 0;
+}
+
+// 1 = device ready (queue set up, DRIVER_OK). Safe no-op when no device.
+fn blk_init(pm: cap phys.mem) -> Int {
+  if (blk_ready == 1) {
+    return 1;
+  }
+  if (blk_found == 0) {
+    let p: Int = blk_probe(pm);
+    if (p != 1) {
+      return 0;
+    }
+  }
+  if (virtio_blk_pvh_build() == 1) {
+    return 0;   // option 1 stub (see the file header)
+  }
+  unsafe {
+    // 1. Reset: status = 0, then read back (QEMU resets synchronously). The
+    //    loop exits when the status reads 0 or after 100 iterations (bounded).
+    port_outb(blk_io_base + 18, 0);   // VIRTIO_PCI_STATUS 0x12
+    let g: Int = 0;
+    while (g < 100) {
+      let st: U8 = port_inb(blk_io_base + 18);
+      let sti: Int = st + 0;
+      if (sti == 0) {
+        g = 100;   // reset confirmed
+      } else {
+        g = g + 1;
+      }
+    }
+    // 2. Guest features: the MVP read path needs no feature bits — offer
+    //    nothing and NEVER VERSION_1 (32-bit reg, keeps the device legacy).
+    port_outl(blk_io_base + 4, 0);   // VIRTIO_PCI_GUEST_FEATURES 0x04
+    // 3. Status: ACKNOWLEDGE | DRIVER (0x01 | 0x02).
+    port_outb(blk_io_base + 18, 3);
+    // 4. Set up the single request queue (3-page legacy layout).
+    let q: Int = blk_queue_setup(pm, virtio_blk_qmem_base(pm));
+    if (q == 0) {
+      port_outb(blk_io_base + 18, 128);   // VIRTIO_CONFIG_S_FAILED 0x80
+      return 0;
+    }
+    // 5. Driver OK — device is live (0x01 | 0x02 | 0x04).
+    port_outb(blk_io_base + 18, 7);
+  }
+  blk_ready = 1;
+  return 1;
+}
+
+// Wait for the single in-flight request to complete (bounded, never hangs):
+// polls the used ring up to 20000000 iterations, yielding to QEMU's main loop
+// via an ISR port read every 256 iterations (a pure memory spin can starve in
+// TCG — the virtio_net net_rx_wait rationale). Returns 1 when the used idx
+// advanced past blk_used_last, else 0 (timeout).
+fn blk_wait_done(pm: cap phys.mem) -> Int {
+  if (blk_ready == 0) {
+    return 0;
+  }
+  let base: Int = blk_ring_base;
+  let idx_addr: Int = blk_used_idx_addr(base);
+  let last: Int = blk_used_last;
+  let i: Int = 0;
+  while (i < 20000000) {   // BLK_POLL_MAX
+    if ((i & 255) == 0) {
+      unsafe {
+        let isr: U8 = port_inb(blk_io_base + 19);   // VIRTIO_PCI_ISR 0x13 — yield
+      }
+      // Re-notify in case the original kick raced the idx publish.
+      blk_queue_notify(pm);
+    }
+    unsafe {
+      let uidx: U16 = phys_read_u16(idx_addr);
+      let ui: Int = uidx + 0;
+      if (ui != last) {
+        return 1;
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Collect the completed request from the used ring: the element at the
+// consumed position must be our head id 0 with len == expect_len (the data
+// bytes + the 1 status byte), and the status byte must be VIRTIO_BLK_S_OK.
+// The used-ring reads are opaque to the verifier (phys reads, no axioms), so
+// the consumed position wraps with the runtime ring num (guarded n >= 3, the
+// probe-verified symbolic-modulo shape) and every failure path advances the
+// counter exactly once (the ring can never wedge).
+fn blk_collect(pm: cap phys.mem, expect_len: Int) -> Int {
+  let base: Int = blk_ring_base;
+  let last: Int = blk_used_last;
+  let n: Int = blk_ring_num;
+  if (n < 3) {
+    return 0;
+  }
+  if (last < 0) {
+    return 0;
+  }
+  let id_addr: Int = blk_used_elem_id_addr(base, last % n);
+  let len_addr: Int = blk_used_elem_len_addr(base, last % n);
+  unsafe {
+    let id: U32 = phys_read_u32(id_addr);
+    let idi: Int = id + 0;
+    if (idi == 0) {
+      let elen: U32 = phys_read_u32(len_addr);
+      let eleni: Int = elen + 0;
+      if (eleni == expect_len) {
+        let staddr: Int = virtio_blk_status_base(pm);
+        let st: U8 = phys_read_u8(staddr);
+        let sti: Int = st + 0;
+        blk_used_last = (last + 1) % 65536;   // u16 wrap (see the state comment)
+        if (sti == 0) {   // VIRTIO_BLK_S_OK
+          return 1;
+        } else {
+          return 0;
+        }
+      } else {
+        blk_used_last = (last + 1) % 65536;
+        return 0;
+      }
+    } else {
+      blk_used_last = (last + 1) % 65536;
+      return 0;
+    }
+  }
+}
+
+// Raw sector read: read `sectors` sectors (512 B each) starting at LBA `lba`
+// into the fixed driver buffer. 1 = success (blk_sector_byte() valid for
+// bytes 0..sectors*512-1), 0 = not ready / bad args / device error. No write
+// support (MVP), no filesystem — the raw contract the Native Inference
+// milestone needs to load one embedded model blob.
+fn blk_read(pm: cap phys.mem, lba: Int, sectors: Int) -> Int {
+  if (blk_ready == 0) {
+    blk_last_err = 3;
+    return 0;
+  }
+  if (lba < 0) {
+    blk_last_err = 3;
+    return 0;
+  }
+  if (sectors <= 0 || sectors > BLK_BUF_SECTORS) {
+    blk_last_err = 3;
+    return 0;
+  }
+  let base: Int = blk_ring_base;
+  let n: Int = blk_ring_num;
+  let head: Int = blk_avail_head;
+  if (n < 3) {
+    blk_last_err = 3;
+    return 0;
+  }
+  if (head < 0) {
+    blk_last_err = 3;
+    return 0;
+  }
+  let data_len: Int = sectors * 512;
+  let hdr: Int = virtio_blk_hdr_base(pm);
+  let buf: Int = virtio_blk_buf_base(pm);
+  let staddr: Int = virtio_blk_status_base(pm);
+  unsafe {
+    // desc 0: request header (device reads) — flags NEXT, next = 1.
+    let h64: U64 = hdr;
+    phys_write_u64(blk_desc_base(base, 0), h64);
+    phys_write_u32(blk_desc_base(base, 0) + 8, 16);   // VIRTIO_BLK_HDR_BYTES
+    phys_write_u16(blk_desc_base(base, 0) + 12, 1);   // VRING_DESC_F_NEXT
+    phys_write_u16(blk_desc_base(base, 0) + 14, 1);   // next = 1
+    // desc 1: data buffer (device writes) — flags WRITE | NEXT, next = 2.
+    let b64: U64 = buf;
+    phys_write_u64(blk_desc_base(base, 1), b64);
+    phys_write_u32(blk_desc_base(base, 1) + 8, data_len);
+    phys_write_u16(blk_desc_base(base, 1) + 12, 3);   // VRING_DESC_F_WRITE | NEXT
+    phys_write_u16(blk_desc_base(base, 1) + 14, 2);   // next = 2
+    // desc 2: status byte (device writes) — flags WRITE (chain end).
+    let s64: U64 = staddr;
+    phys_write_u64(blk_desc_base(base, 2), s64);
+    phys_write_u32(blk_desc_base(base, 2) + 8, 1);
+    phys_write_u16(blk_desc_base(base, 2) + 12, 2);   // VRING_DESC_F_WRITE
+    // Request header: type 0 = VIRTIO_BLK_T_IN (read), reserved 0, sector
+    // u64 = lba (little-endian; high dword 0 for lba < 2^32).
+    phys_write_u32(hdr, 0);
+    phys_write_u32(hdr + 4, 0);
+    let l64: U64 = lba;
+    phys_write_u64(hdr + 8, l64);
+    phys_write_u8(staddr, 255);   // stale status marker (0 = OK on success)
+    // Publish the head desc id 0 on the avail ring.
+    let entry: Int = blk_avail_entry(base, head % n);
+    phys_write_u16(entry, 0);
+  }
+  blk_avail_head = head + 1;
+  curlee_sfence();   // desc[] + ring[] stores visible before idx
+  unsafe {
+    let idx_addr: Int = blk_avail_idx_addr(base);
+    phys_write_u16(idx_addr, blk_avail_head);
+  }
+  blk_queue_notify(pm);
+  let done: Int = blk_wait_done(pm);
+  if (done == 0) {
+    blk_last_err = 1;   // device never completed
+    return 0;
+  }
+  let ok: Int = blk_collect(pm, data_len + 1);   // data + 1 status byte
+  if (ok == 1) {
+    blk_last_len = data_len;
+    blk_last_err = 0;
+    return 1;
+  }
+  blk_last_err = 2;   // completion rejected (id/len/status)
+  return 0;
+}
+
+// Diagnostic: the blk_last_err code of the last blk_read() (see the static).
+fn blk_err() -> Int {
+  return blk_last_err;
+}
+
+// Byte i of the last successful read (0 if none ready, or out of range).
+fn blk_sector_byte(pm: cap phys.mem, i: Int) -> Int {
+  if (blk_ready == 0) {
+    return 0;
+  }
+  if (i < 0 || i >= blk_last_len) {
+    return 0;
+  }
+  let buf: Int = virtio_blk_buf_base(pm);
+  unsafe {
+    let b: U8 = phys_read_u8(buf + i);
+    let bi: Int = b + 0;
+    return bi;
+  }
+}
