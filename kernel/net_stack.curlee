@@ -188,665 +188,204 @@ fn ip_checksum(tcp_len: Int) -> Int {
 
 // "POST /completion HTTP/1.1\r\n" — 27 bytes.
 fn req_sub0_byte(j: Int) -> Int {
-  if (j == 0) {
-    return 80;   // P
-  } else {
-    if (j == 1) {
-      return 79;   // O
-    } else {
-      if (j == 2) {
-        return 83;   // S
-      } else {
-        if (j == 3) {
-          return 84;   // T
-        } else {
-          if (j == 4) {
-            return 32;   // space
-          } else {
-            if (j == 5) {
-              return 47;   // /
-            } else {
-              if (j == 6) {
-                return 99;   // c
-              } else {
-                if (j == 7) {
-                  return 111;   // o
-                } else {
-                  if (j == 8) {
-                    return 109;   // m
-                  } else {
-                    if (j == 9) {
-                      return 112;   // p
-                    } else {
-                      if (j == 10) {
-                        return 108;   // l
-                      } else {
-                        if (j == 11) {
-                          return 101;   // e
-                        } else {
-                          if (j == 12) {
-                            return 116;   // t
-                          } else {
-                            if (j == 13) {
-                              return 105;   // i
-                            } else {
-                              if (j == 14) {
-                                return 111;   // o
-                              } else {
-                                if (j == 15) {
-                                  return 110;   // n
-                                } else {
-                                  if (j == 16) {
-                                    return 32;   // space
-                                  } else {
-                                    if (j == 17) {
-                                      return 72;   // H
-                                    } else {
-                                      if (j == 18) {
-                                        return 84;   // T
-                                      } else {
-                                        if (j == 19) {
-                                          return 84;   // T
-                                        } else {
-                                          if (j == 20) {
-                                            return 80;   // P
-                                          } else {
-                                            if (j == 21) {
-                                              return 47;   // /
-                                            } else {
-                                              if (j == 22) {
-                                                return 49;   // 1
-                                              } else {
-                                                if (j == 23) {
-                                                  return 46;   // .
-                                                } else {
-                                                  if (j == 24) {
-                                                    return 49;   // 1
-                                                  } else {
-                                                    if (j == 25) {
-                                                      return 13;   // \r
-                                                    } else {
-                                                      if (j == 26) {
-                                                        return 10;   // \n
-                                                      } else {
-                                                        return 0;
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 28] = [0; 28];
+  arr[0] = 80;
+  arr[1] = 79;
+  arr[2] = 83;
+  arr[3] = 84;
+  arr[4] = 32;
+  arr[5] = 47;
+  arr[6] = 99;
+  arr[7] = 111;
+  arr[8] = 109;
+  arr[9] = 112;
+  arr[10] = 108;
+  arr[11] = 101;
+  arr[12] = 116;
+  arr[13] = 105;
+  arr[14] = 111;
+  arr[15] = 110;
+  arr[16] = 32;
+  arr[17] = 72;
+  arr[18] = 84;
+  arr[19] = 84;
+  arr[20] = 80;
+  arr[21] = 47;
+  arr[22] = 49;
+  arr[23] = 46;
+  arr[24] = 49;
+  arr[25] = 13;
+  arr[26] = 10;
+  return arr[j];
 }
 
 // "Host: 10.0.2.2:8080\r\n" — 21 bytes.
 fn req_sub1_byte(j: Int) -> Int {
-  if (j == 0) {
-    return 72;   // H
-  } else {
-    if (j == 1) {
-      return 111;   // o
-    } else {
-      if (j == 2) {
-        return 115;   // s
-      } else {
-        if (j == 3) {
-          return 116;   // t
-        } else {
-          if (j == 4) {
-            return 58;   // :
-          } else {
-            if (j == 5) {
-              return 32;   // space
-            } else {
-              if (j == 6) {
-                return 49;   // 1
-              } else {
-                if (j == 7) {
-                  return 48;   // 0
-                } else {
-                  if (j == 8) {
-                    return 46;   // .
-                  } else {
-                    if (j == 9) {
-                      return 48;   // 0
-                    } else {
-                      if (j == 10) {
-                        return 46;   // .
-                      } else {
-                        if (j == 11) {
-                          return 50;   // 2
-                        } else {
-                          if (j == 12) {
-                            return 46;   // .
-                          } else {
-                            if (j == 13) {
-                              return 50;   // 2
-                            } else {
-                              if (j == 14) {
-                                return 58;   // :
-                              } else {
-                                if (j == 15) {
-                                  return 56;   // 8
-                                } else {
-                                  if (j == 16) {
-                                    return 48;   // 0
-                                  } else {
-                                    if (j == 17) {
-                                      return 56;   // 8
-                                    } else {
-                                      if (j == 18) {
-                                        return 48;   // 0
-                                      } else {
-                                        if (j == 19) {
-                                          return 13;   // \r
-                                        } else {
-                                          if (j == 20) {
-                                            return 10;   // \n
-                                          } else {
-                                            return 0;
-                                          }
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 22] = [0; 22];
+  arr[0] = 72;
+  arr[1] = 111;
+  arr[2] = 115;
+  arr[3] = 116;
+  arr[4] = 58;
+  arr[5] = 32;
+  arr[6] = 49;
+  arr[7] = 48;
+  arr[8] = 46;
+  arr[9] = 48;
+  arr[10] = 46;
+  arr[11] = 50;
+  arr[12] = 46;
+  arr[13] = 50;
+  arr[14] = 58;
+  arr[15] = 56;
+  arr[16] = 48;
+  arr[17] = 56;
+  arr[18] = 48;
+  arr[19] = 13;
+  arr[20] = 10;
+  return arr[j];
 }
 
 // "Content-Type: application/json\r\n" — 32 bytes.
 fn req_sub2_byte(j: Int) -> Int {
-  if (j == 0) {
-    return 67;   // C
-  } else {
-    if (j == 1) {
-      return 111;   // o
-    } else {
-      if (j == 2) {
-        return 110;   // n
-      } else {
-        if (j == 3) {
-          return 116;   // t
-        } else {
-          if (j == 4) {
-            return 101;   // e
-          } else {
-            if (j == 5) {
-              return 110;   // n
-            } else {
-              if (j == 6) {
-                return 116;   // t
-              } else {
-                if (j == 7) {
-                  return 45;   // -
-                } else {
-                  if (j == 8) {
-                    return 84;   // T
-                  } else {
-                    if (j == 9) {
-                      return 121;   // y
-                    } else {
-                      if (j == 10) {
-                        return 112;   // p
-                      } else {
-                        if (j == 11) {
-                          return 101;   // e
-                        } else {
-                          if (j == 12) {
-                            return 58;   // :
-                          } else {
-                            if (j == 13) {
-                              return 32;   // space
-                            } else {
-                              if (j == 14) {
-                                return 97;   // a
-                              } else {
-                                if (j == 15) {
-                                  return 112;   // p
-                                } else {
-                                  if (j == 16) {
-                                    return 112;   // p
-                                  } else {
-                                    if (j == 17) {
-                                      return 108;   // l
-                                    } else {
-                                      if (j == 18) {
-                                        return 105;   // i
-                                      } else {
-                                        if (j == 19) {
-                                          return 99;   // c
-                                        } else {
-                                          if (j == 20) {
-                                            return 97;   // a
-                                          } else {
-                                            if (j == 21) {
-                                              return 116;   // t
-                                            } else {
-                                              if (j == 22) {
-                                                return 105;   // i
-                                              } else {
-                                                if (j == 23) {
-                                                  return 111;   // o
-                                                } else {
-                                                  if (j == 24) {
-                                                    return 110;   // n
-                                                  } else {
-                                                    if (j == 25) {
-                                                      return 47;   // /
-                                                    } else {
-                                                      if (j == 26) {
-                                                        return 106;   // j
-                                                      } else {
-                                                        if (j == 27) {
-                                                          return 115;   // s
-                                                        } else {
-                                                          if (j == 28) {
-                                                            return 111;   // o
-                                                          } else {
-                                                            if (j == 29) {
-                                                              return 110;   // n
-                                                            } else {
-                                                              if (j == 30) {
-                                                                return 13;   // \r
-                                                              } else {
-                                                                if (j == 31) {
-                                                                  return 10;   // \n
-                                                                } else {
-                                                                  return 0;
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 33] = [0; 33];
+  arr[0] = 67;
+  arr[1] = 111;
+  arr[2] = 110;
+  arr[3] = 116;
+  arr[4] = 101;
+  arr[5] = 110;
+  arr[6] = 116;
+  arr[7] = 45;
+  arr[8] = 84;
+  arr[9] = 121;
+  arr[10] = 112;
+  arr[11] = 101;
+  arr[12] = 58;
+  arr[13] = 32;
+  arr[14] = 97;
+  arr[15] = 112;
+  arr[16] = 112;
+  arr[17] = 108;
+  arr[18] = 105;
+  arr[19] = 99;
+  arr[20] = 97;
+  arr[21] = 116;
+  arr[22] = 105;
+  arr[23] = 111;
+  arr[24] = 110;
+  arr[25] = 47;
+  arr[26] = 106;
+  arr[27] = 115;
+  arr[28] = 111;
+  arr[29] = 110;
+  arr[30] = 13;
+  arr[31] = 10;
+  arr[32] = 0;
+  return arr[j];
 }
 
 // "Content-Length: 36\r\n" — 20 bytes.
 fn req_sub3_byte(j: Int) -> Int {
-  if (j == 0) {
-    return 67;   // C
-  } else {
-    if (j == 1) {
-      return 111;   // o
-    } else {
-      if (j == 2) {
-        return 110;   // n
-      } else {
-        if (j == 3) {
-          return 116;   // t
-        } else {
-          if (j == 4) {
-            return 101;   // e
-          } else {
-            if (j == 5) {
-              return 110;   // n
-            } else {
-              if (j == 6) {
-                return 116;   // t
-              } else {
-                if (j == 7) {
-                  return 45;   // -
-                } else {
-                  if (j == 8) {
-                    return 76;   // L
-                  } else {
-                    if (j == 9) {
-                      return 101;   // e
-                    } else {
-                      if (j == 10) {
-                        return 110;   // n
-                      } else {
-                        if (j == 11) {
-                          return 103;   // g
-                        } else {
-                          if (j == 12) {
-                            return 116;   // t
-                          } else {
-                            if (j == 13) {
-                              return 104;   // h
-                            } else {
-                              if (j == 14) {
-                                return 58;   // :
-                              } else {
-                                if (j == 15) {
-                                  return 32;   // space
-                                } else {
-                                  if (j == 16) {
-                                    return 51;   // 3
-                                  } else {
-                                    if (j == 17) {
-                                      return 54;   // 6
-                                    } else {
-                                      if (j == 18) {
-                                        return 13;   // \r
-                                      } else {
-                                        if (j == 19) {
-                                          return 10;   // \n
-                                        } else {
-                                          return 0;
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 21] = [0; 21];
+  arr[0] = 67;
+  arr[1] = 111;
+  arr[2] = 110;
+  arr[3] = 116;
+  arr[4] = 101;
+  arr[5] = 110;
+  arr[6] = 116;
+  arr[7] = 45;
+  arr[8] = 76;
+  arr[9] = 101;
+  arr[10] = 110;
+  arr[11] = 103;
+  arr[12] = 116;
+  arr[13] = 104;
+  arr[14] = 58;
+  arr[15] = 32;
+  arr[16] = 51;
+  arr[17] = 54;
+  arr[18] = 13;
+  arr[19] = 10;
+  arr[20] = 0;
+  return arr[j];
 }
 
 // "Connection: close\r\n" — 19 bytes.
 fn req_sub4_byte(j: Int) -> Int {
-  if (j == 0) {
-    return 67;   // C
-  } else {
-    if (j == 1) {
-      return 111;   // o
-    } else {
-      if (j == 2) {
-        return 110;   // n
-      } else {
-        if (j == 3) {
-          return 110;   // n
-        } else {
-          if (j == 4) {
-            return 101;   // e
-          } else {
-            if (j == 5) {
-              return 99;   // c
-            } else {
-              if (j == 6) {
-                return 116;   // t
-              } else {
-                if (j == 7) {
-                  return 105;   // i
-                } else {
-                  if (j == 8) {
-                    return 111;   // o
-                  } else {
-                    if (j == 9) {
-                      return 110;   // n
-                    } else {
-                      if (j == 10) {
-                        return 58;   // :
-                      } else {
-                        if (j == 11) {
-                          return 32;   // space
-                        } else {
-                          if (j == 12) {
-                            return 99;   // c
-                          } else {
-                            if (j == 13) {
-                              return 108;   // l
-                            } else {
-                              if (j == 14) {
-                                return 111;   // o
-                              } else {
-                                if (j == 15) {
-                                  return 115;   // s
-                                } else {
-                                  if (j == 16) {
-                                    return 101;   // e
-                                  } else {
-                                    if (j == 17) {
-                                      return 13;   // \r
-                                    } else {
-                                      if (j == 18) {
-                                        return 10;   // \n
-                                      } else {
-                                        return 0;
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 20] = [0; 20];
+  arr[0] = 67;
+  arr[1] = 111;
+  arr[2] = 110;
+  arr[3] = 110;
+  arr[4] = 101;
+  arr[5] = 99;
+  arr[6] = 116;
+  arr[7] = 105;
+  arr[8] = 111;
+  arr[9] = 110;
+  arr[10] = 58;
+  arr[11] = 32;
+  arr[12] = 99;
+  arr[13] = 108;
+  arr[14] = 111;
+  arr[15] = 115;
+  arr[16] = 101;
+  arr[17] = 13;
+  arr[18] = 10;
+  return arr[j];
 }
 
 // "\r\n" — the blank line terminating the request header — 2 bytes.
 fn req_sub5_byte(j: Int) -> Int {
-  if (j == 0) {
-    return 13;   // \r
-  } else {
-    if (j == 1) {
-      return 10;   // \n
-    } else {
-      return 0;
-    }
-  }
+  let arr: [Int; 3] = [0; 3];
+  arr[0] = 13;
+  arr[1] = 10;
+  arr[2] = 0;
+  return arr[j];
 }
 
 // The 36-byte wire body: {"tool":"frame_tick","args":[0,1,2]}
 fn req_body_byte(j: Int) -> Int {
-  if (j == 0) {
-    return 123;   // {
-  } else {
-    if (j == 1) {
-      return 34;   // "
-    } else {
-      if (j == 2) {
-        return 116;   // t
-      } else {
-        if (j == 3) {
-          return 111;   // o
-        } else {
-          if (j == 4) {
-            return 111;   // o
-          } else {
-            if (j == 5) {
-              return 108;   // l
-            } else {
-              if (j == 6) {
-                return 34;   // "
-              } else {
-                if (j == 7) {
-                  return 58;   // :
-                } else {
-                  if (j == 8) {
-                    return 34;   // "
-                  } else {
-                    if (j == 9) {
-                      return 102;   // f
-                    } else {
-                      if (j == 10) {
-                        return 114;   // r
-                      } else {
-                        if (j == 11) {
-                          return 97;   // a
-                        } else {
-                          if (j == 12) {
-                            return 109;   // m
-                          } else {
-                            if (j == 13) {
-                              return 101;   // e
-                            } else {
-                              if (j == 14) {
-                                return 95;   // _
-                              } else {
-                                if (j == 15) {
-                                  return 116;   // t
-                                } else {
-                                  if (j == 16) {
-                                    return 105;   // i
-                                  } else {
-                                    if (j == 17) {
-                                      return 99;   // c
-                                    } else {
-                                      if (j == 18) {
-                                        return 107;   // k
-                                      } else {
-                                        if (j == 19) {
-                                          return 34;   // "
-                                        } else {
-                                          if (j == 20) {
-                                            return 44;   // ,
-                                          } else {
-                                            if (j == 21) {
-                                              return 34;   // "
-                                            } else {
-                                              if (j == 22) {
-                                                return 97;   // a
-                                              } else {
-                                                if (j == 23) {
-                                                  return 114;   // r
-                                                } else {
-                                                  if (j == 24) {
-                                                    return 103;   // g
-                                                  } else {
-                                                    if (j == 25) {
-                                                      return 115;   // s
-                                                    } else {
-                                                      if (j == 26) {
-                                                        return 34;   // "
-                                                      } else {
-                                                        if (j == 27) {
-                                                          return 58;   // :
-                                                        } else {
-                                                          if (j == 28) {
-                                                            return 91;   // [
-                                                          } else {
-                                                            if (j == 29) {
-                                                              return 48;   // 0
-                                                            } else {
-                                                              if (j == 30) {
-                                                                return 44;   // ,
-                                                              } else {
-                                                                if (j == 31) {
-                                                                  return 49;   // 1
-                                                                } else {
-                                                                  if (j == 32) {
-                                                                    return 44;   // ,
-                                                                  } else {
-                                                                    if (j == 33) {
-                                                                      return 50;   // 2
-                                                                    } else {
-                                                                      if (j == 34) {
-                                                                        return 93;   // ]
-                                                                      } else {
-                                                                        if (j == 35) {
-                                                                          return 125;   // }
-                                                                        } else {
-                                                                          return 0;
-                                                                        }
-                                                                      }
-                                                                    }
-                                                                  }
-                                                                }
-                                                              }
-                                                            }
-                                                          }
-                                                        }
-                                                      }
-                                                    }
-                                                  }
-                                                }
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 37] = [0; 37];
+  arr[0] = 123;
+  arr[1] = 34;
+  arr[2] = 116;
+  arr[3] = 111;
+  arr[4] = 111;
+  arr[5] = 108;
+  arr[6] = 34;
+  arr[7] = 58;
+  arr[8] = 34;
+  arr[9] = 102;
+  arr[10] = 114;
+  arr[11] = 97;
+  arr[12] = 109;
+  arr[13] = 101;
+  arr[14] = 95;
+  arr[15] = 116;
+  arr[16] = 105;
+  arr[17] = 99;
+  arr[18] = 107;
+  arr[19] = 34;
+  arr[20] = 44;
+  arr[21] = 34;
+  arr[22] = 97;
+  arr[23] = 114;
+  arr[24] = 103;
+  arr[25] = 115;
+  arr[26] = 34;
+  arr[27] = 58;
+  arr[28] = 91;
+  arr[29] = 48;
+  arr[30] = 44;
+  arr[31] = 49;
+  arr[32] = 44;
+  arr[33] = 50;
+  arr[34] = 93;
+  arr[35] = 125;
+  return arr[j];
 }
 
 // Byte i of the fixed 157-byte request payload (121 header + 36 body).
