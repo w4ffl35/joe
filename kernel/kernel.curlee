@@ -374,6 +374,122 @@ fn net_bringup(pm: cap phys.mem) -> Unit {
   return;
 }
 
+// Phase 2g (gh issue #26): VirtIO-blk markers — "BLK: <n>" proves the
+// virtio-blk bring-up + raw sector read step n passed:
+//   BLK: 1  PCI found (legacy virtio-blk device)
+//   BLK: 2  device ready (queue set up, DRIVER_OK)
+//   BLK: 3  raw sector read OK + the build-time test pattern verified
+//   BLK: 4..8  failure diagnostics (see blk_bringup — each fails the gate)
+// `n` is a single digit (1..8), so the marker is 6 chars + \n. Grepped in
+// order by the qemu-blk-smoke gate.
+fn serial_blk_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 66);   // B
+  putc(pm, 76);   // L
+  putc(pm, 75);   // K
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 48 + n);   // digit n (1..8)
+  putc(pm, 10);   // newline
+  return;
+}
+
+// The build-time test pattern (scripts/make-blk-disk.sh): the ASCII
+// "JOE-BLK!" (74 79 69 45 66 76 75 33 — 'J' is 74, not 72; a 72 would be
+// 'H' and the smoke gate caught the transcription error live) repeated every
+// 8 bytes across the pattern region (LBA 64..71). A real static array (the
+// gh issue #40/#43/#44/#48 if-chain -> array convention). Explicit
+// initializer lists are NOT accepted by the parser (verified at this
+// workspace's commit — only the [0; N] repeat form parses), so the pattern
+// is zero-initialized and filled once by blk_pat_init() before the first
+// verify.
+static blk_pat: [Int; 8] = [0; 8];
+
+// Fill the pattern table (the blk_pat_init + blk_pat_byte split mirrors the
+// net_glue state-owner idiom; called from blk_bringup before blk_pattern_ok).
+fn blk_pat_init() -> Unit {
+  blk_pat[0] = 74;   // J
+  blk_pat[1] = 79;   // O
+  blk_pat[2] = 69;   // E
+  blk_pat[3] = 45;   // -
+  blk_pat[4] = 66;   // B
+  blk_pat[5] = 76;   // L
+  blk_pat[6] = 75;   // K
+  blk_pat[7] = 33;   // !
+  return;
+}
+
+// Byte i of the pattern region: "JOE-BLK!"[i mod 8]. The wrap is
+// division-based (idx = i - (i/8)*8 — no modulo in the hot path); the
+// verifier picks up 0 <= idx < 8 from the nested-if guards (the verified
+// probe shape), so the blk_pat index is provably in bounds.
+fn blk_pattern_byte(i: Int) -> Int {
+  let idx: Int = i - (i / 8) * 8;
+  if (idx >= 0) {
+    if (idx < 8) {
+      return blk_pat[idx];
+    }
+  }
+  return 0;
+}
+
+// Verify that the last blk_read() delivered the exact build-time test
+// pattern: byte i of the read == "JOE-BLK!"[i % 8] for all i in
+// 0..sectors*512-1. 1 = match, 0 = mismatch / no read. Pure + bounded (the
+// loop is provably terminating), driving the driver's blk_sector_byte.
+fn blk_pattern_ok(pm: cap phys.mem, sectors: Int) -> Int {
+  let total: Int = sectors * 512;
+  let i: Int = 0;
+  while (i < total) {
+    let b: Int = blk_sector_byte(pm, i);
+    let expect: Int = blk_pattern_byte(i);
+    if (b != expect) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// Phase 2g (gh issue #26): VirtIO-blk bring-up + the raw-sector-read smoke
+// (the acceptance gate). Every step is gated on the previous step's return,
+// so a missing device emits nothing and existing gates (which boot WITHOUT
+// -drive/-device blk args) stay green — the no-blk-safe mirror of
+// virtio-net's acceptance criterion 6. The blk_* driver functions are genuine
+// Curlee (kernel/virtio_blk.curlee, gh issue #26) and take the pm capability.
+// The smoke reads 2 sectors at LBA 64 (the script's pattern region starts at
+// LBA 64) and verifies every byte against the build-time pattern. Failure
+// markers (all single digits, each fails the gate):
+//   BLK: 4  blk_read() returned 0 with blk_err() == 0/unknown
+//   BLK: 5  blk_read() timed out waiting for the device (blk_err() == 1)
+//   BLK: 6  completion rejected (used-ring id/len mismatch or bad status)
+//   BLK: 7  bad arguments (blk_err() == 3)
+//   BLK: 8  read OK but the bytes did not match the build-time pattern
+fn blk_bringup(pm: cap phys.mem) -> Unit {
+  blk_pat_init();   // fill the verify table once (explicit initializers are
+                    // not parsed — see the blk_pat comment)
+  let p: Int = blk_probe(pm);
+  if (p == 1) {
+    serial_blk_marker(pm, 1);
+    let i: Int = blk_init(pm);
+    if (i == 1) {
+      serial_blk_marker(pm, 2);
+      let r: Int = blk_read(pm, 64, 2);   // LBA 64, 2 sectors = 1024 bytes
+      if (r == 1) {
+        let ok: Int = blk_pattern_ok(pm, 2);
+        if (ok == 1) {
+          serial_blk_marker(pm, 3);
+        } else {
+          serial_blk_marker(pm, 8);   // pattern mismatch (device read garbage)
+        }
+      } else {
+        let e: Int = blk_err();
+        serial_blk_marker(pm, 4 + e);   // 5 = timeout, 6 = collect, 7 = args
+      }
+    }
+  }
+  return;
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2d-2: the one-shot TCP/IP stack GLUE lives in kernel/net_glue.curlee
 // (gh issue #12) — genuine Curlee net_connect / net_send / net_stack_poll /
@@ -615,6 +731,15 @@ fn main(pm: cap phys.mem) -> Unit {
   // nothing and the whole sequence is a safe no-op (existing gates stay
   // green — acceptance criterion 6).
   net_bringup(pm);
+  // Phase 2g (gh issue #26): VirtIO-blk bring-up — the raw sector read smoke
+  // (BLK: 1..3, or BLK: 4 on failure) runs on the same boot path. With no
+  // virtio-blk device, blk_probe() finds nothing and the whole sequence is a
+  // safe no-op (existing gates stay green — the no-blk-safe mirror of the net
+  // criterion). The disk smoke only runs where SeaBIOS initializes PCI (the
+  // GRUB/ISO path — qemu-blk-smoke); the PVH `-kernel` machine exposes no
+  // legacy PCI config space, so the probe finds nothing there by design
+  // (docs/phase2f-report.md §4).
+  blk_bringup(pm);
   // Phase 2d-2: the TCP/IP stack round-trip (ARP -> TCP -> send -> receive).
   // Gated on link-up, so with no NIC (or on the PVH stub path) every extern
   // returns 0 and the whole sequence is a safe no-op — existing gates stay

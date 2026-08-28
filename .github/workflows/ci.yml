@@ -55,6 +55,11 @@ jobs:
           CURLEE: ${{ github.workspace }}/curlee/build/linux-debug/curlee
         run: make qemu-net-smoke
 
+      - name: virtio-blk smoke (QEMU, raw disk image with the build-time pattern)
+        env:
+          CURLEE: ${{ github.workspace }}/curlee/build/linux-debug/curlee
+        run: make qemu-blk-smoke
+
       # qemu-llm-smoke is NOT wired into CI: it requires a real LLM daemon
       # reachable from the guest (scripts/run-llm-smoke.sh), which CI has no
       # way to provide. Run it locally via `make qemu-llm-smoke` before

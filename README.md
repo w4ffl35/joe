@@ -90,11 +90,11 @@ milestone.
 
 - **Two boot paths.** *PVH*: `qemu -kernel build/kernel.elf` boots 64-bit
   directly via the ELF's PVH note (crt0.S); the VBE probe supplies the
-  framebuffer. The PVH machine exposes no legacy PCI, so no NIC here.
+  framebuffer. The PVH machine exposes no legacy PCI, so no NIC or disk here.
   *GRUB/multiboot2*: the ISO path (VirtualBox, and QEMU for the gate tests);
   boot.S captures the multiboot2 info pointer and SeaBIOS's legacy PCI is
-  where VirtIO-net actually runs. This is also where the framebuffer flip
-  runs at full geometry.
+  where VirtIO-net and VirtIO-blk actually run. This is also where the
+  framebuffer flip runs at full geometry.
 - **Why both:** PVH is the fast, scriptable dev loop. The ISO path is the
   VirtualBox target and the only place the NIC is reachable.
 - **One merged Curlee translation unit.** `scripts/build-kernel.sh`
@@ -116,11 +116,23 @@ hardware has been tested** — see the
 [Bare-Metal Readiness](https://github.com/w4ffl35/joeos/milestone/2)
 milestone.
 
+Features, stated plainly:
+
+- **VirtIO-blk raw sector reads** (gh issue #26): a legacy virtio-blk driver
+  (`kernel/virtio_blk.curlee`) reads N sectors at a given LBA into a fixed
+  buffer over a 3-descriptor virtqueue — no filesystem, no write support.
+  `make qemu-blk-smoke` boots the ISO with a raw disk image
+  (`scripts/make-blk-disk.sh` writes a known pattern — or a model blob — at a
+  known LBA) and asserts the read is verified end-to-end.
+
 Limitations, stated plainly:
 
-- No persistent storage: there is no disk driver (virtio-blk is an open item).
+- No filesystem and no write support: the storage driver is raw-sector-read
+  only (a model blob at a known LBA is the intended use).
 - Networking works only under a hypervisor's paravirtualized virtio-net.
   There is no real NIC driver.
+- Storage works only under a hypervisor's paravirtualized virtio-blk (and
+  only on the GRUB/ISO path — the PVH machine has no legacy PCI).
 - VirtualBox's VGA emulation garbles the text plane and framebuffer after
   the GRUB handoff; serial is the authoritative console there.
 - The LLM smoke gate needs host port 8080 free (see above).

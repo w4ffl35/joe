@@ -47,6 +47,7 @@ jobs:
           make qemu-smoke
           make qemu-fb-smoke
           make qemu-net-smoke
+          make qemu-blk-smoke
 
       - name: Build GRUB ISO (VirtualBox / real-hardware boot path)
         env:

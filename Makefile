@@ -38,6 +38,7 @@ SERIAL_SRC    := kernel/serial.curlee
 VGA_SETUP_SRC := kernel/vga_setup.curlee
 VBE_SRC       := kernel/vbe.curlee
 VIRTIO_NET_SRC := kernel/virtio_net.curlee
+VIRTIO_BLK_SRC := kernel/virtio_blk.curlee
 NET_STACK_SRC := kernel/net_stack.curlee
 NET_GLUE_SRC  := kernel/net_glue.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
@@ -64,11 +65,13 @@ MERGE_SCRIPT  := scripts/build-kernel.sh
 PVH_DEFINES := --define JOE_PVH_BOOT=1 \
   --define ASSET_REGION_W=1 --define ASSET_REGION_H=1 \
   --define FRAME_RING_SLOTS=1 --define FRAME_RING_MAX_W=1 --define FRAME_RING_MAX_H=1 \
-  --define NET_QMEM_PAGES=1 --define NET_RX_BUFS=1 --define NET_TX_BUFS=1 --define NET_BUF_BYTES=1
+  --define NET_QMEM_PAGES=1 --define NET_RX_BUFS=1 --define NET_TX_BUFS=1 --define NET_BUF_BYTES=1 \
+  --define BLK_QMEM_PAGES=1 --define BLK_BUF_SECTORS=1
 GRUB_DEFINES := --define JOE_PVH_BOOT=0 \
   --define ASSET_REGION_W=128 --define ASSET_REGION_H=128 \
   --define FRAME_RING_SLOTS=2 --define FRAME_RING_MAX_W=640 --define FRAME_RING_MAX_H=480 \
-  --define NET_QMEM_PAGES=5 --define NET_RX_BUFS=2 --define NET_TX_BUFS=2 --define NET_BUF_BYTES=2048
+  --define NET_QMEM_PAGES=5 --define NET_RX_BUFS=2 --define NET_TX_BUFS=2 --define NET_BUF_BYTES=2048 \
+  --define BLK_QMEM_PAGES=5 --define BLK_BUF_SECTORS=8
 CHECK_DEFINES := $(GRUB_DEFINES)
 # Curlee runtime (crt0.S, linker.ld, rt.c, libgcc32_helpers.c) lives at the
 # source root, not under build/. Prefer CURLEE_ROOT (repo root); otherwise
@@ -95,7 +98,7 @@ AS := as
 LD := ld
 
 .PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run mb2-codegen-run iso iso-fb qemu run verify clean \
-        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke \
+        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-blk-smoke qemu-llm-smoke \
         c-boundary
 
 all: kernel
@@ -107,7 +110,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
@@ -163,9 +166,28 @@ $(KERNEL_ELF): $(MERGED_SRC)
 # ---------------------------------------------------------------------------
 # Verification gates
 # ---------------------------------------------------------------------------
+# Standalone check wrapper for kernel/virtio_blk.curlee (gh issue #26): the
+# merged TU forbids duplicate externs (verified at this workspace's commit),
+# and kernel/virtio_net.curlee declares curlee_sfence in the merged TU, so the
+# blk module calls it without a declaration there — this generated file
+# prepends the extern so `curlee check` can verify the driver standalone with
+# the full GRUB define set (the harder verify case, like the net driver).
+$(BUILD_DIR)/blk-check.curlee: $(VIRTIO_BLK_SRC)
+	@mkdir -p $(BUILD_DIR)
+	@printf '%s\n' \
+	  '// SPDX-License-Identifier: GPL-3.0' \
+	  '// blk-check.curlee — GENERATED standalone check wrapper for' \
+	  '// kernel/virtio_blk.curlee (see the Makefile rule).' \
+	  '// curlee_sfence is declared by kernel/virtio_net.curlee in the merged' \
+	  '// TU (duplicate externs are rejected by the compiler), so it is' \
+	  '// supplied here for the standalone check.' \
+	  'extern fn curlee_sfence() -> Unit;' \
+	  '' > $@
+	@grep -v '^// SPDX-License-Identifier:' $(VIRTIO_BLK_SRC) >> $@
+
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(NET_STACK_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(BUILD_DIR)/blk-check.curlee $(NET_STACK_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
@@ -182,6 +204,12 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	# ring/buffer statics are sized by --define (checked with the full GRUB
 	# define set here) and its only extern is the runtime curlee_sfence.
 	$(CURLEE) check $(CHECK_DEFINES) $(VIRTIO_NET_SRC)
+	# gh issue #26: the VirtIO-blk driver is genuine Curlee, checked through
+	# the generated wrapper below (the merged TU forbids duplicate externs, so
+	# the standalone file cannot declare curlee_sfence — virtio_net.curlee
+	# declares it in the merged TU; the wrapper supplies it standalone). Its
+	# queue/buffer statics are sized by --define like the net driver.
+	$(CURLEE) check $(CHECK_DEFINES) $(BUILD_DIR)/blk-check.curlee
 	# The pure protocol core stays VM-checkable standalone (extern-free).
 	$(CURLEE) check $(NET_STACK_SRC)
 	# gh issue #20: kernel/vbe.curlee and kernel/mb2.curlee are NOT checked
@@ -518,6 +546,41 @@ qemu-net-smoke: $(BUILD_DIR)/joeos-net.iso
 	# This 2d-1 gate stays exactly as-is: NET: 1..3 + RX: <len>.
 
 # ---------------------------------------------------------------------------
+# Phase 2g acceptance gate (GitHub issue #26): virtio-blk raw sector read.
+# ---------------------------------------------------------------------------
+# Boots the GRUB/ISO path (kernel-grub.elf, the block device compiled in —
+# the PVH `-kernel` machine has no legacy PCI config space, so the disk is
+# only reachable where SeaBIOS runs, exactly like the NIC) with a raw disk
+# image containing the build-time test pattern (scripts/make-blk-disk.sh
+# writes "JOE-BLK!" repeated over LBA 64..71), and asserts the ordered
+# marker sequence:
+#   BLK: 1  (PCI found) -> BLK: 2 (device ready) -> BLK: 3 (read + pattern
+#   verified). Any failure marker (BLK: 4..8 — see blk_bringup in
+#   kernel/kernel.curlee: 5 = wait timeout, 6 = completion rejected,
+#   7 = bad args, 8 = pattern mismatch) fails the gate.
+# The disk image is a plain raw file attached as virtio-blk-pci with
+# disable-modern=on (the legacy 0.9.5 transport the driver drives — the
+# qemu-net-smoke NIC pattern).
+$(BUILD_DIR)/blk-disk.img:
+	@mkdir -p $(BUILD_DIR)
+	bash scripts/make-blk-disk.sh $@
+
+$(BUILD_DIR)/joeos-blk.iso: $(BUILD_DIR)/kernel-grub.elf
+	bash scripts/build_iso.sh $(BUILD_DIR)/kernel-grub.elf $@ text
+
+qemu-blk-smoke: $(BUILD_DIR)/joeos-blk.iso $(BUILD_DIR)/blk-disk.img
+	rm -f $(BUILD_DIR)/serial-blk.log
+	@timeout 25 qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-blk.iso -boot d -no-reboot \
+	  -drive file=$(BUILD_DIR)/blk-disk.img,if=none,id=blk0,format=raw \
+	  -device virtio-blk-pci,disable-modern=on,drive=blk0 \
+	  -serial file:$(BUILD_DIR)/serial-blk.log \
+	  -display none || true
+	@grep -Pzo 'BLK: 1\nBLK: 2\nBLK: 3\n' $(BUILD_DIR)/serial-blk.log > /dev/null \
+	  && echo "PASS: virtio-blk bring-up + raw sector read verified (BLK: 1 -> BLK: 2 -> BLK: 3) -> serial: $$(cat $(BUILD_DIR)/serial-blk.log)" \
+	  || (echo "FAIL: BLK: 1..3 markers not in order in serial log"; \
+	      echo "serial log: $$(cat $(BUILD_DIR)/serial-blk.log)"; exit 1)
+
+# ---------------------------------------------------------------------------
 # Phase 2d-4 acceptance gate (GitHub issue #8): the end-to-end LLM round-trip.
 # ---------------------------------------------------------------------------
 # Boots the GRUB/ISO path (kernel-grub.elf, NIC compiled in — the PVH `-kernel`
@@ -588,6 +651,17 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_net_rx_qmem_base$$' && echo "PASS: curlee_virtio_net_rx_qmem_base linked (Curlee RX qmem getter, issue #296)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_net_pvh_build$$' && echo "PASS: curlee_virtio_net_pvh_build linked (Curlee build discriminator, issue #296)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_sfence$$' && echo "PASS: curlee_sfence linked (runtime ring-publication fence, issue #296)"
+	# gh issue #26: the VirtIO-blk driver is GENUINE Curlee (kernel/virtio_blk.
+	# curlee — no C shim exists) — the codegen emits the driver surface as the
+	# static curlee_blk_* symbols and the queue/buffer memory + base getters as
+	# curlee_virtio_blk_* (Curlee statics + addr_of reads, issue #286/#296).
+	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_probe$$' && echo "PASS: curlee_blk_probe linked (VirtIO-blk driver, gh issue #26)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_init$$' && echo "PASS: curlee_blk_init linked (VirtIO-blk driver)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_read$$' && echo "PASS: curlee_blk_read linked (VirtIO-blk raw sector read)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_sector_byte$$' && echo "PASS: curlee_blk_sector_byte linked (VirtIO-blk read buffer)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_blk_pvh_build$$' && echo "PASS: curlee_virtio_blk_pvh_build linked (Curlee build discriminator, gh issue #26)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_blk_qmem_base$$' && echo "PASS: curlee_virtio_blk_qmem_base linked (Curlee queue-mem getter, gh issue #26)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_blk_buf_base$$' && echo "PASS: curlee_virtio_blk_buf_base linked (Curlee data-buffer getter, gh issue #26)"
 	# Phase 2d-4: the tool-queue producer API the LLM bridge drives
 	# (fb_tool_enqueue(2, arg) — the 2d-3 contract, wired into the 2b ring).
 	# gh issue #13: the blitter + event loop moved to Curlee (kernel/fb.curlee),
