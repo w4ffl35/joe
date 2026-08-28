@@ -223,7 +223,7 @@ json-codegen-run:
 # is VM-runnable; assert the checksums, wire bytes and the HTTP response state
 # machine against the ground truth captured from the former C implementation.
 net-stack-run: $(NET_STACK_TEST) $(NET_STACK_SRC)
-	$(CURLEE) run --fuel 500000 $(NET_STACK_TEST)
+	$(CURLEE) run --fuel 1500000 $(NET_STACK_TEST)
 
 # Phase 2d-2 (gh issue #12): the HOST-SIDE wire proof of the one-shot glue —
 # codegens net_stack.curlee + net_glue.curlee and drives net_connect /

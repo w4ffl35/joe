@@ -3,9 +3,14 @@
 // net_stack_test.curlee — VM assertion suite for the pure TCP/IP protocol core
 // (kernel/net_stack.curlee, gh issue #12).
 //
-// `curlee run --fuel 500000 kernel/net_stack_test.curlee` runs the full check
+// `curlee run --fuel 1500000 kernel/net_stack_test.curlee` runs the full check
 // pipeline (lex -> parse -> resolve -> type-check -> verify) then executes the
 // program on the deterministic VM. It returns 0 iff every assertion holds.
+// Fuel bumped from 500000 (gh issue #43): fill-then-assign local arrays
+// rebuild their full contents on every call, costing more VM fuel per call
+// than the if-chains they replaced -- real for VM *testing* only, since the
+// actual kernel runs via freestanding C codegen (`curlee build`), which has
+// no fuel/VM concept at all.
 // Each probe returns a UNIQUE non-zero code so a failure pinpoints the
 // section.
 //
