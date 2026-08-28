@@ -14,7 +14,7 @@
 //     Int expressions use decimal.
 //   - NO `else if` chain — use nested if/else blocks.
 //
-// Design: the kernel renders "Hello world from JOE" to the 80x25 VGA text
+// Design: the kernel renders "Hello World from Curlee" to the 80x25 VGA text
 // buffer (base 0xB8000, 2 bytes/cell: char, attribute). This module provides
 // the pure mappings used by the kernel:
 //
@@ -41,114 +41,55 @@ fn valid_col(col: Int) -> Bool {
   return col >= 0 && col < 80;
 }
 
-// The ASCII codes for "Hello world from JOE".
+// The ASCII codes for "Hello World from Curlee".
+static hello: [Int; 24] = [0; 24];
+
 fn hello_char_at(i: Int) -> Int {
-  if (i == 0) {
-    return 72;
-  } else {
-    if (i == 1) {
-      return 101;
-    } else {
-      if (i == 2) {
-        return 108;
-      } else {
-        if (i == 3) {
-          return 108;
-        } else {
-          if (i == 4) {
-            return 111;
-          } else {
-            if (i == 5) {
-              return 32;
-            } else {
-              if (i == 6) {
-                return 87;
-              } else {
-                if (i == 7) {
-                  return 111;
-                } else {
-                  if (i == 8) {
-                    return 114;
-                  } else {
-                    if (i == 9) {
-                      return 108;
-                    } else {
-                      if (i == 10) {
-                        return 100;
-                      } else {
-                        if (i == 11) {
-                          return 32;
-                        } else {
-                          if (i == 12) {
-                            return 102;
-                          } else {
-                            if (i == 13) {
-                              return 114;
-                            } else {
-                              if (i == 14) {
-                                return 111;
-                              } else {
-                                if (i == 15) {
-                                  return 109;
-                                } else {
-                                  if (i == 16) {
-                                    return 32;
-                                  } else {
-                                    if (i == 17) {
-                                      return 67;
-                                    } else {
-                                      if (i == 18) {
-                                        return 117;
-                                      } else {
-                                        if (i == 19) {
-                                          return 114;
-                                        } else {
-                                          if (i == 20) {
-                                            return 108;
-                                          } else {
-                                            if (i == 21) {
-                                              return 101;
-                                            } else {
-                                              if (i == 22) {
-                                                return 101;
-                                              } else {
-                                                return 0;
-                                              }
-                                            }
-                                          }
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  hello[0] = 72;
+  hello[1] = 101;
+  hello[2] = 108;
+  hello[3] = 108;
+  hello[4] = 111;
+  hello[5] = 32;
+  hello[6] = 87;
+  hello[7] = 111;
+  hello[8] = 114;
+  hello[9] = 108;
+  hello[10] = 100;
+  hello[11] = 32;
+  hello[12] = 102;
+  hello[13] = 114;
+  hello[14] = 111;
+  hello[15] = 109;
+  hello[16] = 32;
+  hello[17] = 67;
+  hello[18] = 117;
+  hello[19] = 114;
+  hello[20] = 108;
+  hello[21] = 101;
+  hello[22] = 101;
+  hello[23] = 0;
+  return hello[i];
 }
 
-// The message length ("Hello World from JOE" = 23 characters).
+// The message length ("Hello World from Curlee" = 23 characters).
 fn hello_len() -> Int {
   return 23;
 }
 
 // Test entry (not part of the kernel build; `curlee run pack.curlee`).
 // vga_cell('H'=72, attr=0x0F) == 0x0F48 = 3912; vga_addr(0) == 753664.
+// hello_char_at(0) == 'H' = 72; hello_char_at(22) == 'e' = 101 (last real
+// char of "Hello World from Curlee", index 22 of 23).
 fn main() -> Int {
-  if (vga_cell(72, 15) == 3912) {
-    return 0;
-  } else {
+  if (vga_cell(72, 15) != 3912) {
     return 1;
   }
+  if (hello_char_at(0) != 72) {
+    return 2;
+  }
+  if (hello_char_at(22) != 101) {
+    return 3;
+  }
+  return 0;
 }
