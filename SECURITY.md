@@ -16,9 +16,9 @@ reports seriously, especially anything that:
 
 ## Supported versions
 
-JOE is pre-alpha. Security fixes land on `master` only — there are no
-tagged releases yet, so assume only the latest commit on `master` is
-supported.
+JOE is pre-alpha. Security fixes land on `master` and are backported to
+the latest tagged release only — older tags are not maintained. If in
+doubt, the latest commit on `master` is always the most current.
 
 ## Reporting a vulnerability
 
