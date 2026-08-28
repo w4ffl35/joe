@@ -114,87 +114,28 @@ fn be32_k(v: Int, k: Int) -> Int {
 // to ip_checksum().
 fn ip_byte_ck(i: Int, tcp_len: Int) -> Int {
   let total: Int = 20 + tcp_len;
-  if (i == 0) {
-    return 69;             // 0x45: v4 + 5 words
-  } else {
-    if (i == 1) {
-      return 0;            // DSCP/ECN
-    } else {
-      if (i == 2) {
-        return (total >> 8) & 255;
-      } else {
-        if (i == 3) {
-          return total & 255;
-        } else {
-          if (i == 4) {
-            return 18;     // 0x1234 identification: high byte
-          } else {
-            if (i == 5) {
-              return 52;   // 0x1234: low byte
-            } else {
-              if (i == 6) {
-                return 64; // 0x4000 flags DF: high byte
-              } else {
-                if (i == 7) {
-                  return 0;
-                } else {
-                  if (i == 8) {
-                    return 64;   // TTL
-                  } else {
-                    if (i == 9) {
-                      return 6;  // proto TCP
-                    } else {
-                      if (i == 10) {
-                        return 0;  // checksum field: zero for the sum
-                      } else {
-                        if (i == 11) {
-                          return 0;
-                        } else {
-                          if (i == 12) {
-                            return 10;   // src IP 10.0.2.15
-                          } else {
-                            if (i == 13) {
-                              return 0;
-                            } else {
-                              if (i == 14) {
-                                return 2;
-                              } else {
-                                if (i == 15) {
-                                  return 15;
-                                } else {
-                                  if (i == 16) {
-                                    return 10;  // dst IP 10.0.2.2
-                                  } else {
-                                    if (i == 17) {
-                                      return 0;
-                                    } else {
-                                      if (i == 18) {
-                                        return 2;
-                                      } else {
-                                        if (i == 19) {
-                                          return 2;
-                                        } else {
-                                          return 0;
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  let arr: [Int; 20] = [0; 20];
+  arr[0] = 69;                    // 0x45: v4 + 5 words
+  arr[1] = 0;                     // DSCP/ECN
+  arr[2] = (total >> 8) & 255;
+  arr[3] = total & 255;
+  arr[4] = 18;                    // 0x1234 identification: high byte
+  arr[5] = 52;                    // 0x1234: low byte
+  arr[6] = 64;                    // 0x4000 flags DF: high byte
+  arr[7] = 0;
+  arr[8] = 64;                    // TTL
+  arr[9] = 6;                     // proto TCP
+  arr[10] = 0;                    // checksum field: zero for the sum
+  arr[11] = 0;
+  arr[12] = 10;                   // src IP 10.0.2.15
+  arr[13] = 0;
+  arr[14] = 2;
+  arr[15] = 15;
+  arr[16] = 10;                   // dst IP 10.0.2.2
+  arr[17] = 0;
+  arr[18] = 2;
+  arr[19] = 2;
+  return arr[i];
 }
 
 // Header byte at offset i (0..19) for the WIRE frame, with the computed
