@@ -45,8 +45,17 @@ jobs:
           CURLEE: ${{ github.workspace }}/curlee/build/linux-debug/curlee
         run: make qemu-smoke
 
-      # Other gates (framebuffer, network stack, LLM inference) exercise
-      # more setup (a second QEMU instance, a local LLM daemon) and are not
-      # wired into CI yet -- run them locally via `make qemu-fb-smoke` /
-      # `make qemu-net-smoke` / `make qemu-llm-smoke` before relying on them
-      # for a change that touches those paths.
+      - name: Framebuffer smoke (QEMU)
+        env:
+          CURLEE: ${{ github.workspace }}/curlee/build/linux-debug/curlee
+        run: make qemu-fb-smoke
+
+      - name: Network stack smoke (QEMU, socket-based two-instance gate)
+        env:
+          CURLEE: ${{ github.workspace }}/curlee/build/linux-debug/curlee
+        run: make qemu-net-smoke
+
+      # qemu-llm-smoke is NOT wired into CI: it requires a real LLM daemon
+      # reachable from the guest (scripts/run-llm-smoke.sh), which CI has no
+      # way to provide. Run it locally via `make qemu-llm-smoke` before
+      # relying on it for a change that touches the LLM bridge path.
