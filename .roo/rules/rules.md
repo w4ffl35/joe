@@ -176,10 +176,11 @@ while (cond) {
   — this doc previously said otherwise and was stale.)
 - Comparison: `==` `!=` `<` `>` `<=` `>=`
 - Logic: `&&` `||` `!`
-- **NO shifts, NO bitwise ops (`& | ^ ~`)** — confirmed absent from
-  curlee's lexer/parser as of this writing. Verify against
-  `~/Projects/curlee/src/lexer/` or a throwaway `curlee run` probe if
-  this matters for what you're doing, rather than trusting this doc.
+- Bitwise: `&` `|` `^` `~` and shifts `<<` `>>` (curlee issue #270) —
+  verified directly 2026-08-27: `(5 & 3) | (1 << 2)` runs and returns 5.
+  This doc previously said these were absent and was stale. Verify against
+  `~/Projects/curlee/src/lexer/` or a throwaway `curlee run` probe if a
+  claim here matters, rather than trusting this doc.
 
 ### Literals
 
