@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build ISO + verify + publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout JOE
+        uses: actions/checkout@v4
+
+      - name: Checkout Curlee
+        uses: actions/checkout@v4
+        with:
+          repository: w4ffl35/curlee
+          path: curlee
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ gcc libz3-dev pkg-config qemu-system-x86 grub-pc-bin xorriso mtools
+
+      - name: Build Curlee compiler
+        working-directory: curlee
+        run: |
+          cmake --preset linux-debug
+          cmake --build --preset linux-debug
+
+      - name: Static verify gates
+        env:
+          CURLEE: ${{ github.workspace }}/curlee/build/linux-debug/curlee
+        run: make verify
+
+      - name: Boot smoke gates (must pass before releasing an ISO)
+        env:
+          CURLEE: ${{ github.workspace }}/curlee/build/linux-debug/curlee
+        run: |
+          make qemu-smoke
+          make qemu-fb-smoke
+          make qemu-net-smoke
+
+      - name: Build GRUB ISO (VirtualBox / real-hardware boot path)
+        env:
+          CURLEE: ${{ github.workspace }}/curlee/build/linux-debug/curlee
+        run: make iso
+
+      - name: Checksum the ISO
+        run: |
+          mkdir -p dist
+          cp build/joeos.iso dist/joeos-${{ github.ref_name }}.iso
+          sha256sum dist/joeos-${{ github.ref_name }}.iso > dist/SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/joeos-${{ github.ref_name }}.iso
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            Pre-alpha. No real-hardware validation yet — see the Bare-Metal
+            Readiness milestone. Boot under QEMU (`qemu-system-x86_64 -cdrom
+            joeos-${{ github.ref_name }}.iso -boot d`) or VirtualBox.
