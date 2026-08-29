@@ -318,17 +318,13 @@ fn blk_queue_base(pm: cap phys.mem) -> Int {
 // driver walks the response DMA address byte-by-byte, extracting each byte as a
 // plain Int (the response buffer is zero-filled and never owned by any other
 // code, so a physical read is correct).
-fn blk_sector_read(pm: cap phys.mem, lba: Int, num_sectors: Int) -> Int {
-  if (blk_pci_found == 0) {
-    return 0;
-  }
-  // 2026-09-09: blk_sector_read rewrites the descriptor phase. A virtio-blk
-// sector read needs THREE chained descriptors, each pointing at its own
-// buffer -- the old code incorrectly wrote the ring descriptor's OWN fields
-// (addr/len/flags at offsets 0/8/12 within the 16-byte descriptor slot) to
-// encode the request directly; the device has no way to know a request is
-// pending without real buffers and real descriptors (issue #26). The real
-// protocol:
+//
+// 2026-09-09: blk_sector_read's descriptor phase needs THREE chained
+// descriptors, each pointing at its own buffer -- the old code incorrectly
+// wrote the ring descriptor's OWN fields (addr/len/flags at offsets 0/8/12
+// within the 16-byte descriptor slot) to encode the request directly; the
+// device has no way to know a request is pending without real buffers and
+// real descriptors (issue #26). The real protocol:
 //   1. Header descriptor: addr points at a 16-byte virtio_blk_req header
 //      buffer (`u32 type; u32 reserved; u64 sector;` -- type 0 = VIRTIO_BLK_T_IN
 //      for read, sector = the LBA), len = 16, flags = 1 (VRING_DESC_F_NEXT).
@@ -338,21 +334,30 @@ fn blk_sector_read(pm: cap phys.mem, lba: Int, num_sectors: Int) -> Int {
 //   3. Status descriptor: addr points at a 1-byte status buffer, len = 1,
 //      flags = 2 (VRING_DESC_F_WRITE only) -- the device writes 0 on success.
 // The descriptor table lives in the same qmem region as before, but the
-// request buffers are dedicated statics (`blk_req_hdr` at 20480,
-// `blk_req_data` at 20544, `blk_req_status` at 20568) -- the MVP's single
-// sector reads (blk_read_gate) need only 512 bytes; the data buffer is
-// sized for a reasonable burst and reused across reads. The ring/queue
-// geometry is unchanged: the descriptor chain's head (slot 0) is published
-// via the avail ring (blk_vring_avail_entry + blk_vring_avail_idx, exact
-// virtio_net shape), then the used ring is polled for the response.
+// request buffers are dedicated statics below (`blk_req_hdr`, `blk_req_data`,
+// `blk_req_status`) -- the MVP's single sector reads (blk_read_gate) need
+// only 512 bytes; the data buffer is sized for a reasonable burst and reused
+// across reads. The ring/queue geometry is unchanged: the descriptor chain's
+// head (slot 0) is published via the avail ring (blk_vring_avail_entry +
+// blk_vring_avail_idx, exact virtio_net shape), then the used ring is polled
+// for the response.
 //
-// Note: the [0; N] repetition syntax is not accepted by the tool today
-// (the MVP never adds any array support — the tool's own README lists no
-// array feature at all). Each buffer is filled right before each use, so the
-// repetition is never a real MVP dependency.
-static blk_req_hdr: [Int; 16];
-static blk_req_data: [Int; 2048];
-static blk_req_status: [Int; 1];
+// These need a `= [0; N]` repeat-fill initializer just like the existing
+// blk_qmem static above (and net_state/net_ring/net_rx/net_tx in
+// virtio_net.curlee) -- a bare `[T; N]` declaration with no initializer is
+// not valid Curlee syntax and fails `make check` with "expected expression".
+// They must also be declared at TOP LEVEL, outside any function body -- an
+// earlier version of this edit inserted them inside blk_sector_read's own
+// body, which also fails to parse ("expected expression" at the `static`
+// keyword, because the parser is still inside the enclosing function).
+static blk_req_hdr: [U8; 16] = [0; 16];
+static blk_req_data: [U8; 2048] = [0; 2048];
+static blk_req_status: [U8; 1] = [0; 1];
+
+fn blk_sector_read(pm: cap phys.mem, lba: Int, num_sectors: Int) -> Int {
+  if (blk_pci_found == 0) {
+    return 0;
+  }
 
 // 2026-08-29: blk_queue_setup computes and stores the PAGE-ALIGNED ring
 // base in blk_rx_ring_base (the raw blk_qmem static's own address, from
@@ -460,7 +465,24 @@ blk_rx_used_last = last;
 // the real byte count. The MVP's single-sector read always reports the
 // full 512, but this is the real gate for every future burst size.
 if (got == 1 && response_len[0] != 0) {
-  if (blk_req_status[0] == 0) {
+  // blk_req_status is a DMA target the DEVICE writes via a physical-memory
+  // write, not something this driver's own code stores into -- reading it
+  // back must go through phys_read_u8(addr_of(...)), the same pattern
+  // virtio_net.curlee uses for every device-written buffer (see
+  // net_rx_byte's phys_read_u8(buf + i + 10)). Plain `blk_req_status[0]`
+  // array indexing reads this driver's own last-known value, never the
+  // device's write.
+  // Integer literals default to Int, not U8 (a bare `let status: U8 = 0;`
+  // fails to check with "expected U8, got Int") -- widen the byte to Int
+  // with `+ 0` right inside the unsafe block, the same trick this file (see
+  // `idi`/`eleni` above) and virtio_net.curlee (`bi`) already use everywhere
+  // a device-written byte needs to leave an unsafe block as a plain value.
+  let status: Int = 0;
+  unsafe {
+    let s: U8 = phys_read_u8(addr_of(blk_req_status));
+    status = s + 0;
+  }
+  if (status == 0) {
     return response_len[0];
   }
   return 0;
@@ -482,7 +504,13 @@ fn blk_read_gate(pm: cap phys.mem) -> Int {
 // ---------------------------------------------------------------------------
 
 extern fn curlee_putc(c: Int) -> Unit;
-extern fn curlee_halt() -> Unit;
+// NOTE: no `extern fn curlee_halt` here -- kernel.curlee already declares it
+// (its own extern boundary) and the merged build rejects a duplicate extern.
+// No standalone `fn main` here either, for the same reason: kernel.curlee's
+// real `main(pm)` already calls `blk_bringup(pm)` directly (right after
+// `net_bringup(pm)`), and a second `main(pm: cap phys.mem) -> Unit` in this
+// file collides with it once merged. This module is a library the real
+// kernel entry point drives, not its own entry point.
 
 fn blk_bringup(pm: cap phys.mem) -> Unit {
   unsafe {
@@ -506,11 +534,5 @@ fn blk_bringup(pm: cap phys.mem) -> Unit {
       curlee_putc(42); // '*'
     }
   }
-  return;
-}
-
-fn main(pm: cap phys.mem) -> Unit {
-  blk_bringup(pm);
-  curlee_halt();
   return;
 }
