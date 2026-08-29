@@ -625,7 +625,7 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@echo "All verification gates passed."
 
 clean:
- rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR)
 
 $(BUILD_DIR)/joeos-blk.img:
 	bash scripts/blk_model.sh > $(BUILD_DIR)/joeos-blk.img
