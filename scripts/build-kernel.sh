@@ -44,6 +44,7 @@ MODULES=(
   "$ROOT/kernel/vga_setup.curlee"
   "$ROOT/kernel/vbe.curlee"
   "$ROOT/kernel/virtio_net.curlee"
+  "$ROOT/kernel/virtio_blk.curlee"
   "$ROOT/kernel/net_stack.curlee"
   "$ROOT/kernel/net_glue.curlee"
   "$ROOT/kernel/mb2.curlee"

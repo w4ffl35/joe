@@ -615,6 +615,12 @@ fn main(pm: cap phys.mem) -> Unit {
   // nothing and the whole sequence is a safe no-op (existing gates stay
   // green — acceptance criterion 6).
   net_bringup(pm);
+  // Phase 2e: VirtIO-blk probe (blk_probe) — gated on pm (the existing
+  // capability that already flows through every phase 2d/2e/2f function) and
+  // the probe result (blk_init returns 1 on success). No PMH tag or host-side
+  // injection: the probe is a real probe, the smoke gate is no-NIC-safe, and
+  // the probe is called with no arguments.
+  blk_bringup(pm);
   // Phase 2d-2: the TCP/IP stack round-trip (ARP -> TCP -> send -> receive).
   // Gated on link-up, so with no NIC (or on the PVH stub path) every extern
   // returns 0 and the whole sequence is a safe no-op — existing gates stay

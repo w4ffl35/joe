@@ -1,0 +1,13 @@
+{
+  "sessionId": "cd18eb97-a12b-4a01-bba7-c6dbe9c4b9e9",
+  "mode": "code",
+  "model": "qwen3.5-9b-curlee-lora",
+  "iterations": 7,
+  "inputTokens": 131178,
+  "outputTokens": 829,
+  "cachedTokens": 0,
+  "costUsd": 0,
+  "startedAt": "2026-08-29T04:35:00.190Z",
+  "status": "running",
+  "workspaceRoot": "/home/joe/Projects/joeos/.worktrees/w1"
+}

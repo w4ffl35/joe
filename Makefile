@@ -38,6 +38,7 @@ SERIAL_SRC    := kernel/serial.curlee
 VGA_SETUP_SRC := kernel/vga_setup.curlee
 VBE_SRC       := kernel/vbe.curlee
 VIRTIO_NET_SRC := kernel/virtio_net.curlee
+VIRTIO_BLK_SRC := kernel/virtio_blk.curlee
 NET_STACK_SRC := kernel/net_stack.curlee
 NET_GLUE_SRC  := kernel/net_glue.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
@@ -107,7 +108,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
@@ -626,3 +627,28 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+$(BUILD_DIR)/joeos-blk.img:
+	bash scripts/blk_model.sh > $(BUILD_DIR)/joeos-blk.img
+
+qemu-blk-smoke: $(BUILD_DIR)/joeos-net.iso $(BUILD_DIR)/joeos-blk.img
+	rm -f $(BUILD_DIR)/serial-blk.log
+	@timeout 20 qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-net.iso -boot d -no-reboot \
+	  -device virtio-blk-pci,disable-modern=on,drive=blk0 \
+	  -drive if=none,id=blk0,format=raw,file=$(BUILD_DIR)/joeos-blk.img \
+	  -serial file:$(BUILD_DIR)/serial-blk.log \
+	  -display none > $(BUILD_DIR)/blk.err 2>&1 || true
+	# 2026-08-29: a bare `grep -q 'F'` / `grep -q '1'` (matching ANYWHERE in
+	# the log, on their own) is not a real check on this boot path -- the
+	# framebuffer demo's own unrelated output (FR:0, FR:1, RING: 1, FB: 1)
+	# already contains both characters regardless of whether virtio-blk did
+	# anything at all (found live: the gate reported PASS while the
+	# driver's own transcript showed the '*' probe-failure marker). Match
+	# the exact literal byte sequence blk_bringup emits on success instead
+	# ('F' + space + '1' + LF, from a real probe+init+read all succeeding)
+	# -- the qemu-net-smoke gate's own `grep -Pzo` multi-byte-sequence
+	# pattern is the precedent for this.
+	@grep -Pzo 'F 1\n' $(BUILD_DIR)/serial-blk.log > /dev/null \
+	  && echo "PASS: virtio-blk probe+init+read -> serial: $$(cat $(BUILD_DIR)/serial-blk.log)" \
+	  || (echo "FAIL: expected 'F 1' marker sequence not in serial log"; \
+	      echo "serial log: $$(cat $(BUILD_DIR)/serial-blk.log)"; exit 1)
