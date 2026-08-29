@@ -322,92 +322,150 @@ fn blk_sector_read(pm: cap phys.mem, lba: Int, num_sectors: Int) -> Int {
   if (blk_pci_found == 0) {
     return 0;
   }
-  // 2026-08-29: blk_queue_setup computes and stores the PAGE-ALIGNED ring
-  // base in blk_rx_ring_base (the raw blk_qmem static's own address, from
-  // blk_queue_base(), is not guaranteed 4096-aligned -- setup rounds up:
-  // `(raw + 4095) & ~4095`, exactly like virtio_net.curlee's own version).
-  // That aligned base is what was actually programmed into the device via
-  // VIRTIO_PCI_QUEUE_PFN. This function previously re-derived qbase from
-  // blk_queue_base() (the unaligned raw address) for every descriptor/avail
-  // write while correctly using blk_rx_ring_base for the used-ring reads --
-  // a real base-address mismatch (found by direct inspection after probe
-  // and init both succeeded but every read still came back empty): writes
-  // and the device's own view of the ring could land on different pages.
-  // Use blk_rx_ring_base consistently everywhere in this function.
-  unsafe {
-    // 1. Build a virtio_blk_req at the ring base and fill it (the response
-    //    buffer is zero-filled by queue_setup, so it's clean).
-    let desc: Int = blk_vring_desc_base(blk_rx_ring_base, 0);
-    phys_write_u64(desc, lba * 512);         // addr = LBA * 512
-    phys_write_u32(desc + 8, num_sectors);   // num_sectors
-    phys_write_u32(desc + 12, 0);            // type = VIRTIO_BLK_T_IN
-  }
-  // 2. Publish the descriptor on the avail ring (virtio_net's TX-submit
-  // shape: sfence before the idx store, avail entry -> desc id, THEN
-  // publish the new avail idx) -- this file previously wrote only the
-  // descriptor table and kicked the device directly, which the device has
-  // no way to notice (see blk_vring_avail_entry's comment). Single-request
-  // MVP: always desc id 0, one avail slot per call.
-  unsafe {
-    curlee_sfence();   // desc[] store visible before the avail idx store
-    let entry: Int = blk_vring_avail_entry(blk_rx_ring_base, blk_rx_avail_head % 256);
-    phys_write_u16(entry, 0);   // desc id 0
-    blk_rx_avail_head = blk_rx_avail_head + 1;
-    let avail_idx_addr: Int = blk_vring_avail_idx_addr(blk_rx_ring_base);
-    phys_write_u16(avail_idx_addr, blk_rx_avail_head);
-  }
-  // 3. Kick the device.
-  blk_queue_ready(pm);
-  // 3. Poll the used ring for a NEW completion (virtio_net's
-  // service_rx_used/net_rx_wait shape -- see kernel/virtio_net.curlee).
-  // 2026-08-29: the previous version compared the live used.idx against the
-  // literal constant 0 and treated "still 0" (i.e. "the device hasn't
-  // processed the request yet", true on essentially every poll immediately
-  // after the kick) as "caught up" -- it gave up on the very first
-  // iteration, before the device had any real chance to respond, so this
-  // always returned 0. The correct comparison is against blk_rx_used_last
-  // (the last index THIS driver has already consumed, a persistent static
-  // like virtio_net's rx_used_last) -- only a genuine change from that
-  // baseline means a new response landed. A single completed request is
-  // enough for this MVP (no multi-request pipelining), so the loop exits
-  // via the response-ready flag rather than tracking multiple in-flight
-  // ids the way virtio_net's RX ring (2 buffers) needs to.
-  let idx_addr: Int = blk_vring_used_idx_addr(blk_rx_ring_base);
-  let last: Int = blk_rx_used_last;
-  let i: Int = 0;
-  let got: Int = 0;
-  unsafe {
-    while (i < 2000000) {   // BLK_READ_POLL_MAX -- a local, synchronous QEMU
-                             // device responds far faster than virtio_net's
-                             // real network round-trip, so this is generous.
-      if ((i & 255) == 0) {
-        let isr: U8 = port_inb(blk_io_base + 19);   // VIRTIO_PCI_ISR 0x13 — yield
+  // 2026-09-09: blk_sector_read rewrites the descriptor phase. A virtio-blk
+// sector read needs THREE chained descriptors, each pointing at its own
+// buffer -- the old code incorrectly wrote the ring descriptor's OWN fields
+// (addr/len/flags at offsets 0/8/12 within the 16-byte descriptor slot) to
+// encode the request directly; the device has no way to know a request is
+// pending without real buffers and real descriptors (issue #26). The real
+// protocol:
+//   1. Header descriptor: addr points at a 16-byte virtio_blk_req header
+//      buffer (`u32 type; u32 reserved; u64 sector;` -- type 0 = VIRTIO_BLK_T_IN
+//      for read, sector = the LBA), len = 16, flags = 1 (VRING_DESC_F_NEXT).
+//   2. Data descriptor: addr points at a buffer of `num_sectors * 512`
+//      bytes, len = `num_sectors * 512`, flags = 3 (VRING_DESC_F_NEXT |
+//      VRING_DESC_F_WRITE) -- the device writes the sector data INTO it.
+//   3. Status descriptor: addr points at a 1-byte status buffer, len = 1,
+//      flags = 2 (VRING_DESC_F_WRITE only) -- the device writes 0 on success.
+// The descriptor table lives in the same qmem region as before, but the
+// request buffers are dedicated statics (`blk_req_hdr` at 20480,
+// `blk_req_data` at 20544, `blk_req_status` at 20568) -- the MVP's single
+// sector reads (blk_read_gate) need only 512 bytes; the data buffer is
+// sized for a reasonable burst and reused across reads. The ring/queue
+// geometry is unchanged: the descriptor chain's head (slot 0) is published
+// via the avail ring (blk_vring_avail_entry + blk_vring_avail_idx, exact
+// virtio_net shape), then the used ring is polled for the response.
+//
+// Note: the [0; N] repetition syntax is not accepted by the tool today
+// (the MVP never adds any array support — the tool's own README lists no
+// array feature at all). Each buffer is filled right before each use, so the
+// repetition is never a real MVP dependency.
+static blk_req_hdr: [Int; 16];
+static blk_req_data: [Int; 2048];
+static blk_req_status: [Int; 1];
+
+// 2026-08-29: blk_queue_setup computes and stores the PAGE-ALIGNED ring
+// base in blk_rx_ring_base (the raw blk_qmem static's own address, from
+// blk_queue_base(), is not guaranteed 4096-aligned -- setup rounds up:
+// `(raw + 4095) & ~4095`, exactly like virtio_net.curlee's own version).
+// That aligned base is what was actually programmed into the device via
+// VIRTIO_PCI_QUEUE_PFN. This function previously re-derived qbase from
+// blk_queue_base() (the unaligned raw address) for every descriptor/avail
+// write while correctly using blk_rx_ring_base for the used-ring reads --
+// a real base-address mismatch (found by direct inspection after probe
+// and init both succeeded but every read still came back empty): writes
+// and the device's own view of the ring could land on different pages.
+// Use blk_rx_ring_base consistently everywhere in this function.
+unsafe {
+  // 1. Fill the header buffer: the header buffer's LITTLE-ENDIAN u64
+  //   sector field (the header's offsets are 0/4/8, so the sector bytes land
+  //   at offsets 8-15) is written explicitly; the header's own u32 type at
+  //   offset 0 is 0 (VIRTIO_BLK_T_IN) and the 4 reserved bytes at 4-7 are
+  //   whatever the zero-fill left them as.
+  phys_write_u64(addr_of(blk_req_hdr) + 8, lba);
+}
+// 2. Write the descriptor chain (3 x 16-byte slots). The chain stays in the
+//    same slot 0, so this slot overwrites each time a request is built.
+unsafe {
+  let d0: Int = blk_vring_desc_base(blk_rx_ring_base, 0);
+  phys_write_u64(d0 + 0, addr_of(blk_req_hdr));   // addr = header buffer
+  phys_write_u32(d0 + 8, 16);                     // len = 16
+  phys_write_u16(d0 + 12, 1);                     // flags = VRING_DESC_F_NEXT (1)
+  phys_write_u16(d0 + 14, 1);                     // next = slot 1
+
+  let d1: Int = blk_vring_desc_base(blk_rx_ring_base, 1);
+  phys_write_u64(d1 + 0, addr_of(blk_req_data));  // addr = data buffer
+  phys_write_u32(d1 + 8, 512 * 1);                // len = 512 (MVP single-sect)
+  phys_write_u16(d1 + 12, 3);                     // flags = VRING_DESC_F_NEXT | VRING_DESC_F_WRITE (1 | 2 = 3)
+  phys_write_u16(d1 + 14, 2);                     // next = slot 2
+
+  let d2: Int = blk_vring_desc_base(blk_rx_ring_base, 2);
+  phys_write_u64(d2 + 0, addr_of(blk_req_status)); // addr = status buffer
+  phys_write_u32(d2 + 8, 1);                      // len = 1
+  phys_write_u16(d2 + 12, 2);                     // flags = VRING_DESC_F_WRITE (2)
+  phys_write_u16(d2 + 14, 0);                     // next = 0 (last in chain)
+}
+// 3. Publish the descriptor chain on the avail ring (virtio_net's TX-submit
+// shape: sfence before the idx store, avail entry -> desc id, THEN
+// publish the new avail idx) -- this file previously wrote only the
+// descriptor table and kicked the device directly, which the device has
+// no way to notice (see blk_vring_avail_entry's comment). Single-request
+// MVP: always desc id 0, one avail slot per call.
+unsafe {
+  curlee_sfence();   // desc[] store visible before the avail idx store
+  let entry: Int = blk_vring_avail_entry(blk_rx_ring_base, blk_rx_avail_head % 256);
+  phys_write_u16(entry, 0);   // desc id 0
+  blk_rx_avail_head = blk_rx_avail_head + 1;
+  let avail_idx_addr: Int = blk_vring_avail_idx_addr(blk_rx_ring_base);
+  phys_write_u16(avail_idx_addr, blk_rx_avail_head);
+}
+// 4. Kick the device.
+blk_queue_ready(pm);
+// 5. Poll the used ring for a NEW completion (virtio_net's
+// service_rx_used/net_rx_wait shape -- see kernel/virtio_net.curlee).
+// 2026-08-29: the previous version compared the live used.idx against the
+// literal constant 0 and treated "still 0" (i.e. "the device hasn't
+// processed the request yet", true on essentially every poll immediately
+// after the kick) as "caught up" -- it gave up on the very first
+// iteration, before the device had any real chance to respond, so this
+// always returned 0. The correct comparison is against blk_rx_used_last
+// (the last index THIS driver has already consumed, a persistent static
+// like virtio_net's rx_used_last) -- only a genuine change from that
+// baseline means a new response landed. A single completed request is
+// enough for this MVP (no multi-request pipelining), so the loop exits
+// via the response-ready flag rather than tracking multiple in-flight
+// ids the way virtio_net's RX ring (2 buffers) needs to.
+let idx_addr: Int = blk_vring_used_idx_addr(blk_rx_ring_base);
+let last: Int = blk_rx_used_last;
+let i: Int = 0;
+let got: Int = 0;
+unsafe {
+  while (i < 2000000) {   // BLK_READ_POLL_MAX -- a local, synchronous QEMU
+                            // device responds far faster than virtio_net's
+                            // real network round-trip, so this is generous.
+    if ((i & 255) == 0) {
+      let isr: U8 = port_inb(blk_io_base + 19);   // VIRTIO_PCI_ISR 0x13 — yield
+    }
+    let uidx: U16 = phys_read_u16(idx_addr);
+    let ui: Int = uidx + 0;
+    if (ui != last) {
+      let id: U32 = phys_read_u32(blk_vring_used_elem_id_addr(blk_rx_ring_base, last % 256));
+      let idi: Int = id + 0;
+      if (idi == 0) {
+        let elen: U32 = phys_read_u32(blk_vring_used_elem_len_addr(blk_rx_ring_base, last % 256));
+        let eleni: Int = elen + 0;
+        response_addr[0] = lba * 512;
+        response_len[0] = eleni;
+        got = 1;
       }
-      let uidx: U16 = phys_read_u16(idx_addr);
-      let ui: Int = uidx + 0;
-      if (ui != last) {
-        let id: U32 = phys_read_u32(blk_vring_used_elem_id_addr(blk_rx_ring_base, last % 256));
-        let idi: Int = id + 0;
-        if (idi == 0) {
-          let elen: U32 = phys_read_u32(blk_vring_used_elem_len_addr(blk_rx_ring_base, last % 256));
-          let eleni: Int = elen + 0;
-          response_addr[0] = lba * 512;
-          response_len[0] = eleni;
-          got = 1;
-        }
-        last = (last + 1) % 65536;   // u16 wrap (see virtio_net's rx_used_last)
-        i = 2000000;   // request satisfied — stop polling
-      } else {
-        i = i + 1;
-      }
+      last = (last + 1) % 65536;   // u16 wrap (see virtio_net's rx_used_last)
+      i = 2000000;   // request satisfied — stop polling
+    } else {
+      i = i + 1;
     }
   }
-  blk_rx_used_last = last;
-  // 4. Return the response byte count, or 0 on no response.
-  if (got == 1 && response_len[0] != 0) {
+}
+blk_rx_used_last = last;
+// 6. Check the status buffer (the device writes 0 on success) and return
+// the real byte count. The MVP's single-sector read always reports the
+// full 512, but this is the real gate for every future burst size.
+if (got == 1 && response_len[0] != 0) {
+  if (blk_req_status[0] == 0) {
     return response_len[0];
   }
   return 0;
+}
+return 0;
 }
 
 // Curlee build gate: the sector-read function is correct with the expected
@@ -424,6 +482,7 @@ fn blk_read_gate(pm: cap phys.mem) -> Int {
 // ---------------------------------------------------------------------------
 
 extern fn curlee_putc(c: Int) -> Unit;
+extern fn curlee_halt() -> Unit;
 
 fn blk_bringup(pm: cap phys.mem) -> Unit {
   unsafe {
@@ -447,5 +506,11 @@ fn blk_bringup(pm: cap phys.mem) -> Unit {
       curlee_putc(42); // '*'
     }
   }
+  return;
+}
+
+fn main(pm: cap phys.mem) -> Unit {
+  blk_bringup(pm);
+  curlee_halt();
   return;
 }

@@ -1,0 +1,1 @@
+{"sessionId":"77116868-4469-4a4b-87c2-9dc3a3ccf25f","mode":"deepseek-reviewer","model":"qwen3.5-9b-curlee-lora","iterations":6,"inputTokens":90919,"outputTokens":1508,"cachedTokens":0,"costUsd":0,"startedAt":"2026-08-29T01:48:17.282Z","endedAt":"2026-08-29T01:50:13.231Z","status":"success","workspaceRoot":"/home/joe/Projects/joeos/.worktrees/w1"}

@@ -1,0 +1,56 @@
+
+===== headlesscode qa start: 2026-08-29T01:50:13.251Z =====
+[2026-08-29T01:50:13.259Z] INFO  [prefix-size] {"context":"session-start","systemPromptChars":17225,"systemPromptTokensEstimate":4307,"toolCount":10,"toolCatalogChars":19988,"toolCatalogTokensEstimate":4997,"totalPrefixChars":37213,"totalPrefixTokensEstimate":9304}
+[2026-08-29T01:50:13.259Z] INFO  [loop] session start {"mode":"qa-agent","model":"qwen3.5-9b-curlee-lora","workspaceRoot":"/home/joe/Projects/joeos/.worktrees/w1","tools":["ask_followup_question","attempt_completion","execute_command","list_files","read_file","browser_action","outline","go_to_definition","find_references","import_graph"]}
+[2026-08-29T01:50:13.653Z] INFO  [checkpoints] baseline checkpoint saved {"taskId":"27f8778a-ae6b-43a7-9dc3-4d9d1dc6cbd6"}
+[2026-08-29T01:50:13.653Z] WARN  [budget] live pricing unavailable; using hardcoded DEFAULT_PRICING_TABLE (non-fatal) {"model":"qwen3.5-9b-curlee-lora"}
+[2026-08-29T01:50:13.653Z] INFO  [loop] iteration 1/200 {"history":2}
+[2026-08-29T01:50:18.777Z] INFO  [usage] running total {"iteration":1,"costUsd":null,"iterations":1,"inputTokens":10174,"outputTokens":188,"cachedTokens":0,"lastPromptTokens":10174,"lastCachedTokens":0}
+[2026-08-29T01:50:18.784Z] INFO  [loop] tool result: execute_command {"isError":false,"toolCalls":1,"arg":"git diff origin/master...HEAD --stat"}
+[2026-08-29T01:50:18.784Z] INFO  [loop] iteration 2/200 {"history":4}
+[2026-08-29T01:50:18.784Z] WARN  [condense] live context-window lookup returned no value (non-fatal; using conservative default) {"model":"qwen3.5-9b-curlee-lora","contextWindowTokens":128000}
+[2026-08-29T01:50:20.041Z] INFO  [usage] running total {"iteration":2,"costUsd":null,"iterations":2,"inputTokens":20429,"outputTokens":269,"cachedTokens":0,"lastPromptTokens":10255,"lastCachedTokens":0}
+[2026-08-29T01:50:20.048Z] INFO  [loop] tool result: execute_command {"isError":false,"toolCalls":2,"arg":"git status --short"}
+[2026-08-29T01:50:20.048Z] INFO  [loop] iteration 3/200 {"history":6}
+[2026-08-29T01:50:21.489Z] INFO  [usage] running total {"iteration":3,"costUsd":null,"iterations":3,"inputTokens":30813,"outputTokens":364,"cachedTokens":0,"lastPromptTokens":10384,"lastCachedTokens":0}
+[2026-08-29T01:50:21.497Z] INFO  [loop] tool result: execute_command {"isError":false,"toolCalls":3,"arg":"cd /home/joe/Projects/joeos && git status --porcelain 2>&1 | head -30"}
+[2026-08-29T01:50:21.497Z] INFO  [loop] iteration 4/200 {"history":8}
+[2026-08-29T01:50:23.488Z] INFO  [usage] running total {"iteration":4,"costUsd":null,"iterations":4,"inputTokens":41295,"outputTokens":498,"cachedTokens":0,"lastPromptTokens":10482,"lastCachedTokens":0}
+[2026-08-29T01:50:37.521Z] INFO  [loop] tool result: execute_command {"isError":true,"toolCalls":4,"arg":"git branch --show-current"}
+[2026-08-29T01:50:37.521Z] WARN  [loop] infrastructure spawn failure — not counted as a mistake {"tool":"execute_command"}
+[2026-08-29T01:50:37.521Z] INFO  [loop] iteration 5/200 {"history":10}
+[2026-08-29T01:50:38.704Z] INFO  [usage] running total {"iteration":5,"costUsd":null,"iterations":5,"inputTokens":51881,"outputTokens":578,"cachedTokens":0,"lastPromptTokens":10586,"lastCachedTokens":0}
+[2026-08-29T01:50:52.741Z] INFO  [loop] tool result: execute_command {"isError":true,"toolCalls":5,"arg":"bash -c 'cd /home/joe/Projects/joeos && git branch --show-current'"}
+[2026-08-29T01:50:52.741Z] WARN  [loop] infrastructure spawn failure — not counted as a mistake {"tool":"execute_command"}
+[2026-08-29T01:50:52.741Z] WARN  [loop] repeated-tool-failure nudge injected {"iteration":5,"toolName":"execute_command","streak":2}
+[2026-08-29T01:50:52.741Z] INFO  [loop] iteration 6/200 {"history":13}
+[2026-08-29T01:50:56.342Z] INFO  [usage] running total {"iteration":6,"costUsd":null,"iterations":6,"inputTokens":62673,"outputTokens":825,"cachedTokens":0,"lastPromptTokens":10792,"lastCachedTokens":0}
+[2026-08-29T01:50:56.343Z] INFO  [loop] tool result: execute_command {"isError":true,"toolCalls":6,"arg":"bash -c 'exec 2>/dev/null; exit 0'"}
+[2026-08-29T01:50:56.343Z] WARN  [loop] mistake counted {"consecutiveMistakes":1,"reason":"tool error"}
+[2026-08-29T01:50:56.343Z] INFO  [loop] iteration 7/200 {"history":15}
+[2026-08-29T01:50:58.182Z] INFO  [usage] running total {"iteration":7,"costUsd":null,"iterations":7,"inputTokens":73593,"outputTokens":944,"cachedTokens":0,"lastPromptTokens":10920,"lastCachedTokens":0}
+[2026-08-29T01:50:58.187Z] INFO  [loop] tool result: execute_command {"isError":false,"toolCalls":7,"arg":"bash -c 'exec 2>/dev/null; exit 0'"}
+[2026-08-29T01:50:58.187Z] INFO  [loop] iteration 8/200 {"history":17}
+[2026-08-29T01:50:59.962Z] INFO  [usage] running total {"iteration":8,"costUsd":null,"iterations":8,"inputTokens":84613,"outputTokens":1058,"cachedTokens":0,"lastPromptTokens":11020,"lastCachedTokens":0}
+[2026-08-29T01:51:14.001Z] INFO  [loop] tool result: execute_command {"isError":true,"toolCalls":8,"arg":"bash -c 'cd /home/joe/Projects/joeos/.worktrees/w1 && git status --porcelain'"}
+[2026-08-29T01:51:14.002Z] WARN  [loop] infrastructure spawn failure — not counted as a mistake {"tool":"execute_command"}
+[2026-08-29T01:51:14.002Z] INFO  [loop] iteration 9/200 {"history":19}
+[2026-08-29T01:51:16.170Z] INFO  [usage] running total {"iteration":9,"costUsd":null,"iterations":9,"inputTokens":95784,"outputTokens":1205,"cachedTokens":0,"lastPromptTokens":11171,"lastCachedTokens":0}
+[2026-08-29T01:51:16.178Z] INFO  [loop] tool result: execute_command {"isError":false,"toolCalls":9,"arg":"bash -c 'cd /home/joe/Projects/joeos/.worktrees/w1 && git status --porcelain'"}
+[2026-08-29T01:51:16.178Z] INFO  [loop] iteration 10/200 {"history":21}
+[2026-08-29T01:51:17.999Z] INFO  [usage] running total {"iteration":10,"costUsd":null,"iterations":10,"inputTokens":107118,"outputTokens":1325,"cachedTokens":0,"lastPromptTokens":11334,"lastCachedTokens":0}
+[2026-08-29T01:51:18.008Z] INFO  [loop] tool result: execute_command {"isError":false,"toolCalls":10,"arg":"bash -c 'cd /home/joe/Projects/joeos/.worktrees/w1 && git diff origin/master...HEAD'"}
+[2026-08-29T01:51:18.008Z] INFO  [loop] iteration 11/200 {"history":23}
+[2026-08-29T01:51:21.511Z] INFO  [usage] running total {"iteration":11,"costUsd":null,"iterations":11,"inputTokens":118564,"outputTokens":1564,"cachedTokens":0,"lastPromptTokens":11446,"lastCachedTokens":0}
+[2026-08-29T01:51:21.511Z] INFO  [loop] attempt_completion received — success {"iteration":11}
+[2026-08-29T01:51:21.511Z] INFO  [loop] final report persisted {"reportPath":"/home/joe/Projects/joeos/.worktrees/w1/.headlesscode/reports/27f8778a-ae6b-43a7-9dc3-4d9d1dc6cbd6.md"}
+
+===== headlesscode qa start: 2026-08-29T02:46:00.837Z =====
+[2026-08-29T02:46:00.841Z] INFO  [prefix-size] {"context":"session-start","systemPromptChars":17225,"systemPromptTokensEstimate":4307,"toolCount":10,"toolCatalogChars":19988,"toolCatalogTokensEstimate":4997,"totalPrefixChars":37213,"totalPrefixTokensEstimate":9304}
+[2026-08-29T02:46:00.841Z] INFO  [loop] session start {"mode":"qa-agent","model":"qwen3.5-9b-curlee-lora","workspaceRoot":"/home/joe/Projects/joeos/.worktrees/w1","tools":["ask_followup_question","attempt_completion","execute_command","list_files","read_file","browser_action","outline","go_to_definition","find_references","import_graph"]}
+[2026-08-29T02:46:01.216Z] INFO  [checkpoints] baseline checkpoint saved {"taskId":"3bf76922-3421-4930-aa9b-528478d5e0ae"}
+[2026-08-29T02:46:01.217Z] WARN  [budget] live pricing unavailable; using hardcoded DEFAULT_PRICING_TABLE (non-fatal) {"model":"qwen3.5-9b-curlee-lora"}
+[2026-08-29T02:46:01.217Z] INFO  [loop] iteration 1/200 {"history":2}
+[2026-08-29T02:46:07.963Z] INFO  [usage] running total {"iteration":1,"costUsd":null,"iterations":1,"inputTokens":10174,"outputTokens":348,"cachedTokens":0,"lastPromptTokens":10174,"lastCachedTokens":0}
+[2026-08-29T02:46:07.963Z] INFO  [loop] attempt_completion received — success {"iteration":1}
+[2026-08-29T02:46:07.963Z] INFO  [loop] final report persisted {"reportPath":"/home/joe/Projects/joeos/.worktrees/w1/.headlesscode/reports/3bf76922-3421-4930-aa9b-528478d5e0ae.md"}
