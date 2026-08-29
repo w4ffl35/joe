@@ -86,6 +86,22 @@ fn blk_vring_used_idx_addr(base: Int) -> Int {
   return base + 8192 + 2;
 }
 
+// Avail ring entry for slot s (page 1): flags u16 @0, idx u16 @2, ring[256]
+// u16 @4 (virtio_net.curlee's vring_avail_entry, exact clone). Added
+// 2026-08-29: the original blk_sector_read wrote the descriptor table but
+// NEVER published it via the avail ring (found by direct inspection after
+// the driver's probe+init succeeded but every read came back empty — the
+// device has no way to know a new descriptor exists without this).
+fn blk_vring_avail_entry(base: Int, s: Int) -> Int {
+  return base + 4096 + 4 + s * 2;
+}
+
+// Avail idx field (page 1 @2) — virtio_net.curlee's vring_avail_idx_addr,
+// exact clone.
+fn blk_vring_avail_idx_addr(base: Int) -> Int {
+  return base + 4096 + 2;
+}
+
 // Queue kick (virtio_net's queue_notify, exact clone). Renamed with a blk_
 // prefix (2026-08-29): virtio_net.curlee defines an identically-named
 // function, and both files are now part of the same merged translation
@@ -202,11 +218,22 @@ fn blk_probe(pm: cap phys.mem) -> Int {
         let vendor: Int = id & 65535;
         let device: Int = (id >> 16) & 65535;
         if (vendor == 6900) {   // 0x1AF4
-          if (device == 4161) {   // 0x1041 (modern, the smoke path uses
-                                   // the legacy-only register layout, but the
-                                   // driver never offers VIRTIO_F_VERSION_1, so
-                                   // the device stays in legacy mode — see the
-                                   // virtio_net header)
+          if (device == 4097 || device == 4162) {   // 0x1001 legacy, 0x1042
+                                   // modern (2026-08-29: was 4161/0x1041 --
+                                   // virtio-NET's own modern ID, copy-pasted
+                                   // from virtio_net.curlee's blk_probe clone
+                                   // without updating it for blk; found by
+                                   // direct inspection when a real QEMU boot
+                                   // produced the '*' probe-failure marker
+                                   // instead of 'F'). The driver only
+                                   // implements the legacy I/O-port register
+                                   // layout (mirrors virtio_net.curlee), so
+                                   // qemu-blk-smoke's -device line pins
+                                   // disable-modern=on -- the device always
+                                   // negotiates down to the legacy ID (4097)
+                                   // in practice; 4162 is accepted too for
+                                   // symmetry with virtio_net's own dual
+                                   // check.
             let bar: Int = blk_pci_config_read32(pm, 0, dev, func, 16);   // 0x10
             if ((bar & 1) != 0) {
               // I/O BAR (legacy transport). An MMIO BAR (bit 0 clear) is
@@ -295,43 +322,89 @@ fn blk_sector_read(pm: cap phys.mem, lba: Int, num_sectors: Int) -> Int {
   if (blk_pci_found == 0) {
     return 0;
   }
+  // 2026-08-29: blk_queue_setup computes and stores the PAGE-ALIGNED ring
+  // base in blk_rx_ring_base (the raw blk_qmem static's own address, from
+  // blk_queue_base(), is not guaranteed 4096-aligned -- setup rounds up:
+  // `(raw + 4095) & ~4095`, exactly like virtio_net.curlee's own version).
+  // That aligned base is what was actually programmed into the device via
+  // VIRTIO_PCI_QUEUE_PFN. This function previously re-derived qbase from
+  // blk_queue_base() (the unaligned raw address) for every descriptor/avail
+  // write while correctly using blk_rx_ring_base for the used-ring reads --
+  // a real base-address mismatch (found by direct inspection after probe
+  // and init both succeeded but every read still came back empty): writes
+  // and the device's own view of the ring could land on different pages.
+  // Use blk_rx_ring_base consistently everywhere in this function.
   unsafe {
     // 1. Build a virtio_blk_req at the ring base and fill it (the response
     //    buffer is zero-filled by queue_setup, so it's clean).
-    let qbase: Int = blk_queue_base(pm);
-    let desc: Int = blk_vring_desc_base(qbase, 0);
+    let desc: Int = blk_vring_desc_base(blk_rx_ring_base, 0);
     phys_write_u64(desc, lba * 512);         // addr = LBA * 512
     phys_write_u32(desc + 8, num_sectors);   // num_sectors
     phys_write_u32(desc + 12, 0);            // type = VIRTIO_BLK_T_IN
   }
-  // 2. Kick the device.
-  blk_queue_ready(pm);
-  // 3. Poll the used ring (virtio_net's service_rx_used shape).
-  let guard: Int = 0;
-  let idx_addr: Int = blk_vring_used_idx_addr(blk_rx_ring_base);
+  // 2. Publish the descriptor on the avail ring (virtio_net's TX-submit
+  // shape: sfence before the idx store, avail entry -> desc id, THEN
+  // publish the new avail idx) -- this file previously wrote only the
+  // descriptor table and kicked the device directly, which the device has
+  // no way to notice (see blk_vring_avail_entry's comment). Single-request
+  // MVP: always desc id 0, one avail slot per call.
   unsafe {
-    while (guard < 256) {
+    curlee_sfence();   // desc[] store visible before the avail idx store
+    let entry: Int = blk_vring_avail_entry(blk_rx_ring_base, blk_rx_avail_head % 256);
+    phys_write_u16(entry, 0);   // desc id 0
+    blk_rx_avail_head = blk_rx_avail_head + 1;
+    let avail_idx_addr: Int = blk_vring_avail_idx_addr(blk_rx_ring_base);
+    phys_write_u16(avail_idx_addr, blk_rx_avail_head);
+  }
+  // 3. Kick the device.
+  blk_queue_ready(pm);
+  // 3. Poll the used ring for a NEW completion (virtio_net's
+  // service_rx_used/net_rx_wait shape -- see kernel/virtio_net.curlee).
+  // 2026-08-29: the previous version compared the live used.idx against the
+  // literal constant 0 and treated "still 0" (i.e. "the device hasn't
+  // processed the request yet", true on essentially every poll immediately
+  // after the kick) as "caught up" -- it gave up on the very first
+  // iteration, before the device had any real chance to respond, so this
+  // always returned 0. The correct comparison is against blk_rx_used_last
+  // (the last index THIS driver has already consumed, a persistent static
+  // like virtio_net's rx_used_last) -- only a genuine change from that
+  // baseline means a new response landed. A single completed request is
+  // enough for this MVP (no multi-request pipelining), so the loop exits
+  // via the response-ready flag rather than tracking multiple in-flight
+  // ids the way virtio_net's RX ring (2 buffers) needs to.
+  let idx_addr: Int = blk_vring_used_idx_addr(blk_rx_ring_base);
+  let last: Int = blk_rx_used_last;
+  let i: Int = 0;
+  let got: Int = 0;
+  unsafe {
+    while (i < 2000000) {   // BLK_READ_POLL_MAX -- a local, synchronous QEMU
+                             // device responds far faster than virtio_net's
+                             // real network round-trip, so this is generous.
+      if ((i & 255) == 0) {
+        let isr: U8 = port_inb(blk_io_base + 19);   // VIRTIO_PCI_ISR 0x13 — yield
+      }
       let uidx: U16 = phys_read_u16(idx_addr);
       let ui: Int = uidx + 0;
-      if (ui == 0) {
-        guard = 256;   // caught up
-      } else {
-        let id: U32 = phys_read_u32(blk_vring_used_elem_id_addr(blk_rx_ring_base, 0));
+      if (ui != last) {
+        let id: U32 = phys_read_u32(blk_vring_used_elem_id_addr(blk_rx_ring_base, last % 256));
         let idi: Int = id + 0;
         if (idi == 0) {
-          let elen: U32 = phys_read_u32(blk_vring_used_elem_len_addr(blk_rx_ring_base, 0));
+          let elen: U32 = phys_read_u32(blk_vring_used_elem_len_addr(blk_rx_ring_base, last % 256));
           let eleni: Int = elen + 0;
           response_addr[0] = lba * 512;
           response_len[0] = eleni;
-          guard = 256;   // caught up
-        } else {
-          guard = guard + 1;
+          got = 1;
         }
+        last = (last + 1) % 65536;   // u16 wrap (see virtio_net's rx_used_last)
+        i = 2000000;   // request satisfied — stop polling
+      } else {
+        i = i + 1;
       }
     }
   }
+  blk_rx_used_last = last;
   // 4. Return the response byte count, or 0 on no response.
-  if (guard == 256 && response_len[0] != 0) {
+  if (got == 1 && response_len[0] != 0) {
     return response_len[0];
   }
   return 0;
