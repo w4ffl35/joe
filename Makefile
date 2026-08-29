@@ -625,4 +625,19 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@echo "All verification gates passed."
 
 clean:
-	rm -rf $(BUILD_DIR)
+ rm -rf $(BUILD_DIR)
+
+$(BUILD_DIR)/joeos-blk.img:
+	bash scripts/blk_model.sh > $(BUILD_DIR)/joeos-blk.img
+
+qemu-blk-smoke: $(BUILD_DIR)/joeos-net.iso $(BUILD_DIR)/joeos-blk.img
+	rm -f $(BUILD_DIR)/serial-blk.log
+	@timeout 20 qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-net.iso -boot d -no-reboot \
+	  -device virtio-blk-pci,drive=blk0 \
+	  -drive if=none,id=blk0,format=raw,file=$(BUILD_DIR)/joeos-blk.img \
+	  -serial file:$(BUILD_DIR)/serial-blk.log \
+	  -display none > $(BUILD_DIR)/blk.err 2>&1 || true
+	@grep -q 'F' $(BUILD_DIR)/serial-blk.log && grep -q '1' $(BUILD_DIR)/serial-blk.log \
+	  && echo "PASS: virtio-blk probe+init+read -> serial: $$(cat $(BUILD_DIR)/serial-blk.log)" \
+	  || (echo "FAIL: expected markers not in serial log"; \
+	      echo "serial log: $$(cat $(BUILD_DIR)/serial-blk.log)"; exit 1)
