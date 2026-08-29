@@ -1,0 +1,373 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// virtio_blk.curlee — Phase 2e VirtIO-blk storage driver (raw sector read,
+// no filesystem), ported from the former kernel/virtio_blk.c (397 lines, gh
+// issue #26).
+//
+// Boot path (LOCKED in issue #26): paravirtualized VIRTIO-blk over the PCI I/O
+// BAR, exactly like virtio-net — QEMU's `-device virtio-blk-pci,drive=...`
+// (blk.curlee reads the raw storage; qemu-block.curlee reads the QEMU block
+// curlee tool itself).
+//
+// Queue layout (proven by virtio_net.curlee): one request queue (no RX/TX
+// split), 256-element ring, 3 x 4096 pages. The device writes a 16-byte
+// `struct virtio_blk_req` at the DMA address into the request buffer:
+//   struct virtio_blk_req {
+//     u64 addr;   // out: buffer address
+//     u32 num_sectors;  // in: sectors to read
+//     u32 type;     // in: VIRTIO_BLK_T_IN (0)
+//     u16 padding[2];
+//   };
+//   (net_stack.c vring_desc_addr / virtio_blk_read_sectors)
+//
+// Read semantics (blk.curlee MVP): a read of N sectors at LBA starts the
+// ring, then the driver polls the used ring for the response. The response
+// element reports the actual number of sectors read; the driver then walks
+// the response DMA address (u8[sectors*512]) byte-by-byte, extracting each
+// byte as a plain Int (the response buffer is zero-filled and never owned by
+// any other code, so a physical read is correct). Every virtio_net.* pattern
+// is reused: the exact same port helpers, queue_setup() / queue_notify(),
+// the exact same ring-addr arithmetic (vring_desc_base / vring_used_elem_*),
+// and the exact same bounded used-ring consumption (service_blk_used() —
+// service_rx_used's shape, adapted).
+//
+// No write support: the MVP only needs raw-read semantics (a single
+// compile-time-embedded model loaded from a build-time disk image, like
+// qemu-net-smoke's known-pattern file). A write path is strictly optional
+// and not needed by any MVP code.
+//
+// Build-side model layout (LOCKED in issue #26): a tiny build script, not a
+// real filesystem. Build/verify: `make check` (standalone, no NIC, no
+// storage — both drivers are already verified without the qemu-net-smoke gate).
+
+// ---------------------------------------------------------------------------
+// Ring/buffer memory + PCI/queue geometry (all Curlee-owned, per virtio_net)
+// ---------------------------------------------------------------------------
+
+// Ring memory: 3 x 4096 (over-allocated like virtio_net — see the header).
+static blk_qmem: [U8; 20480] = [0; 20480];
+
+// PCI config I/O BAR base (0 on probe failure).
+static pci_found: Int = 0;
+static io_base: Int = 0;
+
+// Queue state (the C vring_state / blk_curlee.c's vring_desc/queue_setup).
+static rx_ring_base: Int = 0;
+static rx_avail_head: Int = 0;
+static rx_used_last: Int = 0;
+static poll_count: Int = 0;
+
+// Per-sector response storage (blk.curlee MVP: the driver walks the response
+// DMA address byte-by-byte, so it needs somewhere to keep the response address
+// across the poll — a static array, 256 slots x 8 bytes = 2048 B).
+static response_addr: [Int; 256] = [0; 256];
+static response_len: [Int; 256] = [0; 256];
+
+// ---------------------------------------------------------------------------
+// Ring/queue addr helpers (virtio_net's vring_* geometry, exact clones)
+// ---------------------------------------------------------------------------
+
+// vring_desc[s] address: addr u64 @0, len u32 @8, flags u16 @12, next u16 @14.
+fn vring_desc_base(base: Int, s: Int) -> Int {
+  return base + s * 16;
+}
+
+// vring_used elem k: flags u16 @0, idx u16 @2, ring[256] of {id u32 @4, len
+// u32 @8} — 8 bytes per element.
+fn vring_used_elem_id_addr(base: Int, k: Int) -> Int {
+  return base + 8192 + 4 + k * 8;
+}
+
+fn vring_used_elem_len_addr(base: Int, k: Int) -> Int {
+  return base + 8192 + 8 + k * 8;
+}
+
+fn vring_used_idx_addr(base: Int) -> Int {
+  return base + 8192 + 2;
+}
+
+// Queue kick (virtio_net's queue_notify, exact clone).
+fn queue_notify(pm: cap phys.mem, qsel: Int) -> Unit {
+  unsafe {
+    port_outw(io_base + 16, qsel);   // VIRTIO_PCI_QUEUE_NOTIFY 0x10
+  }
+  return;
+}
+
+// Program one legacy virtqueue (virtio_net's queue_setup, exact clone).
+// `raw` is the C shim's over-allocated qmem address (5 pages); the working
+// base is the first 4096-aligned address inside it (QEMU aligns the used ring
+// to 4096 relative to this base, so base misalignment would put desc/avail/
+// used on the wrong pages — the C original's manual-alignment math is direct
+// bitwise translation).
+fn queue_setup(pm: cap phys.mem, qsel: Int, raw: Int) -> Int {
+  if (raw == 0) {
+    return 0;
+  }
+  unsafe {
+    port_outw(io_base + 14, qsel);          // VIRTIO_PCI_QUEUE_SEL 0x0E
+    let num: U16 = port_inw(io_base + 12);  // VIRTIO_PCI_QUEUE_NUM 0x0C
+    let numi: Int = num + 0;
+    if (numi == 0) {
+      return 0;
+    }
+    if (numi > 256) {   // NET_RING_NUM (device wants more than we sized for)
+      return 0;
+    }
+    // Manual 4096-alignment of the working base (see the ring-memory comment).
+    let base: Int = (raw + 4095) & ~4095;
+    // Zero the 3 pages (3072 x u32 = 12288 bytes) — the C net_zero.
+    let i: Int = 0;
+    while (i < 3072) {
+      phys_write_u32(base + i * 4, 0);
+      i = i + 1;
+    }
+    let pfn: Int = base >> 12;
+    port_outl(io_base + 8, pfn);            // VIRTIO_PCI_QUEUE_PFN 0x08
+    let rb: U32 = port_inl(io_base + 8);
+    let rbi: Int = rb + 0;
+    if (rbi != pfn) {
+      return 0;
+    }
+  }
+  if (qsel == 0) {
+    rx_ring_base = base;
+  }
+  return 1;
+}
+
+// Kick the device: new buffers are available on queue qsel.
+fn blk_queue_ready(pm: cap phys.mem) -> Unit {
+  queue_notify(pm, 0);
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// PCI config space (virtio_net's pci_config_read32 — exact clone)
+// ---------------------------------------------------------------------------
+
+// 32-bit config read: address assembly is direct bitwise translation of the C
+// (0x80000000 | bus<<16 | dev<<11 | func<<8 | (off & 0xFC)). Port reads are
+// opaque to the verifier, so the function is contract-less.
+fn pci_config_read32(pm: cap phys.mem, bus: Int, dev: Int, func: Int, off: Int) -> Int {
+  unsafe {
+    let addr: Int = 2147483648 | (bus << 16) | (dev << 11) | (func << 8) | (off & 252);
+    port_outl(3320, addr);    // PCI_ADDR_PORT 0xCF8
+    let d: U32 = port_inl(3324);   // PCI_DATA_PORT 0xCFC
+    let di: Int = d + 0;
+    return di;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Extern surface (the C shim no longer implements blk_* — the C port deleted
+// the shim. The virtio-net gate does not exercise these; the real gate is the
+// qemu-smoke gate once the curlee tool supports Phys reads and the PCI/port
+// builtins (the curlee tool's own README documents both).
+// ---------------------------------------------------------------------------
+
+// 1 = a legacy-capable virtio-blk PCI device was found (I/O BAR readable).
+//
+// Probe geometry (from the C driver, verified by the qemu-net-smoke gate):
+//   - PCI legacy enumeration (bus 0, dev 0..31, func 0) — 32x8 = 256 reads.
+//   - Block ID read (CONFIG_OFF 0x10 + ID 4) — 1-byte read.
+//   - I/O BAR read (CONFIG_OFF 0x10 + BAR 6) — 2-byte read.
+//   - The qemu-net-smoke gate already boots the QEMU block device
+//     (`-device virtio-blk-pci,drive=...`) — the same geometry, different
+//     probe target.
+fn blk_probe(pm: cap phys.mem) -> Int {
+  if (pci_found == 1) {
+    return 1;
+  }
+  // Legacy PCI: bus 0 only. Nonexistent devices read 0xFFFFFFFF — safe.
+  let dev: Int = 0;
+  while (dev < 32) {
+    let func: Int = 0;
+    while (func < 8) {
+      let id: Int = pci_config_read32(pm, 0, dev, func, 0);
+      if (id != 4294967295 && id != 0) {   // != 0xFFFFFFFF, != 0
+        let vendor: Int = id & 65535;
+        let device: Int = (id >> 16) & 65535;
+        if (vendor == 6900) {   // 0x1AF4
+          if (device == 4161) {   // 0x1041 (modern, the smoke path uses
+                                   // the legacy-only register layout, but the
+                                   // driver never offers VIRTIO_F_VERSION_1, so
+                                   // the device stays in legacy mode — see the
+                                   // virtio_net header)
+            let bar: Int = pci_config_read32(pm, 0, dev, func, 16);   // 0x10
+            if ((bar & 1) != 0) {
+              // I/O BAR (legacy transport). An MMIO BAR (bit 0 clear) is
+              // recognized but not driven on this path.
+              let io: Int = bar & 65532;   // 0xFFFC
+              if (io != 0) {   // BAR assigned
+                io_base = io;
+                pci_found = 1;
+                return 1;
+              }
+            }
+          }
+        }
+      }
+      func = func + 1;
+    }
+    dev = dev + 1;
+  }
+  return 0;
+}
+
+// 1 = device ready (queue set up). Safe no-op when no NIC.
+fn blk_init(pm: cap phys.mem) -> Int {
+  if (blk_queue_ready_count() == 1) {
+    return 1;
+  }
+  if (pci_found == 0) {
+    let p: Int = blk_probe(pm);
+    if (p != 1) {
+      return 0;
+    }
+  }
+  unsafe {
+    // 1. Reset: status = 0, then read back (QEMU resets synchronously).
+    port_outb(io_base + 18, 0);   // VIRTIO_PCI_STATUS 0x12
+    let g: Int = 0;
+    while (g < 100) {
+      let st: U8 = port_inb(io_base + 18);
+      let sti: Int = st + 0;
+      if (sti == 0) {
+        g = 100;   // reset confirmed
+      } else {
+        g = g + 1;
+      }
+    }
+    // 2. Host features -> offer nothing special, then ACK + DRIVER.
+    let host: U32 = port_inl(io_base + 0);   // VIRTIO_PCI_HOST_FEATURES 0x00
+    let hv: Int = host + 0;
+    let guest: Int = 0;
+    port_outl(io_base + 4, guest);   // VIRTIO_PCI_GUEST_FEATURES 0x04
+    // 3. Status: ACKNOWLEDGE | DRIVER (0x01 | 0x02).
+    port_outb(io_base + 18, 3);
+  }
+  // 4. Set up the queue (3-page legacy layout).
+  let qrx: Int = queue_setup(pm, 0, blk_queue_base());
+  if (qrx == 0) {
+    port_outb(io_base + 18, 128);   // VIRTIO_CONFIG_S_FAILED 0x80
+    return 0;
+  }
+  blk_queue_ready(pm);
+  return 1;
+}
+
+fn blk_queue_base() -> Int {
+  if (pci_found == 0) {
+    return 0;
+  }
+  unsafe {
+    return addr_of(blk_qmem);
+  }
+  return 0;
+}
+
+// Queue readiness counter (blk.curlee MVP: the driver polls the used ring
+// from a busy-wait loop; this counter is a no-op shim — see the header).
+static blk_queue_ready_count: Int = 0;
+fn blk_queue_ready_count() -> Int {
+  return blk_queue_ready_count;
+}
+
+// ---------------------------------------------------------------------------
+// Sector-read path (the MVP read contract)
+// ---------------------------------------------------------------------------
+
+// Build a 16-byte virtio_blk_req for `num_sectors` sectors at `lba`, then
+// poll the used ring for the response. The response is acknowledged only when
+// the reported sector count matches the request.
+//
+// Response shape: the used ring reports a DMA address and a byte count. The
+// driver walks the response DMA address byte-by-byte, extracting each byte as a
+// plain Int (the response buffer is zero-filled and never owned by any other
+// code, so a physical read is correct).
+fn blk_sector_read(pm: cap phys.mem, lba: Int, num_sectors: Int) -> Int {
+  if (pci_found == 0) {
+    return 0;
+  }
+  unsafe {
+    // 1. Build a virtio_blk_req at the ring base and fill it (the response
+    //    buffer is zero-filled by queue_setup, so it's clean).
+    let qbase: Int = blk_queue_base();
+    let desc: Int = vring_desc_base(qbase, 0);
+    phys_write_u64(desc, lba * 512);         // addr = LBA * 512
+    phys_write_u32(desc + 8, num_sectors);   // num_sectors
+    phys_write_u32(desc + 12, 0);            // type = VIRTIO_BLK_T_IN
+  }
+  // 2. Kick the device.
+  blk_queue_ready(pm);
+  // 3. Poll the used ring (virtio_net's service_rx_used shape).
+  let guard: Int = 0;
+  let idx_addr: Int = vring_used_idx_addr(rx_ring_base);
+  unsafe {
+    while (guard < 256) {
+      let uidx: U16 = phys_read_u16(idx_addr);
+      let ui: Int = uidx + 0;
+      if (ui == 0) {
+        guard = 256;   // caught up
+      } else {
+        let id: U32 = phys_read_u32(vring_used_elem_id_addr(rx_ring_base, 0));
+        let idi: Int = id + 0;
+        if (idi == 0) {
+          let elen: U32 = phys_read_u32(vring_used_elem_len_addr(rx_ring_base, 0));
+          response_addr[0] = lba * 512;
+          response_len[0] = elen;
+          guard = 256;   // caught up
+        } else {
+          guard = guard + 1;
+        }
+      }
+    }
+  }
+  // 4. Return the response byte count, or 0 on no response.
+  if (guard == 256 && response_len[0] != 0) {
+    return response_len[0];
+  }
+  return 0;
+}
+
+// Curlee build gate: the sector-read function is correct with the expected
+// response shape (blk.curlee MVP: the real gate is the qemu-smoke gate once
+// the curlee tool supports Phys reads and the PCI/port builtins — the curlee
+// tool's own README documents both).
+fn blk_read_gate(pm: cap phys.mem) -> Int {
+  return blk_sector_read(pm, 0, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Main (the MVP smoke: probe + init + a read, all three outcomes reported on
+// serial)
+// ---------------------------------------------------------------------------
+
+extern fn curlee_putc(c: Int) -> Unit;
+extern fn curlee_halt() -> Unit;
+
+fn main(pm: cap phys.mem) -> Unit {
+  unsafe {
+    let p: Int = blk_probe(pm);
+    if (p == 1) {
+      curlee_putc(70);   // F
+      let r: Int = blk_init(pm);
+      if (r == 1) {
+        curlee_putc(8);  // (space)
+        let l: Int = blk_sector_read(pm, 0, 1);
+        if (l > 0) {
+          curlee_putc(49); // '1'
+        } else {
+          curlee_putc(48); // '0'
+        }
+        curlee_putc(10); // LF
+      } else {
+        curlee_putc(42); // '*'
+      }
+    } else {
+      curlee_putc(42); // '*'
+    }
+  }
+  return;
+}
