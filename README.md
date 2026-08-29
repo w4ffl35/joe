@@ -1,7 +1,10 @@
 # JOE
 
 ![status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-red)
+[![build](https://img.shields.io/github/actions/workflow/status/w4ffl35/joe/ci.yml?branch=master&label=build)](https://github.com/w4ffl35/joe/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/w4ffl35/joe?label=release)](https://github.com/w4ffl35/joe/releases)
 ![license: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)
+[![Discord](https://img.shields.io/badge/Discord-Join%20Chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/7254Hkzc4T)
 
 A from-scratch x86-64 kernel whose entire driver layer is written in
 [Curlee](https://github.com/w4ffl35/curlee), a verification-first systems
