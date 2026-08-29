@@ -267,13 +267,6 @@ fn blk_queue_base() -> Int {
   return 0;
 }
 
-// Queue readiness counter (blk.curlee MVP: the driver polls the used ring
-// from a busy-wait loop; this counter is a no-op shim — see the header).
-static blk_queue_ready_count: Int = 0;
-fn blk_queue_ready_count() -> Int {
-  return blk_queue_ready_count;
-}
-
 // ---------------------------------------------------------------------------
 // Sector-read path (the MVP read contract)
 // ---------------------------------------------------------------------------
@@ -347,21 +340,23 @@ fn blk_read_gate(pm: cap phys.mem) -> Int {
 extern fn curlee_putc(c: Int) -> Unit;
 extern fn curlee_halt() -> Unit;
 
-fn main(pm: cap phys.mem) -> Unit {
+fn blk_bringup(pm: cap phys.mem) -> Unit {
   unsafe {
     let p: Int = blk_probe(pm);
     if (p == 1) {
       curlee_putc(70);   // F
       let r: Int = blk_init(pm);
       if (r == 1) {
-        curlee_putc(8);  // (space)
+        curlee_putc(32); // space
         let l: Int = blk_sector_read(pm, 0, 1);
         if (l > 0) {
           curlee_putc(49); // '1'
         } else {
           curlee_putc(48); // '0'
         }
-        curlee_putc(10); // LF
+        curlee_putc(32);   // space
+        curlee_putc(49);   // '1'
+        curlee_putc(10);   // LF
       } else {
         curlee_putc(42); // '*'
       }

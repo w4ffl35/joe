@@ -38,6 +38,7 @@ SERIAL_SRC    := kernel/serial.curlee
 VGA_SETUP_SRC := kernel/vga_setup.curlee
 VBE_SRC       := kernel/vbe.curlee
 VIRTIO_NET_SRC := kernel/virtio_net.curlee
+VIRTIO_BLK_SRC := kernel/virtio_blk.curlee
 NET_STACK_SRC := kernel/net_stack.curlee
 NET_GLUE_SRC  := kernel/net_glue.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
@@ -107,7 +108,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
