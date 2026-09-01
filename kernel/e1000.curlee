@@ -1,0 +1,213 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// e1000.curlee — Workstream C (fabrication-fix plan): Intel e1000 NIC
+// PCI detection + reset milestone.
+//
+// Scoped milestone (deliberately tractable): detect the Intel e1000 via
+// legacy PCI enumeration, reset it, and prove it via the real serial markers
+// "E1000: 1" (detected) / "E1000: 2" (reset) on the GRUB/ISO boot path with
+// QEMU's `-device e1000`. Full TX/RX is OUT of scope for this milestone.
+//
+// Transport (LOCKED — this is the finding the fabrication report got wrong):
+//   QEMU's e1000 model (hw/net/e1000.c) exposes TWO PCI BARs:
+//     BAR0 = 0x20000-byte MMIO register file (e1000_mmio_ops — the REAL
+//            register interface: CTRL/STATUS/etc., 4-byte accesses only)
+//     BAR1 = 0x40-byte I/O window (e1000_io_ops — a COMPLETE NO-OP in the
+//            model: read returns 0, write discards)
+//   So the I/O-window approach (virtio_net's legacy I/O BAR) CANNOT reach
+//   the registers — the driver must use the MMIO BAR0. That is fine for
+//   Curlee: BAR0's base is a runtime PCI value, so it is addressed with the
+//   runtime-address phys_read_u32 / phys_write_u32 compiler builtins (curlee
+//   #279/#285 — the vga_clear_text_buffer pattern), NOT Phys<T> (whose
+//   address must be a compile-time literal). The GRUB/ISO boot path runs
+//   with paging disabled and identity mapping (kernel/boot.S — "the kernel
+//   addresses physical memory directly, same model as the VGA text buffer at
+//   0xB8000"), so a BAR0 physical address is directly dereferenceable.
+//
+//   The PVH path (`qemu -kernel`) is NOT used: the Phase 2f measurement
+//   (docs/phase2f-report.md §4) proved the PVH machine (xenpvh) exposes NO
+//   legacy PCI config space — every 0xCF8/0xCFC read returns 0 — so the NIC
+//   is only reachable where SeaBIOS runs (the ISO boot, like qemu-net-smoke
+//   and qemu-llm-smoke).
+//
+// Registers (Intel 82540EM / e1000.h, canonical offsets — QEMU's
+// mac_reg[] is indexed by these):
+//   CTRL   0x00000 — device control; bit 26 (RST) = device reset. QEMU's
+//                    set_ctrl masks RST out on store (`val & ~RST` — RST is
+//                    self-clearing), so after the write CTRL reads back with
+//                    bit 26 clear: the reset bit was CONSUMED by the device.
+//   STATUS 0x00008 — device status; bit 1 (LU) = link up. QEMU's
+//                    mac_reg_init sets STATUS = 0x80000000 | ... | LU, so a
+//                    readback of the MMIO window returns LU == 1: proof the
+//                    window is live and the device answered.
+//
+// Reset protocol (this milestone): write RST to CTRL, then read back CTRL
+// (bit 26 clear — the device accepted the reset) and STATUS (LU set — the
+// device is alive). Both readbacks prove the MMIO window was reached at the
+// runtime BAR0 base — the exact thing the fabricated session never did (its
+// reset wrote to a bogus base and "verified" with a made-up log).
+//
+// Detection (mirrors virtio_net.curlee's net_probe): legacy PCI config
+// space (ports 0xCF8/0xCFC, bus 0). Vendor 0x8086 = 32902 (Intel), device
+// 0x100E = 4110 (82540EM — QEMU's `-device e1000` default). The read is
+// opaque to the verifier, so the scan is contract-less (the established
+// pattern).
+//
+// Design laws honored:
+//   - Single address space, Ring 0: PCI config via direct x86 port I/O;
+//     MMIO via direct volatile 32-bit loads/stores (phys_read_u32 /
+//     phys_write_u32).
+//   - Deterministic verification: `curlee check e1000.curlee` runs
+//     standalone and the merged kernel re-verifies it (`make check`). No
+//     proof, no build.
+//   - Minimal footprint: no libc, no String/Vec, no MMIO Phys<T> literals
+//     (runtime BAR0 base -> runtime-address builtins); ~90 lines.
+//
+// No-NIC-safe: with no e1000 device, e1000_probe() finds nothing (config
+// reads return 0xFFFFFFFF) and main() emits NO E1000 markers — existing
+// gates (which boot WITHOUT -device e1000) stay green. No hang, no crash.
+
+// ---------------------------------------------------------------------------
+// e1000 register offsets + masks (canonical Intel 8254x values — kept as
+// decimal per the Curlee literal rule; hex only inside phys<T>()).
+// ---------------------------------------------------------------------------
+
+// CTRL register offset within the MMIO BAR0 register file.
+fn e1000_ctrl_off() -> Int {
+  return 0;   // 0x00000
+}
+
+// STATUS register offset within the MMIO BAR0 register file.
+fn e1000_status_off() -> Int {
+  return 8;   // 0x00008
+}
+
+// CTRL.RST: bit 26 (1 << 26 = 67108864) — device reset, self-clearing.
+fn e1000_ctrl_rst() -> Int {
+  return 67108864;
+}
+
+// STATUS.LU: bit 1 (1 << 1 = 2) — link up.
+fn e1000_status_lu() -> Int {
+  return 2;
+}
+
+// ---------------------------------------------------------------------------
+// Driver state (Curlee statics — the toolchain static + [T; N] pattern).
+// ---------------------------------------------------------------------------
+
+static e1000_mmio_base: Int = 0;   // runtime BAR0 base (0 = not found)
+static e1000_found: Int = 0;       // e1000_probe() cache
+static e1000_reset_done: Int = 0;  // e1000_reset() completed
+
+// ---------------------------------------------------------------------------
+// PCI config space (legacy ports 0xCF8/0xCFC) — the virtio_net.curlee idiom.
+// ---------------------------------------------------------------------------
+
+// 32-bit config read: address assembly is the direct bitwise translation of
+// the C (0x80000000 | bus<<16 | dev<<11 | func<<8 | (off & 0xFC)). Port
+// reads are opaque to the verifier, so the function is contract-less.
+fn e1000_pci_config_read32(pm: cap phys.mem, bus: Int, dev: Int, func: Int, off: Int) -> Int {
+  unsafe {
+    let addr: Int = 2147483648 | (bus << 16) | (dev << 11) | (func << 8) | (off & 252);
+    port_outl(3320, addr);    // PCI_ADDR_PORT 0xCF8
+    let d: U32 = port_inl(3324);   // PCI_DATA_PORT 0xCFC
+    let di: Int = d + 0;
+    return di;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MMIO register access (runtime-address builtins — the vga_clear_text_buffer
+// pattern; NOT Phys<T>, whose address must be a compile-time literal).
+// ---------------------------------------------------------------------------
+
+// 32-bit read of e1000 register `off` at the runtime BAR0 base.
+fn e1000_reg_read(pm: cap phys.mem, off: Int) -> Int {
+  unsafe {
+    let v: U32 = phys_read_u32(e1000_mmio_base + off);
+    let vi: Int = v + 0;
+    return vi;
+  }
+}
+
+// 32-bit write of `val` to e1000 register `off` at the runtime BAR0 base.
+fn e1000_reg_write(pm: cap phys.mem, off: Int, val: Int) -> Unit {
+  unsafe {
+    phys_write_u32(e1000_mmio_base + off, val);
+  }
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// Probe + reset
+// ---------------------------------------------------------------------------
+
+// 1 = an Intel e1000 (vendor 0x8086, device 0x100E) was found on legacy PCI
+// bus 0 and its MMIO BAR0 is readable. Mirrors virtio_net.curlee's
+// net_probe shape: bus 0 only, nonexistent devices read 0xFFFFFFFF.
+fn e1000_probe(pm: cap phys.mem) -> Int {
+  if (e1000_found == 1) {
+    return 1;
+  }
+  let dev: Int = 0;
+  while (dev < 32) {
+    let func: Int = 0;
+    while (func < 8) {
+      let id: Int = e1000_pci_config_read32(pm, 0, dev, func, 0);
+      if (id != 4294967295 && id != 0) {   // != 0xFFFFFFFF, != 0
+        let vendor: Int = id & 65535;
+        let device: Int = (id >> 16) & 65535;
+        if (vendor == 32902) {   // 0x8086 (Intel)
+          if (device == 4110) {  // 0x100E (82540EM — QEMU `-device e1000`)
+            // BAR0 (config offset 0x10): MMIO register file base. Mask off
+            // the low 4 flag bits (space + prefetch + type).
+            let bar: Int = e1000_pci_config_read32(pm, 0, dev, func, 16);
+            let base: Int = bar & 4294967280;   // 0xFFFFFFF0
+            if (base != 0) {   // BAR assigned
+              e1000_mmio_base = base;
+              e1000_found = 1;
+              return 1;
+            }
+          }
+        }
+      }
+      func = func + 1;
+    }
+    dev = dev + 1;
+  }
+  return 0;
+}
+
+// 1 = device reset: wrote CTRL.RST through the MMIO BAR0 window and read
+// back proof the window is live (CTRL no longer holds RST — the device
+// consumed the self-clearing bit — and STATUS reports LU). Safe no-op when
+// no e1000 was found. `pm` threads the phys.mem capability (the phys
+// builtin gate); dropped by codegen.
+fn e1000_reset(pm: cap phys.mem) -> Int {
+  if (e1000_reset_done == 1) {
+    return 1;
+  }
+  if (e1000_found == 0) {
+    let p: Int = e1000_probe(pm);
+    if (p != 1) {
+      return 0;
+    }
+  }
+  // 1. Issue the reset: write RST to CTRL. QEMU's set_ctrl masks RST out on
+  //    store (self-clearing), so the device consumes the bit.
+  e1000_reg_write(pm, e1000_ctrl_off(), e1000_ctrl_rst());
+  // 2. Read back CTRL: RST must be clear (the device accepted the reset).
+  let ctrl: Int = e1000_reg_read(pm, e1000_ctrl_off());
+  if ((ctrl & e1000_ctrl_rst()) != 0) {
+    return 0;   // reset bit still set — the window did not reach the device
+  }
+  // 3. Read back STATUS: link up (LU) — the device answered on the MMIO
+  //    window. QEMU's mac_reg_init sets STATUS with LU.
+  let status: Int = e1000_reg_read(pm, e1000_status_off());
+  if ((status & e1000_status_lu()) != 0) {
+    e1000_reset_done = 1;
+    return 1;
+  }
+  return 0;
+}

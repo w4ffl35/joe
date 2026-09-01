@@ -38,6 +38,7 @@ SERIAL_SRC    := kernel/serial.curlee
 VGA_SETUP_SRC := kernel/vga_setup.curlee
 VBE_SRC       := kernel/vbe.curlee
 VIRTIO_NET_SRC := kernel/virtio_net.curlee
+E1000_SRC     := kernel/e1000.curlee
 NET_STACK_SRC := kernel/net_stack.curlee
 NET_GLUE_SRC  := kernel/net_glue.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
@@ -95,7 +96,7 @@ AS := as
 LD := ld
 
 .PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run mb2-codegen-run iso iso-fb qemu run verify clean \
-        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke \
+        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
         c-boundary
 
 all: kernel
@@ -107,7 +108,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
@@ -165,7 +166,7 @@ $(KERNEL_ELF): $(MERGED_SRC)
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(NET_STACK_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(NET_STACK_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
@@ -182,6 +183,11 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	# ring/buffer statics are sized by --define (checked with the full GRUB
 	# define set here) and its only extern is the runtime curlee_sfence.
 	$(CURLEE) check $(CHECK_DEFINES) $(VIRTIO_NET_SRC)
+	# Workstream C (fabrication-fix plan): the e1000 detect + reset driver is
+	# genuine Curlee (PCI config via 0xCF8/0xCFC + MMIO via the runtime-address
+	# phys_read_u32/phys_write_u32 builtins — no Phys<T> literals, no C shim).
+	# Standalone-checkable (no cross-module calls); re-verified in the merged TU.
+	$(CURLEE) check $(E1000_SRC)
 	# The pure protocol core stays VM-checkable standalone (extern-free).
 	$(CURLEE) check $(NET_STACK_SRC)
 	# gh issue #20: kernel/vbe.curlee and kernel/mb2.curlee are NOT checked
@@ -538,6 +544,22 @@ qemu-net-smoke: $(BUILD_DIR)/joeos-net.iso
 qemu-llm-smoke: $(BUILD_DIR)/joeos-net.iso
 	bash scripts/run-llm-smoke.sh
 
+# ---------------------------------------------------------------------------
+# Workstream C acceptance gate (fabrication-fix plan): the REAL Intel e1000
+# milestone — detect + reset, proven on real QEMU hardware with a real serial
+# assertion. The gate is the checked-in, rerunnable artifact the harness
+# (Workstream A) re-runs, making a fabricated "E1000: 1 / E1000: 2" report
+# structurally impossible to pass.
+#
+# Boots the GRUB/ISO path (kernel-grub.elf — the PVH `-kernel` machine has no
+# legacy PCI config space, docs/phase2f-report.md §4) with QEMU's real e1000
+# NIC (`-device e1000,netdev=n0 -netdev user,id=n0`) and asserts the serial
+# log contains, IN ORDER, "E1000: 1" (PCI detected) then "E1000: 2" (reset).
+# The gate is timeout-bounded and fail-closed (missing/out-of-order markers
+# -> FAIL, non-zero exit).
+qemu-e1000-smoke: $(BUILD_DIR)/joeos-net.iso
+	bash scripts/run-e1000-smoke.sh
+
 # Boot the GRUB ISO under qemu (sanity check for the VirtualBox path).
 qemu-iso: $(ISO)
 	qemu-system-x86_64 -cdrom $(ISO) -boot d \
@@ -588,6 +610,14 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_net_rx_qmem_base$$' && echo "PASS: curlee_virtio_net_rx_qmem_base linked (Curlee RX qmem getter, issue #296)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_virtio_net_pvh_build$$' && echo "PASS: curlee_virtio_net_pvh_build linked (Curlee build discriminator, issue #296)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_sfence$$' && echo "PASS: curlee_sfence linked (runtime ring-publication fence, issue #296)"
+	# Workstream C (fabrication-fix plan): the Intel e1000 detect + reset
+	# driver is genuine Curlee (kernel/e1000.curlee) — the codegen emits the
+	# driver surface as the static curlee_e1000_* symbols. No C shim links
+	# (pure Curlee: PCI config via ports, MMIO via the phys builtins).
+	@nm $(KERNEL_ELF) | grep -q ' curlee_e1000_probe$$' && echo "PASS: curlee_e1000_probe linked (e1000 PCI detect, Workstream C)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_e1000_reset$$' && echo "PASS: curlee_e1000_reset linked (e1000 MMIO reset, Workstream C)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_e1000_bringup$$' && echo "PASS: curlee_e1000_bringup linked (e1000 bring-up glue, Workstream C)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_serial_e1000_marker$$' && echo "PASS: curlee_serial_e1000_marker linked (E1000 serial markers, Workstream C)"
 	# Phase 2d-4: the tool-queue producer API the LLM bridge drives
 	# (fb_tool_enqueue(2, arg) — the 2d-3 contract, wired into the 2b ring).
 	# gh issue #13: the blitter + event loop moved to Curlee (kernel/fb.curlee),

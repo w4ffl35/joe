@@ -343,6 +343,44 @@ fn serial_llm_marker(pm: cap phys.mem, n: Int) -> Unit {
   return;
 }
 
+// Workstream C (fabrication-fix plan): Intel e1000 detect + reset markers.
+//   E1000: 1  e1000_probe() found an Intel e1000 (vendor 0x8086, device
+//             0x100E) on legacy PCI bus 0 and read its MMIO BAR0 base
+//   E1000: 2  e1000_reset() wrote CTRL.RST through the MMIO window and read
+//             back proof the window is live (CTRL no longer holds RST, STATUS
+//             reports LU)
+// `n` is a single digit (1..2), so the marker is 8 chars + \n. Grepped IN
+// ORDER by the qemu-e1000-smoke gate (scripts/run-e1000-smoke.sh). The
+// driver functions are genuine Curlee (kernel/e1000.curlee, merged in before
+// this file).
+fn serial_e1000_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 69);   // E
+  putc(pm, 49);   // 1
+  putc(pm, 48);   // 0
+  putc(pm, 48);   // 0
+  putc(pm, 48);   // 0
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 48 + n);
+  putc(pm, 10);   // newline
+  return;
+}
+
+// Workstream C bring-up: probe, then reset. Every step is gated on the
+// previous step's return, so a missing NIC emits nothing and existing gates
+// (which boot WITHOUT -device e1000) stay green — the no-NIC-safe baseline.
+fn e1000_bringup(pm: cap phys.mem) -> Unit {
+  let p: Int = e1000_probe(pm);
+  if (p == 1) {
+    serial_e1000_marker(pm, 1);
+    let r: Int = e1000_reset(pm);
+    if (r == 1) {
+      serial_e1000_marker(pm, 2);
+    }
+  }
+  return;
+}
+
 // Phase 2d-1: VirtIO-net bring-up — probe, init, link, then the deterministic
 // RX smoke path (the guest ARPs the slirp gateway 10.0.2.2; slirp auto-answers,
 // delivering the first RX frame). Every step is gated on the previous step's
@@ -609,6 +647,13 @@ fn render_frame(pm: cap phys.mem, frame: Int) -> Unit {
 // FB_LOOP_FRAMES frames. The loop is bounded (not `while(true)`) so the
 // qemu-fb-smoke / qemu-loop-smoke gates stay deterministic and timeout-safe.
 fn main(pm: cap phys.mem) -> Unit {
+  // Workstream C (fabrication-fix plan): Intel e1000 detect + reset first —
+  // the E1000: 1 / E1000: 2 marker sequence runs before the display branch so
+  // the qemu-e1000-smoke gate can observe it on the GRUB/ISO boot path (the
+  // only path with legacy PCI config space — docs/phase2f-report.md §4). With
+  // no e1000 device, e1000_probe() finds nothing and the sequence is a safe
+  // no-op (existing gates stay green).
+  e1000_bringup(pm);
   // Phase 2d-1: VirtIO-net bring-up first — the NIC sequence (NET: 1..3,
   // RX: <len>) runs before the display branch so the smoke gate can observe
   // it on any boot path. With no virtio-net device, net_probe() finds
