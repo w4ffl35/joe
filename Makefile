@@ -398,7 +398,7 @@ $(BUILD_DIR)/kernel-smoke.elf: check
 # compile -> assemble -> link -> PVH boot -> curlee_main -> display + serial).
 qemu-smoke: $(BUILD_DIR)/kernel-smoke.elf
 	rm -f $(BUILD_DIR)/serial.log
-	@timeout 20 qemu-system-x86_64 -display none -no-reboot \
+	@timeout 20 qemu-system-x86_64 -display none -no-reboot -net none \
 	  -serial file:$(BUILD_DIR)/serial.log \
 	  -kernel $(BUILD_DIR)/kernel-smoke.elf || true
 	@grep -q 'Hello World from JOE' $(BUILD_DIR)/serial.log \
@@ -414,7 +414,7 @@ qemu-smoke: $(BUILD_DIR)/kernel-smoke.elf
 # timeout, -display none, -serial file:, grep.
 qemu-pvh-fb-smoke: $(BUILD_DIR)/kernel-smoke.elf
 	rm -f $(BUILD_DIR)/serial-pvh-fb.log
-	@timeout 20 qemu-system-x86_64 -display none -no-reboot \
+	@timeout 20 qemu-system-x86_64 -display none -no-reboot -net none \
 	  -vga std -serial file:$(BUILD_DIR)/serial-pvh-fb.log \
 	  -kernel $(BUILD_DIR)/kernel-smoke.elf || true
 	@grep -q 'FB: 1' $(BUILD_DIR)/serial-pvh-fb.log \
@@ -431,7 +431,7 @@ qemu-pvh-fb-smoke: $(BUILD_DIR)/kernel-smoke.elf
 # performed a real back-buffer flip during the loop.
 qemu-fb-smoke: $(BUILD_DIR)/joeos-fb.iso
 	rm -f $(BUILD_DIR)/serial-fb.log
-	@timeout 25 qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-fb.iso -boot d -no-reboot \
+	@timeout 25 qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-fb.iso -boot d -no-reboot -net none \
 	  -vga std -serial file:$(BUILD_DIR)/serial-fb.log \
 	  -display none || true
 	@grep -q 'FB:' $(BUILD_DIR)/serial-fb.log \
@@ -452,7 +452,7 @@ qemu-fb-smoke: $(BUILD_DIR)/joeos-fb.iso
 # mid-way, deterministically and within the timeout.
 qemu-loop-smoke: $(BUILD_DIR)/joeos-fb.iso
 	rm -f $(BUILD_DIR)/serial-loop.log
-	@timeout 25 qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-fb.iso -boot d -no-reboot \
+	@timeout 25 qemu-system-x86_64 -cdrom $(BUILD_DIR)/joeos-fb.iso -boot d -no-reboot -net none \
 	  -vga std -serial file:$(BUILD_DIR)/serial-loop.log \
 	  -display none || true
 	@grep -Pzo 'FR:0\nFR:1\nFR:2\nFR:3\nRING: 1\nFB: 1\nHello World from JOE!\n' \
