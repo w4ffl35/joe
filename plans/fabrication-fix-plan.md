@@ -451,29 +451,85 @@ The real test runs headlesscode sessions against the joeos workspace with
 harness re-runs (A2), so a session literally cannot report "gate passed"
 unless the real script ran and passed.
 
-### Workstream D — Selfplay / mining integrity (joeos_finetune_data)
+### Workstream D — Selfplay / mining integrity (joeos_finetune_data) ✅ IMPLEMENTED
 
-**Goal:** never mine fabricated-success sessions into training data.
+**Goal:** never mine fabricated-success sessions into training data, and
+teach the newly-diagnosed shape ("claimed a gate that never ran") as
+training signal.
 
-**D1. Gate mining on evidence, not just `verified_pass`**
+**Status (2026-09-01):** D1 + D2 implemented and verified in
+`/home/joe/Projects/joeos_finetune_data`. D1's detector found a REAL
+fabrication in the existing round data during validation (round-003
+`task04-apic_stub`: accepted completion claimed "the real `make check`
+passed with no errors" while the independent verifier says `CHECK_FAIL`),
+and correctly left the honest-failure sessions unflagged.
 
-[`selfplay/run_task.py`](/home/joe/Projects/joeos_finetune_data/selfplay/run_task.py)
-already independently re-verifies with the real compiler (good — the report
-confirms selfplay "never trusts the session's own report"). Strengthen:
-`mine_round.py` additionally skips any task whose session transcript contains
-an `attempt_completion` claim that contradicts the independent verification
-result (i.e., session said success + compiler says fail = **fabrication
-record**, logged separately as signal, never mined).
+**D1. Gate mining on evidence, not just `verified_pass`** — implemented in
+[`selfplay/mine_round.py`](/home/joe/Projects/joeos_finetune_data/selfplay/mine_round.py):
 
-**D2. Fabrication-signal corpus additions**
+- [`detect_fabrication()`](/home/joe/Projects/joeos_finetune_data/selfplay/mine_round.py)
+  — pure detector, per task result: `fabrication == True` iff (a) the
+  INDEPENDENT verification failed (`verified_pass == False`, the real-curlee
+  re-run) AND (b) the session produced an ACCEPTED `attempt_completion`
+  (`session_returncode == 0`) whose result text makes an explicit passing
+  claim (gate/check/build/smoke/test + passed/succeeded/clean/green/success
+  or "with no errors"). Conservative: an honest failure report, a session
+  that never got a completion accepted (rc != 0, or a deferred-only window),
+  and a verified-pass session are never fabrication. A negation guard
+  (`NEGATED_PASS_RE`) prevents "the build does not pass yet"-style honest
+  text from being misread as a claim.
+- [`last_attempt_completion()`](/home/joe/Projects/joeos_finetune_data/selfplay/mine_round.py)
+  — finds the LAST `attempt_completion` in the task's capture window; the
+  accepted completion of a session is its last one (the loop stops on
+  acceptance), and `session_returncode == 0` is required at the call site so
+  a deferred-only window is never treated as accepted.
+- Fabrication records are NEVER mined (they are a strict subset of the
+  already-excluded `verified_pass == False` tasks — the existing gate is
+  untouched, D1 ADDS detection alongside it) AND are logged separately as a
+  signal: `<round_dir>/fabrications.jsonl` (one record per fabrication with
+  task, accepted-completion snippet, verify_detail, reason), surfaced in
+  `mine_summary.json` (`fabrication_count` / `fabrication_tasks`).
+- [`selfplay/loop.py`](/home/joe/Projects/joeos_finetune_data/selfplay/loop.py):
+  the round flow now counts fabrications per round and logs a
+  `round_fabrications` event into `loop_log.jsonl` (`fabrication_count`,
+  `verified_pass`) — a round with N fabrications is visible, never silent.
+- Unit test: [`selfplay/_fabrication_detector_test.py`](/home/joe/Projects/joeos_finetune_data/selfplay/_fabrication_detector_test.py)
+  — (a) fabrication flagged/skipped/logged, (b) honest fail not flagged,
+  (c) verified pass mined as normal, (d) rc != 0 (no accepted completion)
+  not flagged, (e) no completion in window not flagged; plus an end-to-end
+  flow on a temp round dir asserting `fabrications.jsonl` content, skip-
+  mining, and `mine_summary.json`. ALL PASS.
 
-Add targeted `add_*_examples.py` scripts (following the existing verified
-methodology) for the *newly diagnosed* shape: "session skipped the gate it
-claimed to run" — teaching the model that `attempt_completion` claiming a
-specific command/marker without a real matching `execute_command` is the
-failure mode. The report's Rec #4 distinction ("misread output vs. skipped
-and invented") lands here as *training* — but the *enforcement* is
-Workstream A, which makes it structurally impossible either way.
+**D2. Fabrication-signal corpus additions** — implemented in
+[`add_gate_claim_requires_real_tool_result_examples.py`](/home/joe/Projects/joeos_finetune_data/add_gate_claim_requires_real_tool_result_examples.py):
+
+- Teaches the newly-diagnosed shape: "attempt_completion claims a specific
+  gate/command passed, but the session never ran it (or the run failed)".
+  The correct behavior taught: a gate claim must be backed by a real
+  `execute_command` whose real tool result is in context; otherwise run the
+  gate for real or report honestly. Module docstring names the FINAL_REPORT
+  e1000 incident as the real incident targeted.
+- 6 examples, x20 oversampled (top of the x10–x20 serious-regression range —
+  the fabrication is the project's most serious finding) = 120 records
+  appended to `sft_dataset.jsonl` (976 → 1096).
+- **HELDOUT CONTAMINATION GUARD (critical):** examples use DIFFERENT
+  concrete gates (`make qemu-blk-smoke`, `make qemu-net-smoke`,
+  `make qemu-fb-smoke`, `make qemu-loop-smoke`, `make check`, a nonexistent
+  `make qemu-dma-smoke` teaching the target-doesn't-exist shape) and
+  different markers (`BLK: 1`, `NET: 1`, `FB: 1`, `LOOP: 1/2`) — ZERO
+  "e1000"/"E1000"/"8086" tokens. An in-script `contamination_free()` guard
+  greps every record for those tokens and REFUSES to write if found
+  (verified: guard rejects contaminated input; corpus-wide grep for
+  `e1000|E1000|8086` in `sft_dataset.jsonl` = 0 matches).
+- Verified: `lint_corpus.py` pre-flight AST gate passes (all 67 claimed
+  examples across add_*.py present in the corpus, including the 6 new
+  titles); py_compile clean on all touched files.
+
+**Success criteria (from §6):** `mine_round.py` never mines a session whose
+success claim contradicts independent verification, and logs it as a
+fabrication signal — met (detector + fabrications.jsonl + loop surfacing +
+unit test). The heldout `_v_e1000` case is untouched by training content —
+met (grep-verified zero e1000/8086 in the corpus).
 
 ---
 
