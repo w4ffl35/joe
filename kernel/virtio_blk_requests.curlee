@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: GPL-3.0
+
+// virtio_blk_requests.curlee
+///
+// Pure request-type utilities for the virtio-blk header (docs/phase2-virtio-blk.md).
+// The virtio-blk request `type` field (u32 at offset 0 of the request header, per the spec)
+// uses these constants:
+//   VIRTIO_BLK_T_IN  = 0 (read)
+//   VIRTIO_BLK_T_OUT = 1 (write)
+//   VIRTIO_BLK_T_FLUSH = 4 (flush)
+// This module provides the constants and two pure predicates to distinguish read vs write.
+
+fn vblk_req_type_read() -> Int
+  [ requires true; ensures result == 0; ] {
+  return 0;
+}
+
+fn vblk_req_type_write() -> Int
+  [ requires true; ensures result == 1; ] {
+  return 1;
+}
+
+fn vblk_is_read_request(t: Int) -> Bool
+  [ requires true; ensures result == (t == 0); ] {
+  return t == 0;
+}
+
+fn vblk_is_write_request(t: Int) -> Bool
+  [ requires true; ensures result == (t == 1); ] {
+  return t == 1;
+}
