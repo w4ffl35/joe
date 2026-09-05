@@ -223,6 +223,16 @@ Session template in `plans/parallel-tasks/slice{N}-*-task.md`. Recipe is
 8-for-8 on delivering verified committed Curlee (1 wrong-content incident in
 slice 6, caught by manual review and fixed).
 
+**Slice 9 = Makefile wiring (done manually, 2026-09-05)**: the model CANNOT
+reliably edit the large existing Makefile (slice-9 session stalled with
+"no artifact-producing tool call" after one read_file — same edit-large-file
+weakness as edit_file). Wired manually: added `VIRTIO_BLK_SRC` var + 7
+individual `$(CURLEE) check kernel/virtio_blk_*.curlee` lines + the var to
+`check:`'s prerequisites (commit `8c4f98d`). **KEY FACT: `curlee check`
+accepts ONE file only** — a multi-file `curlee check a b c` errors with
+"expected a single <file.curlee>"; the Makefile must run one check per file.
+`make check` now passes with all 7 modules.
+
 **CRITICAL caveat (slice 6, 2026-09-05)**: the model can produce **wrong-but-verifiable
 content**. Its slice-6 "bounds" file was a verbatim duplicate of the slice-5
 requests module (same 4 functions) — it passed `curlee check` and got committed
