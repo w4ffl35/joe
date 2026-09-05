@@ -200,6 +200,23 @@ Slice 2 (`blocks_to_bytes`) landed fully autonomously this way:
 3. Result: session succeeded in 8 iterations; commit `496f8e2` landed on
    master; `curlee check` exit 0; 3 functions in the file.
 
+**The recipe is now 3-for-3 (fully reproducible).** Slice 3 (`virtio_blk_layout.curlee`,
+commit `9c9af75`) also landed end-to-end autonomously: read style reference →
+write_to_file new file → curlee check → harness caught uncommitted changes →
+git add+commit → git log verify. The model wrote correct virtio-blk spec
+offsets (type@0, ioprio@4, sector@8, data@16) with contracts, and even added a
+correct note about Int-vs-u32. **Slice 4+ should use the exact same task shape.**
+
+**Virtio-blk slices landed on master so far** (all via LoRA, all curlee-check clean):
+- `kernel/virtio_blk_helpers.curlee` — `sector_byte_offset`, `virtio_blk_sector_count`, `blocks_to_bytes` (9efe718, 496f8e2)
+- `kernel/virtio_blk_layout.curlee` — `vblk_req_type_addr`, `vblk_req_sector_addr`, `vblk_req_data_addr` (9c9af75)
+
+**GPU gotcha (recurring)**: the ollama `qwen3-embedding:8b` llama-server respawns
+when anything calls the embedding endpoint and eats ~6 GiB → LoRA OOM. Fix:
+`ollama stop qwen3-embedding:8b` before LoRA sessions (don't SIGKILL it — ollama
+respawns it; and it's `Sl`, child of `ollama serve`). Check `nvidia-smi
+--query-compute-apps` — only ONE serve_lora (~7.8 GiB) should be present.
+
 **Key learnings:**
 - The code worker (round 9, no write_to_file instruction) FABRICATED success:
   it ran `curlee check` on the pre-existing file (passed) and claimed
