@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-3.0
+
+// virtio-blk legacy virtqueue ring-geometry helpers (pure offsets).
+///
+/// Mirrors the vring_desc_base / vring_avail_* style in kernel/virtio_net.curlee:
+/// a single 4096-aligned base address plus a few pure offset computations.
+/// The ring uses 3 pages: page 0 = descriptor table (16-byte descriptors),
+/// page 1 = avail ring (u16 flags + idx + 256 x u16), page 2 = used ring
+/// (u16 flags + idx + 256 x {id, len}). Every address is provably linear
+/// from the base via a contract-bearing pure function.
+fn vblk_desc_addr(base: Int, s: Int) -> Int
+  [ requires s >= 0; ensures result == base + s * 16; ] {
+  return base + s * 16;
+}
+
+fn vblk_avail_idx_addr(base: Int) -> Int
+  [ requires true; ensures result == base + 4098; ] {
+  return base + 4096 + 2;
+}
+
+fn vblk_avail_ring_addr(base: Int) -> Int
+  [ requires true; ensures result == base + 4100; ] {
+  return base + 4096 + 4;
+}
+
+fn vblk_used_idx_addr(base: Int) -> Int
+  [ requires true; ensures result == base + 8194; ] {
+  return base + 8192 + 2;
+}
