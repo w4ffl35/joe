@@ -41,6 +41,14 @@ VIRTIO_NET_SRC := kernel/virtio_net.curlee
 E1000_SRC     := kernel/e1000.curlee
 NET_STACK_SRC := kernel/net_stack.curlee
 NET_GLUE_SRC  := kernel/net_glue.curlee
+# Pure virtio-blk modules (raw sector-read driver foundation). All are
+# standalone-checkable pure Curlee (no Phys, no extern) — see the per-module
+# slice commits. Wired into `check` only; they join the merged kernel TU
+# when the real driver lands.
+VIRTIO_BLK_SRC := kernel/virtio_blk_helpers.curlee kernel/virtio_blk_layout.curlee \
+                  kernel/virtio_blk_queue.curlee kernel/virtio_blk_requests.curlee \
+                  kernel/virtio_blk_bounds.curlee kernel/virtio_blk_reqbuf.curlee \
+                  kernel/virtio_blk_alloc.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
 JSON_TEST     := kernel/json_test.curlee
 NET_STACK_TEST := kernel/net_stack_test.curlee
@@ -166,7 +174,7 @@ $(KERNEL_ELF): $(MERGED_SRC)
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(NET_STACK_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(NET_STACK_SRC) $(VIRTIO_BLK_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
@@ -190,6 +198,15 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	$(CURLEE) check $(E1000_SRC)
 	# The pure protocol core stays VM-checkable standalone (extern-free).
 	$(CURLEE) check $(NET_STACK_SRC)
+	# The pure virtio-blk foundation modules (slice-built, standalone pure).
+	# curlee check takes ONE file, so loop the 7 modules individually.
+	$(CURLEE) check kernel/virtio_blk_helpers.curlee
+	$(CURLEE) check kernel/virtio_blk_layout.curlee
+	$(CURLEE) check kernel/virtio_blk_queue.curlee
+	$(CURLEE) check kernel/virtio_blk_requests.curlee
+	$(CURLEE) check kernel/virtio_blk_bounds.curlee
+	$(CURLEE) check kernel/virtio_blk_reqbuf.curlee
+	$(CURLEE) check kernel/virtio_blk_alloc.curlee
 	# gh issue #20: kernel/vbe.curlee and kernel/mb2.curlee are NOT checked
 	# standalone anymore — they call fb.curlee's fb_state_set (the shared
 	# framebuffer-state setter), so they verify through the MERGED TU below
