@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-3.0
+
+// virtio-blk READ request buffer size helpers.
+//
+// The virtio-blk request buffer layout is: a 16-byte request header
+// (type u32 @0, ioprio u32 @4, sector u64 @8 — see kernel/virtio_blk_layout.curlee)
+// followed by the data region. For a read of `count` 512-byte sectors,
+// the total buffer size and data-region size are pure arithmetic. This
+// module provides those.
+
+fn vblk_req_header_size() -> Int
+  [ requires true; ensures result == 16; ] {
+  return 16;
+}
+
+fn vblk_req_data_size(count: Int) -> Int
+  [ requires count >= 0; ensures result == count * 512; ] {
+  return count * 512;
+}
+
+fn vblk_req_total_size(count: Int) -> Int
+  [ requires count >= 0; ensures result == 16 + count * 512; ] {
+  return 16 + count * 512;
+}
