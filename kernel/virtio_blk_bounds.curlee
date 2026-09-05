@@ -1,32 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0
-
-// kernel/virtio_blk_bounds.curlee
 //
-// Pure, verifiable Curlee (no Phys, no unsafe, no extern, no imports).
+// Pure sector-range bounds helpers for virtio-blk sector reads.
 //
-// The virtio-blk request `type` field (u32 at offset 0 of the request header, per the spec)
-// uses these constants:
-//   VIRTIO_BLK_T_IN  = 0 (read)
-//   VIRTIO_BLK_T_OUT = 1 (write)
-//   VIRTIO_BLK_T_FLUSH = 4 (flush)
-// This module provides the constants and two pure predicates to distinguish read vs write.
+// A read request reads `count` 512-byte sectors starting at LBA `sector` on
+// a device with `capacity` total sectors. The read is in bounds iff:
+//   sector >= 0 AND count > 0 AND sector + count <= capacity
+// These helpers let the driver validate a request before queueing it.
+// Pure library: no Phys, no unsafe, no extern, no imports.
 
-fn vblk_req_type_read() -> Int
-  [ requires true; ensures result == 0; ] {
-  return 0;
+// Whether a read of `count` sectors at LBA `sector` fits within a device of
+// `capacity` sectors.
+fn vblk_read_in_bounds(sector: Int, count: Int, capacity: Int) -> Bool
+  [ requires true; ensures result == (sector >= 0 && count > 0 && sector + count <= capacity); ] {
+  return sector >= 0 && count > 0 && sector + count <= capacity;
 }
 
-fn vblk_req_type_write() -> Int
-  [ requires true; ensures result == 1; ] {
-  return 1;
+// The first sector index after a read of `count` sectors starting at `sector`.
+fn vblk_sector_after(sector: Int, count: Int) -> Int
+  [ requires sector >= 0 && count >= 0; ensures result == sector + count; ] {
+  return sector + count;
 }
 
-fn vblk_is_read_request(t: Int) -> Bool
-  [ requires true; ensures result == (t == 0); ] {
-  return t == 0;
-}
-
-fn vblk_is_write_request(t: Int) -> Bool
-  [ requires true; ensures result == (t == 1); ] {
-  return t == 1;
+// The last sector index (0-based, inclusive) of a read of `count` sectors
+// starting at `sector`.
+fn vblk_last_sector(sector: Int, count: Int) -> Int
+  [ requires sector >= 0 && count > 0; ensures result == sector + count - 1; ] {
+  return sector + count - 1;
 }
