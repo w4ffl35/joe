@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// Pure request-header layout helpers for the virtio-blk storage driver.
+//
+// The virtio-blk request header (from the virtio-blk spec) is laid out in
+// the request buffer at these offsets, all relative to a `base` address:
+//   - byte 0: `type` (u32) — request type
+//   - byte 4: `ioprio` (u32)
+//   - byte 8: `sector` (u64) — the LBA
+//   - byte 16: the 512-byte data buffer begins
+//
+// This file is a pure library — no unsafe block, no Phys, no extern.
+// The real driver (kernel/virtio_blk.curlee) sits on top of these helpers.
+//
+// NOTE: the spec calls these fields u32/u64; Curlee has no unsigned types,
+// so the header is written with Int. The byte offsets are the authoritative
+// contract: type at offset 0, ioprio at offset 4, sector at offset 8,
+// data at offset 16.
+
+// Type field address: the u32 request type at offset 0 of the request buffer.
+fn vblk_req_type_addr(base: Int) -> Int
+  [ requires true; ensures result == base; ] {
+  return base;
+}
+
+// Sector field address: the u64 LBA field at offset 8 of the request buffer.
+fn vblk_req_sector_addr(base: Int) -> Int
+  [ requires true; ensures result == base + 8; ] {
+  return base + 8;
+}
+
+// Data buffer address: the 512-byte data region at offset 16 of the request
+// buffer.
+fn vblk_req_data_addr(base: Int) -> Int
+  [ requires true; ensures result == base + 16; ] {
+  return base + 16;
+}
