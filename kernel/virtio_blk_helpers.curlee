@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// Pure sector/LBA helper functions for the virtio-blk storage driver.
+// Verifiable with the curlee verifier (Int x Int arithmetic, no Phys access).
+//
+// This file is a pure library — no unsafe block, no Phys, no extern.
+// The real driver (kernel/virtio_blk.curlee) sits on top of these helpers.
+
+// Sector byte offset: given a sector number (LBA), return the byte offset
+// in the raw disk image. The sector size is fixed at 512 bytes.
+fn sector_byte_offset(lba: Int) -> Int
+  [ requires lba >= 0; ensures result == lba * 512; ] {
+  return lba * 512;
+}
+
+// Virtio-blk sector count: how many 512-byte sectors fit in a disk of
+// `disk_bytes` bytes (integer floor division). Mirrors the real driver's
+// read-sector logic.
+fn virtio_blk_sector_count(disk_bytes: Int) -> Int
+  [ requires disk_bytes >= 0; ensures result == disk_bytes / 512; ] {
+  return disk_bytes / 512;
+}
