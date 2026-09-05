@@ -214,6 +214,14 @@ correct note about Int-vs-u32. **Slice 4+ should use the exact same task shape.*
 - `kernel/virtio_blk_requests.curlee` — `vblk_req_type_read/write`, `vblk_is_read/write_request` (8742eff). Model used `///` again — clean with `sed 's|/// |// |'` before merging.
 - `kernel/virtio_blk_bounds.curlee` — `vblk_read_in_bounds`, `vblk_sector_after`, `vblk_last_sector` (56e1eef, after fixing d11f7d8).
 - `kernel/virtio_blk_reqbuf.curlee` — `vblk_req_header_size`, `vblk_req_data_size`, `vblk_req_total_size` (c7956bf).
+- `kernel/virtio_blk_alloc.curlee` — `vblk_next_slot`, `vblk_ring_size`, `vblk_advance_slots` (3317380).
+
+**Autonomous slice cadence (2026-09-05 continuation)**: 8 slices landed over
+~45 min, ~4-6 min per slice, each a fresh `--task-file` code-mode session on a
+worktree from master (write_to_file → curlee check → git commit → verify).
+Session template in `plans/parallel-tasks/slice{N}-*-task.md`. Recipe is
+8-for-8 on delivering verified committed Curlee (1 wrong-content incident in
+slice 6, caught by manual review and fixed).
 
 **CRITICAL caveat (slice 6, 2026-09-05)**: the model can produce **wrong-but-verifiable
 content**. Its slice-6 "bounds" file was a verbatim duplicate of the slice-5
