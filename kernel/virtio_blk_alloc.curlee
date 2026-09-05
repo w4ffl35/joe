@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: GPL-3.0
+
+// virtio_blk_alloc.curlee
+//
+// Pure ring-slot arithmetic for the virtio-blk request queue's descriptor ring.
+// The ring has 256 slots (indices 0..255) and wraps with modulo 256, the same
+// convention the virtio_net ring uses (see kernel/virtio_net.curlee "Desc
+// allocation": the producer tracks the next slot and wraps with modulo 256).
+//
+// All functions are pure (no Phys, no unsafe, no extern, no imports) and
+// verified with contracts.
+
+fn vblk_next_slot(cur: Int) -> Int
+  [ requires cur >= 0; ensures result == (cur + 1) % 256; ] {
+  return (cur + 1) % 256;
+}
+
+fn vblk_ring_size() -> Int
+  [ requires true; ensures result == 256; ] {
+  return 256;
+}
+
+fn vblk_advance_slots(cur: Int, n: Int) -> Int
+  [ requires cur >= 0 && n >= 0; ensures result == (cur + n) % 256; ] {
+  return (cur + n) % 256;
+}
