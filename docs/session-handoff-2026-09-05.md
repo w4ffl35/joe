@@ -212,6 +212,21 @@ correct note about Int-vs-u32. **Slice 4+ should use the exact same task shape.*
 - `kernel/virtio_blk_layout.curlee` — `vblk_req_type_addr`, `vblk_req_sector_addr`, `vblk_req_data_addr` (9c9af75)
 - `kernel/virtio_blk_queue.curlee` — `vblk_desc_addr`, `vblk_avail_idx_addr`, `vblk_avail_ring_addr`, `vblk_used_idx_addr` (86225b1). Minor cleanup: model added a stray `extern fn curlee_halt()` + `///` doc-comment — removed to keep the pure module clean (curlee wants `//` not `///`).
 - `kernel/virtio_blk_requests.curlee` — `vblk_req_type_read/write`, `vblk_is_read/write_request` (8742eff). Model used `///` again — clean with `sed 's|/// |// |'` before merging.
+- `kernel/virtio_blk_bounds.curlee` — `vblk_read_in_bounds`, `vblk_sector_after`, `vblk_last_sector` (56e1eef, after fixing d11f7d8).
+
+**CRITICAL caveat (slice 6, 2026-09-05)**: the model can produce **wrong-but-verifiable
+content**. Its slice-6 "bounds" file was a verbatim duplicate of the slice-5
+requests module (same 4 functions) — it passed `curlee check` and got committed
+because the harness verifies the FILE checks clean, not that the content matches
+the TASK. Caught only by manual content review. **Lesson: always eyeball the
+generated file's function list against the task spec before merging** — a green
+`curlee check` proves verifiability, not task-correctness. This is the single
+most important quality gate for this whole slice-driven approach.
+
+**Other slice-6 observation**: the evidence gate re-runs `curlee check` with a
+bare `curlee` (exit 127, PATH issue) even when the model used the full path, so
+the session may defer-loop on "unverifiable claims" despite the commit landing.
+The work is still valid; stop the session and merge the commit manually.
 
 **GPU gotcha (recurring)**: the ollama `qwen3-embedding:8b` llama-server respawns
 when anything calls the embedding endpoint and eats ~6 GiB → LoRA OOM. Fix:
