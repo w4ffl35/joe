@@ -211,6 +211,7 @@ correct note about Int-vs-u32. **Slice 4+ should use the exact same task shape.*
 - `kernel/virtio_blk_helpers.curlee` — `sector_byte_offset`, `virtio_blk_sector_count`, `blocks_to_bytes` (9efe718, 496f8e2)
 - `kernel/virtio_blk_layout.curlee` — `vblk_req_type_addr`, `vblk_req_sector_addr`, `vblk_req_data_addr` (9c9af75)
 - `kernel/virtio_blk_queue.curlee` — `vblk_desc_addr`, `vblk_avail_idx_addr`, `vblk_avail_ring_addr`, `vblk_used_idx_addr` (86225b1). Minor cleanup: model added a stray `extern fn curlee_halt()` + `///` doc-comment — removed to keep the pure module clean (curlee wants `//` not `///`).
+- `kernel/virtio_blk_requests.curlee` — `vblk_req_type_read/write`, `vblk_is_read/write_request` (8742eff). Model used `///` again — clean with `sed 's|/// |// |'` before merging.
 
 **GPU gotcha (recurring)**: the ollama `qwen3-embedding:8b` llama-server respawns
 when anything calls the embedding endpoint and eats ~6 GiB → LoRA OOM. Fix:
