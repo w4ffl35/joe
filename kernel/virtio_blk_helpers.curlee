@@ -13,6 +13,17 @@ fn sector_byte_offset(lba: Int) -> Int
   return lba * 512;
 }
 
+// BLOCKS TO BYTES: the number of 512-byte sectors needed for a raw image of
+// `blocks` sectors. The inverse of sector_byte_offset's direction:
+//   blocks_to_bytes(1) == 512
+//   blocks_to_bytes(0) == 0
+//   blocks_to_bytes(3) == 1536
+//
+fn blocks_to_bytes(blocks: Int) -> Int
+  [ requires blocks >= 0; ensures result == blocks * 512; ] {
+  return blocks * 512;
+}
+
 // Virtio-blk sector count: how many 512-byte sectors fit in a disk of
 // `disk_bytes` bytes (integer floor division). Mirrors the real driver's
 // read-sector logic.
