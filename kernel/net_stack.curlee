@@ -112,7 +112,8 @@ fn be32_k(v: Int, k: Int) -> Int {
 
 // Header byte at offset i (0..19) with the checksum field ZEROED — the input
 // to ip_checksum().
-fn ip_byte_ck(i: Int, tcp_len: Int) -> Int {
+fn ip_byte_ck(i: Int, tcp_len: Int) -> Int
+  [ requires i >= 0 && i < 20; ] {
   let total: Int = 20 + tcp_len;
   let arr: [Int; 20] = [0; 20];
   arr[0] = 69;                    // 0x45: v4 + 5 words
@@ -140,7 +141,8 @@ fn ip_byte_ck(i: Int, tcp_len: Int) -> Int {
 
 // Header byte at offset i (0..19) for the WIRE frame, with the computed
 // checksum ck in bytes 10..11.
-fn ip_byte_frame(i: Int, tcp_len: Int, ck: Int) -> Int {
+fn ip_byte_frame(i: Int, tcp_len: Int, ck: Int) -> Int
+  [ requires i >= 0 && i < 20; ] {
   if (i == 10) {
     return (ck >> 8) & 255;
   } else {
@@ -187,7 +189,8 @@ fn ip_checksum(tcp_len: Int) -> Int {
 // ---------------------------------------------------------------------------
 
 // "POST /completion HTTP/1.1\r\n" — 27 bytes.
-fn req_sub0_byte(j: Int) -> Int {
+fn req_sub0_byte(j: Int) -> Int
+  [ requires j >= 0 && j < 28; ] {
   let arr: [Int; 28] = [0; 28];
   arr[0] = 80;
   arr[1] = 79;
@@ -220,7 +223,8 @@ fn req_sub0_byte(j: Int) -> Int {
 }
 
 // "Host: 10.0.2.2:8080\r\n" — 21 bytes.
-fn req_sub1_byte(j: Int) -> Int {
+fn req_sub1_byte(j: Int) -> Int
+  [ requires j >= 0 && j < 22; ] {
   let arr: [Int; 22] = [0; 22];
   arr[0] = 72;
   arr[1] = 111;
@@ -247,7 +251,8 @@ fn req_sub1_byte(j: Int) -> Int {
 }
 
 // "Content-Type: application/json\r\n" — 32 bytes.
-fn req_sub2_byte(j: Int) -> Int {
+fn req_sub2_byte(j: Int) -> Int
+  [ requires j >= 0 && j < 33; ] {
   let arr: [Int; 33] = [0; 33];
   arr[0] = 67;
   arr[1] = 111;
@@ -286,7 +291,8 @@ fn req_sub2_byte(j: Int) -> Int {
 }
 
 // "Content-Length: 36\r\n" — 20 bytes.
-fn req_sub3_byte(j: Int) -> Int {
+fn req_sub3_byte(j: Int) -> Int
+  [ requires j >= 0 && j < 21; ] {
   let arr: [Int; 21] = [0; 21];
   arr[0] = 67;
   arr[1] = 111;
@@ -313,7 +319,8 @@ fn req_sub3_byte(j: Int) -> Int {
 }
 
 // "Connection: close\r\n" — 19 bytes.
-fn req_sub4_byte(j: Int) -> Int {
+fn req_sub4_byte(j: Int) -> Int
+  [ requires j >= 0 && j < 20; ] {
   let arr: [Int; 20] = [0; 20];
   arr[0] = 67;
   arr[1] = 111;
@@ -338,7 +345,8 @@ fn req_sub4_byte(j: Int) -> Int {
 }
 
 // "\r\n" — the blank line terminating the request header — 2 bytes.
-fn req_sub5_byte(j: Int) -> Int {
+fn req_sub5_byte(j: Int) -> Int
+  [ requires j >= 0 && j < 3; ] {
   let arr: [Int; 3] = [0; 3];
   arr[0] = 13;
   arr[1] = 10;
@@ -347,7 +355,8 @@ fn req_sub5_byte(j: Int) -> Int {
 }
 
 // The 36-byte wire body: {"tool":"frame_tick","args":[0,1,2]}
-fn req_body_byte(j: Int) -> Int {
+fn req_body_byte(j: Int) -> Int
+  [ requires j >= 0 && j < 37; ] {
   let arr: [Int; 37] = [0; 37];
   arr[0] = 123;
   arr[1] = 34;
@@ -391,9 +400,12 @@ fn req_body_byte(j: Int) -> Int {
 // Byte i of the fixed 157-byte request payload (121 header + 36 body).
 // Total and total-by-construction: out-of-range returns 0.
 fn req_payload_byte(i: Int) -> Int {
-  if (i < 27) {
-    return req_sub0_byte(i);
+  if (i < 0) {
+    return 0;
   } else {
+    if (i < 27) {
+      return req_sub0_byte(i);
+    } else {
     if (i < 48) {
       return req_sub1_byte(i - 27);
     } else {
@@ -419,6 +431,7 @@ fn req_payload_byte(i: Int) -> Int {
         }
       }
     }
+  }
   }
 }
 
@@ -620,7 +633,8 @@ fn tcp_checksum(src_port: Int, dst_port: Int, seq: Int, ack: Int, flags: Int,
 // from net_mac_byte, supplied by the caller so this stays VM-testable with a
 // known MAC).
 // ---------------------------------------------------------------------------
-fn arp_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int, m5: Int) -> Int {
+fn arp_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int, m5: Int) -> Int
+  [ requires i >= 0 && i < 60; ] {
   let arr: [Int; 60] = [0; 60];
   arr[0] = 255;
   arr[1] = 255;
@@ -677,7 +691,8 @@ fn arp_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int, m5: Int) -> Int
 // 52:55:<gw-ip> (kernel/virtio_net.c documents the empirical gap: slirp 4.8
 // does NOT answer a bare guest ARP on QEMU 10.0.11, so the LOCKED 2d-2
 // resolution is by CONSTANT). Every TCP segment's Ethernet dst is this MAC.
-fn gw_mac_byte(k: Int) -> Int {
+fn gw_mac_byte(k: Int) -> Int
+  [ requires k >= 0 && k < 6; ] {
   let arr: [Int; 6] = [0; 6];
   arr[0] = 82;
   arr[1] = 85;
@@ -792,11 +807,13 @@ fn tcp_frame_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int, m5: Int,
   }
   if (i < 0) {
     return 0;
+  } else {
+    if (i >= 512) {
+      return 0;
+    } else {
+      return f[i] + 0;
+    }
   }
-  if (i >= 512) {
-    return 0;
-  }
-  return f[i] + 0;
 }
 
 // Byte i of the PADDED wire frame — the C ns_tcp_send_segment padded any
@@ -848,7 +865,8 @@ fn tcp_frame_pad_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int,
 // ---------------------------------------------------------------------------
 
 // Lowercase byte k (0..13) of "content-length" (the matcher pattern).
-fn cl_name_byte(k: Int) -> Int {
+fn cl_name_byte(k: Int) -> Int
+  [ requires k >= 0 && k < 15; ] {
   let arr: [Int; 15] = [0; 15];
   arr[0] = 99;
   arr[1] = 111;

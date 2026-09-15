@@ -241,6 +241,58 @@ fn serial_net_marker(pm: cap phys.mem, n: Int) -> Unit {
   return;
 }
 
+// VirtIO block smoke markers: PCI discovery, queue readiness, pattern read.
+fn serial_blk_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 66);   // B
+  putc(pm, 76);   // L
+  putc(pm, 75);   // K
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 48 + n);
+  putc(pm, 10);   // newline
+  return;
+}
+
+fn serial_blk_queue(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 66); putc(pm, 76); putc(pm, 75); putc(pm, 78);
+  putc(pm, 58); putc(pm, 32);
+  let d4: Int = n / 10000;
+  let r4: Int = n - d4 * 10000;
+  let d3: Int = r4 / 1000;
+  let r3: Int = r4 - d3 * 1000;
+  let d2: Int = r3 / 100;
+  let r2: Int = r3 - d2 * 100;
+  putc(pm, 48 + d4); putc(pm, 48 + d3); putc(pm, 48 + d2);
+  putc(pm, 48 + r2 / 10); putc(pm, 48 + r2 - (r2 / 10) * 10);
+  putc(pm, 10);
+  return;
+}
+
+fn blk_pattern_ok(pm: cap phys.mem) -> Int {
+  if (blk_read_byte(pm, 0) != 74) { return 0; }  // J
+  if (blk_read_byte(pm, 1) != 79) { return 0; }  // O
+  if (blk_read_byte(pm, 2) != 69) { return 0; }  // E
+  if (blk_read_byte(pm, 511) != 65) { return 0; }  // A
+  if (blk_read_byte(pm, 512) != 66) { return 0; }  // B
+  if (blk_read_byte(pm, 1023) != 90) { return 0; } // Z
+  return 1;
+}
+
+fn blk_bringup(pm: cap phys.mem) -> Unit {
+  if (blk_probe(pm) != 1) { return; }
+  serial_blk_marker(pm, 1);
+  if (blk_init(pm) != 1) {
+    serial_blk_marker(pm, blk_error_code());
+    serial_blk_queue(pm, blk_queue_size());
+    return;
+  }
+  serial_blk_marker(pm, 2);
+  if (blk_read_sectors(pm, 7, 2) != 1) { return; }
+  if (blk_pattern_ok(pm) != 1) { return; }
+  serial_blk_marker(pm, 3);
+  return;
+}
+
 // Phase 2d-1 RX marker: "RX: <len>" reports the received frame length (the
 // slirp ARP reply, 42-60 bytes — two digits max). No modulo (rejected by the
 // compiler): split tens/ones with division + subtraction.
@@ -654,6 +706,9 @@ fn main(pm: cap phys.mem) -> Unit {
   // no e1000 device, e1000_probe() finds nothing and the sequence is a safe
   // no-op (existing gates stay green).
   e1000_bringup(pm);
+  // Raw model-disk path: safe no-op unless a legacy VirtIO block device is
+  // attached. The live smoke image carries its known pattern at LBA 7.
+  blk_bringup(pm);
   // Phase 2d-1: VirtIO-net bring-up first — the NIC sequence (NET: 1..3,
   // RX: <len>) runs before the display branch so the smoke gate can observe
   // it on any boot path. With no virtio-net device, net_probe() finds

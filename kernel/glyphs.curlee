@@ -104,7 +104,8 @@ fn glyph_height(scale: Int) -> Int {
 
 // Row `row` (0..6) of the 5-bit glyph for ASCII `ch`. Blank (0) for
 // unknown/space rows beyond the glyph's content. Total: any input -> 0..31.
-fn glyph_row(ch: Int, row: Int) -> Int {
+fn glyph_row(ch: Int, row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
   if (ch == 72) {       // 'H'
     return glyph_h(row);
   } else {
@@ -157,7 +158,8 @@ fn glyph_row(ch: Int, row: Int) -> Int {
 }
 
 // 'H' — rows 0..6: |  |  |  |##|  |  |  |
-fn glyph_h(row: Int) -> Int {
+fn glyph_h(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
   let arr: [Int; 7] = [0; 7];
   arr[0] = 17;
   arr[1] = 17;
@@ -170,8 +172,9 @@ fn glyph_h(row: Int) -> Int {
 }
 
 // 'e' — rows 0..6:  ###  #  # #### #      ###
-fn glyph_e(row: Int) -> Int {
-  let arr: [Int; 6] = [0; 6];
+fn glyph_e(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
+  let arr: [Int; 7] = [0; 7];
   arr[0] = 14;
   arr[1] = 17;
   arr[2] = 31;
@@ -181,8 +184,9 @@ fn glyph_e(row: Int) -> Int {
 }
 
 // 'l' — rows 0..6:  #    #    #    #   ###
-fn glyph_l(row: Int) -> Int {
-  let arr: [Int; 6] = [0; 6];
+fn glyph_l(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
+  let arr: [Int; 7] = [0; 7];
   arr[0] = 4;
   arr[1] = 4;
   arr[2] = 4;
@@ -193,8 +197,9 @@ fn glyph_l(row: Int) -> Int {
 }
 
 // 'o' — rows 0..6:  ###  #  # #  # #  #  ###
-fn glyph_o(row: Int) -> Int {
-  let arr: [Int; 6] = [0; 6];
+fn glyph_o(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
+  let arr: [Int; 7] = [0; 7];
   arr[0] = 14;
   arr[1] = 17;
   arr[2] = 17;
@@ -205,7 +210,8 @@ fn glyph_o(row: Int) -> Int {
 }
 
 // 'W' — rows 0..6: #  # #  # #  # # # # ##### #  #
-fn glyph_w(row: Int) -> Int {
+fn glyph_w(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
   let arr: [Int; 7] = [17; 7];
   arr[0] = 17;
   arr[1] = 17;
@@ -218,8 +224,9 @@ fn glyph_w(row: Int) -> Int {
 }
 
 // 'r' — rows 0..6:  ##   #    #    #   ###
-fn glyph_r(row: Int) -> Int {
-  let arr: [Int; 6] = [0; 6];
+fn glyph_r(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
+  let arr: [Int; 7] = [0; 7];
   arr[0] = 6;
   arr[1] = 4;
   arr[2] = 4;
@@ -230,7 +237,8 @@ fn glyph_r(row: Int) -> Int {
 }
 
 // 'd' — rows 0..6:    #    #  ### #  # #  #  ###
-fn glyph_d(row: Int) -> Int {
+fn glyph_d(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
   let arr: [Int; 7] = [0; 7];
   arr[0] = 1;
   arr[1] = 1;
@@ -243,8 +251,9 @@ fn glyph_d(row: Int) -> Int {
 }
 
 // 'f' — rows 0..6:  ###  #  # #### #    #
-fn glyph_f(row: Int) -> Int {
-  let arr: [Int; 6] = [0; 6];
+fn glyph_f(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
+  let arr: [Int; 7] = [0; 7];
   arr[0] = 6;
   arr[1] = 9;
   arr[2] = 14;
@@ -254,8 +263,9 @@ fn glyph_f(row: Int) -> Int {
 }
 
 // 'm' — rows 0..6: # # # # # # # # # ##
-fn glyph_m(row: Int) -> Int {
-  let arr: [Int; 6] = [0; 6];
+fn glyph_m(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
+  let arr: [Int; 7] = [0; 7];
   arr[0] = 21;
   arr[1] = 21;
   arr[2] = 21;
@@ -266,8 +276,9 @@ fn glyph_m(row: Int) -> Int {
 }
 
 // 'C' — rows 0..6:  ###  #  # #    #    ###
-fn glyph_c(row: Int) -> Int {
-  let arr: [Int; 6] = [0; 6];
+fn glyph_c(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
+  let arr: [Int; 7] = [0; 7];
   arr[0] = 14;
   arr[1] = 17;
   arr[2] = 16;
@@ -278,8 +289,9 @@ fn glyph_c(row: Int) -> Int {
 }
 
 // 'u' — rows 0..6: #  # #  # #  # #  #  ###
-fn glyph_u(row: Int) -> Int {
-  let arr: [Int; 6] = [0; 6];
+fn glyph_u(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
+  let arr: [Int; 7] = [0; 7];
   arr[0] = 5;
   arr[1] = 9;
   arr[2] = 9;
@@ -290,8 +302,9 @@ fn glyph_u(row: Int) -> Int {
 }
 
 // '!' — rows 0..6:  #    #    #        #
-fn glyph_bang(row: Int) -> Int {
-  let arr: [Int; 6] = [0; 6];
+fn glyph_bang(row: Int) -> Int
+  [ requires row >= 0 && row < 7; ] {
+  let arr: [Int; 7] = [0; 7];
   arr[0] = 4;
   arr[1] = 4;
   arr[2] = 4;

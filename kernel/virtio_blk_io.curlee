@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: GPL-3.0
+// Synchronous bounded raw-sector reads for the VirtIO block queue.
+
+static vblk_avail_head: Int = 0;
+static vblk_used_last: Int = 0;
+static vblk_read_bytes: Int = 0;
+
+fn vblk_write_desc(
+  pm: cap phys.mem,
+  id: Int,
+  addr: Int,
+  len: Int,
+  flags: Int,
+  next: Int
+) -> Unit {
+  if (id >= 0) {
+    let desc: Int = vblk_desc_addr(vblk_ring_base, id);
+    unsafe {
+      let addr64: U64 = addr;
+      phys_write_u64(desc, addr64);
+      phys_write_u32(desc + 8, len);
+      phys_write_u16(desc + 12, flags);
+      phys_write_u16(desc + 14, next);
+    }
+  }
+  return;
+}
+
+fn vblk_prepare_header(pm: cap phys.mem, sector: Int) -> Unit {
+  let header: Int = vblk_header_base(pm);
+  let status: Int = vblk_status_base(pm);
+  unsafe {
+    phys_write_u32(header, 0);
+    phys_write_u32(header + 4, 0);
+    let sector64: U64 = sector;
+    phys_write_u64(header + 8, sector64);
+    phys_write_u8(status, 255);
+  }
+  return;
+}
+
+fn vblk_prepare_chain(pm: cap phys.mem, bytes: Int) -> Unit {
+  vblk_write_desc(pm, 0, vblk_header_base(pm), 16, 1, 1);
+  vblk_write_desc(pm, 1, vblk_data_base(pm), bytes, 3, 2);
+  vblk_write_desc(pm, 2, vblk_status_base(pm), 1, 2, 0);
+  return;
+}
+
+fn vblk_publish(pm: cap phys.mem) -> Unit {
+  let slot: Int = vblk_avail_head % vblk_queue_size;
+  unsafe {
+    let ring: Int = vblk_avail_ring_addr(
+      vblk_ring_base, vblk_queue_size);
+    phys_write_u16(ring + slot * 2, 0);
+  }
+  curlee_sfence();
+  vblk_avail_head = vblk_avail_head + 1;
+  unsafe {
+    let idx: Int = vblk_avail_idx_addr(
+      vblk_ring_base, vblk_queue_size);
+    phys_write_u16(idx, vblk_avail_head);
+  }
+  vblk_notify(pm);
+  return;
+}
+
+fn vblk_wait(pm: cap phys.mem) -> Int {
+  let poll: Int = 0;
+  while (poll < 20000000) {
+    unsafe {
+      let used: Int = vblk_used_idx_addr(
+        vblk_ring_base, vblk_queue_size);
+      let idx: U16 = phys_read_u16(used);
+      if ((idx + 0) != vblk_used_last) {
+        vblk_used_last = (vblk_used_last + 1) % 65536;
+        return 1;
+      }
+    }
+    if ((poll & 255) == 0) { vblk_yield(pm); }
+    poll = poll + 1;
+  }
+  return 0;
+}
+
+fn vblk_status_ok(pm: cap phys.mem) -> Int {
+  unsafe {
+    let status: U8 = phys_read_u8(vblk_status_base(pm));
+    if ((status + 0) == 0) { return 1; }
+  }
+  return 0;
+}
+
+fn blk_read_sectors(pm: cap phys.mem, sector: Int, count: Int) -> Int {
+  if (vblk_ready != 1) { return 0; }
+  if (!vblk_read_in_bounds(sector, count, vblk_capacity)) { return 0; }
+  if (count > vblk_max_sectors()) { return 0; }
+  let bytes: Int = count * 512;
+  vblk_prepare_header(pm, sector);
+  vblk_prepare_chain(pm, bytes);
+  vblk_publish(pm);
+  if (vblk_wait(pm) != 1) { return 0; }
+  if (vblk_status_ok(pm) != 1) { return 0; }
+  vblk_read_bytes = bytes;
+  return 1;
+}
+
+fn blk_read_byte(pm: cap phys.mem, index: Int) -> Int {
+  if (index < 0 || index >= vblk_read_bytes) { return 0; }
+  unsafe {
+    let value: U8 = phys_read_u8(vblk_data_base(pm) + index);
+    return value + 0;
+  }
+}

@@ -24,17 +24,18 @@
 //
 // Ring layout (matches Linux vring_init + QEMU legacy exactly):
 //   queue base (4096-aligned) -> PFN register = phys >> 12
-//     page 0: vring_desc[256]   (16 B each)
-//     page 1: vring_avail       (flags + idx + ring[256])
-//     page 2: vring_used        (flags + idx + ring[256] of {id,len})
+//     descriptors: queue_size * 16 bytes
+//     available: flags + idx + queue_size entries
+//     used: next 4096-byte boundary, then flags + idx + elements
+//   The queue size is read from the device and may be as large as 1024.
 //   There is no GuestPageSize register in the shipped legacy layout: Linux
 //   (virtio_pci_legacy.c, VIRTIO_PCI_QUEUE_ADDR_SHIFT 12) and QEMU both fix
 //   the PFN unit at 4096 bytes. The issue's mention is a draft-era register.
 //
 // PVH sizing mode (LOCKED option 2 default, option 1 fallback):
 //   GRUB build (no JOE_PVH_BOOT) — OPTION 2 ACTIVE: full rings (2 RX x 2048 B
-//   + 2 TX x 2048 B, ring depth 256). The NIC runs on the GRUB/ISO path, which
-//   is where qemu-net-smoke boots.
+//   + 2 TX x 2048 B, ring depth reported by the device). The NIC runs on the
+//   GRUB/ISO path, which is where qemu-net-smoke boots.
 //   PVH build (JOE_PVH_BOOT) — OPTION 1 ACTIVE: the ring/buffer memory is
 //   stubbed to 1 element (Curlee statics sized by --define, gh issue #296),
 //   every base getter returns 0, and net_probe() is a safe no-op. Trigger:
@@ -45,7 +46,7 @@
 //   the PVH LOAD budget. The getter surface is identical on both paths.
 //
 // PORT NOTE — per-build-target static array sizing (gh issue #296): the
-//   5-page ring memory and the 2048-byte RX/TX data buffers are Curlee
+//   9-page ring memory and the 2048-byte RX/TX data buffers are Curlee
 //   statics whose sizes are constant expressions over build-time constants
 //   injected with `curlee build --define NAME=VALUE`. The SAME merged source
 //   is built twice: the PVH build (JOE_PVH_BOOT=1) sizes the qmem to 1 page
@@ -106,10 +107,9 @@
 // buffer and queue_setup() manually aligns the working base (`(raw + 4095) &
 // ~4095UL` — ported verbatim from the C original).
 //
-// Over-allocation math: the aligned base can be up to (4096-1) bytes past the
-// raw start, and we need 3 x 4096 from the aligned base. So the raw buffer
-// must be >= 4095 + 3*4096 = 16383 bytes. 5 pages (20480) is safe on both
-// sides. Sized per build: NET_QMEM_PAGES=5 on the GRUB build, 1 on the PVH
+// Over-allocation math: the aligned base can be up to 4095 bytes past the raw
+// start. A 1024-entry ring needs just under eight pages after that base, so
+// nine raw pages are safe. NET_QMEM_PAGES=9 on the GRUB build and 1 on PVH
 // build (1-element-stub semantics — the getters return 0 and net_init() bails
 // on virtio_net_pvh_build()==1).
 static rx_qmem: [U8; NET_QMEM_PAGES * 4096] = [0; NET_QMEM_PAGES * 4096];
@@ -121,8 +121,10 @@ static tx_qmem: [U8; NET_QMEM_PAGES * 4096] = [0; NET_QMEM_PAGES * 4096];
 // the GRUB build (>= 256 B: the wire-shape §3.2 absolute response limit; 2048
 // covers the ARP frame and the 2d-2 HTTP round trip comfortably), 1 x 1 on
 // the PVH build.
-static rx_buf: [U8; NET_RX_BUFS * NET_BUF_BYTES] = [0; NET_RX_BUFS * NET_BUF_BYTES];
-static tx_buf: [U8; NET_TX_BUFS * NET_BUF_BYTES] = [0; NET_TX_BUFS * NET_BUF_BYTES];
+static rx_buf: [U8; NET_RX_BUFS * NET_BUF_BYTES] =
+  [0; NET_RX_BUFS * NET_BUF_BYTES];
+static tx_buf: [U8; NET_TX_BUFS * NET_BUF_BYTES] =
+  [0; NET_TX_BUFS * NET_BUF_BYTES];
 
 // Build discriminator: 1 on the PVH build (the buffers above are 1-element
 // stubs and every base getter returns 0), 0 on the GRUB build. The C
@@ -204,6 +206,7 @@ static pci_found: Int = 0;          // net_probe() cache
 static net_ready: Int = 0;          // net_init() completed (rings live)
 static net_status_feature: Int = 0; // VIRTIO_NET_F_STATUS negotiated
 static net_link_up_now: Int = 0;
+static net_queue_size: Int = 0;
 static guest_mac: [Int; 6] = [0; 6];
 static mac_known: Int = 0;
 
@@ -214,6 +217,8 @@ static mac_known: Int = 0;
 // can compute ring-field addresses.
 static rx_ring_base: Int = 0;
 static tx_ring_base: Int = 0;
+static rx_ring_size: Int = 0;
+static tx_ring_size: Int = 0;
 
 static rx_avail_head: Int = 0;   // number of RX descs added to the avail ring
 static tx_avail_head: Int = 0;
@@ -248,39 +253,45 @@ fn vring_desc_base(base: Int, s: Int) -> Int {
 
 // Address of the avail ring entry for slot s (page 1): flags u16 @0, idx u16
 // @2, ring[256] u16 @4.
-fn vring_avail_entry(base: Int, s: Int) -> Int {
-  return base + 4096 + 4 + s * 2;
+fn vring_avail_entry(base: Int, size: Int, s: Int) -> Int {
+  return base + size * 16 + 4 + s * 2;
 }
 
 // Address of the avail/used idx fields (page 1 @2 / page 2 @2).
-fn vring_avail_idx_addr(base: Int) -> Int {
-  return base + 4096 + 2;
+fn vring_avail_idx_addr(base: Int, size: Int) -> Int {
+  return base + size * 16 + 2;
 }
 
-fn vring_used_idx_addr(base: Int) -> Int {
-  return base + 8192 + 2;
+fn vring_used_base(base: Int, size: Int) -> Int {
+  return (base + size * 18 + 6 + 4095) & ~4095;
+}
+
+fn vring_used_idx_addr(base: Int, size: Int) -> Int {
+  return vring_used_base(base, size) + 2;
 }
 
 // Addresses of used-ring element k's id/len (page 2): flags u16 @0, idx u16
 // @2, ring[256] of {id u32 @4, len u32 @8} — 8 bytes per element.
-fn vring_used_elem_id_addr(base: Int, k: Int) -> Int {
-  return base + 8192 + 4 + k * 8;
+fn vring_used_elem_id_addr(base: Int, size: Int, k: Int) -> Int {
+  return vring_used_base(base, size) + 4 + k * 8;
 }
 
-fn vring_used_elem_len_addr(base: Int, k: Int) -> Int {
-  return base + 8192 + 8 + k * 8;
+fn vring_used_elem_len_addr(base: Int, size: Int, k: Int) -> Int {
+  return vring_used_base(base, size) + 8 + k * 8;
 }
 
 // ---------------------------------------------------------------------------
 // Virtqueue helpers
 // ---------------------------------------------------------------------------
 
-// Cache the 3-page queue base for qsel (the C ring_pointers).
+// Cache the queue base and device-reported size for qsel.
 fn ring_pointers(qsel: Int, base: Int) -> Unit {
   if (qsel == 0) {
     rx_ring_base = base;
+    rx_ring_size = net_queue_size;
   } else {
     tx_ring_base = base;
+    tx_ring_size = net_queue_size;
   }
   return;
 }
@@ -310,17 +321,18 @@ fn queue_setup(pm: cap phys.mem, qsel: Int, raw: Int) -> Int {
     port_outw(io_base + 14, qsel);          // VIRTIO_PCI_QUEUE_SEL 0x0E
     let num: U16 = port_inw(io_base + 12);  // VIRTIO_PCI_QUEUE_NUM 0x0C
     let numi: Int = num + 0;
+    net_queue_size = numi;
     if (numi == 0) {
       return 0;
     }
-    if (numi > 256) {   // NET_RING_NUM (device wants more than we sized for)
+    if (numi > 1024) {
       return 0;
     }
     // Manual 4096-alignment of the working base (see the ring-memory comment).
     let base: Int = (raw + 4095) & ~4095;
-    // Zero the 3 pages (3072 x u32 = 12288 bytes) — the C net_zero.
+    // Zero eight pages, enough for a 1024-entry legacy ring.
     let i: Int = 0;
-    while (i < 3072) {
+    while (i < 8192) {
       phys_write_u32(base + i * 4, 0);
       i = i + 1;
     }
@@ -354,7 +366,8 @@ fn refill_rx(pm: cap phys.mem) -> Unit {
         phys_write_u32(desc + 8, 2048);   // len = NET_BUF_BYTES
         phys_write_u16(desc + 12, 2);     // flags = VRING_DESC_F_WRITE
       }
-      let entry: Int = vring_avail_entry(rx_ring_base, rx_avail_head % 256);
+      let entry: Int = vring_avail_entry(
+        rx_ring_base, rx_ring_size, rx_avail_head % rx_ring_size);
       unsafe {
         phys_write_u16(entry, s);
       }
@@ -366,7 +379,8 @@ fn refill_rx(pm: cap phys.mem) -> Unit {
   }
   if (armed > 0) {
     curlee_sfence();   // desc[] + ring[] stores visible before idx
-    let idx_addr: Int = vring_avail_idx_addr(rx_ring_base);
+    let idx_addr: Int = vring_avail_idx_addr(
+      rx_ring_base, rx_ring_size);
     unsafe {
       phys_write_u16(idx_addr, rx_avail_head);
     }
@@ -386,7 +400,7 @@ fn service_rx_used(pm: cap phys.mem) -> Unit {
   let base: Int = rx_ring_base;
   let last: Int = rx_used_last;
   let guard: Int = 0;
-  let idx_addr: Int = vring_used_idx_addr(base);
+  let idx_addr: Int = vring_used_idx_addr(base, rx_ring_size);
   unsafe {
     while (guard < 256) {
       let uidx: U16 = phys_read_u16(idx_addr);
@@ -394,12 +408,14 @@ fn service_rx_used(pm: cap phys.mem) -> Unit {
       if (ui == last) {
         guard = 256;   // caught up
       } else {
-        let id: U32 = phys_read_u32(vring_used_elem_id_addr(base, last % 256));
+        let id: U32 = phys_read_u32(vring_used_elem_id_addr(
+          base, rx_ring_size, last % rx_ring_size));
         let idi: Int = id + 0;
         if (idi >= 0) {
           if (idi < 2) {   // id < NET_RX_BUFS
             if (rx_buf_state[idi] == 1) {
-              let elen: U32 = phys_read_u32(vring_used_elem_len_addr(base, last % 256));
+              let elen: U32 = phys_read_u32(vring_used_elem_len_addr(
+                base, rx_ring_size, last % rx_ring_size));
               let eleni: Int = elen + 0;
               rx_frame_len[idi] = eleni;
               rx_buf_state[idi] = 2;   // frame ready (owned by the stack)
@@ -419,7 +435,7 @@ fn service_tx_used(pm: cap phys.mem) -> Unit {
   let base: Int = tx_ring_base;
   let last: Int = tx_used_last;
   let guard: Int = 0;
-  let idx_addr: Int = vring_used_idx_addr(base);
+  let idx_addr: Int = vring_used_idx_addr(base, tx_ring_size);
   unsafe {
     while (guard < 256) {
       let uidx: U16 = phys_read_u16(idx_addr);
@@ -427,7 +443,8 @@ fn service_tx_used(pm: cap phys.mem) -> Unit {
       if (ui == last) {
         guard = 256;   // caught up
       } else {
-        let id: U32 = phys_read_u32(vring_used_elem_id_addr(base, last % 256));
+        let id: U32 = phys_read_u32(vring_used_elem_id_addr(
+          base, tx_ring_size, last % tx_ring_size));
         let idi: Int = id + 0;
         if (idi >= 2) {
           if (idi < 4) {   // id in [NET_RX_BUFS, NET_RX_BUFS + NET_TX_BUFS)
@@ -547,7 +564,7 @@ fn net_init(pm: cap phys.mem) -> Int {
     port_outl(io_base + 4, guest);   // VIRTIO_PCI_GUEST_FEATURES 0x04
     // 3. Status: ACKNOWLEDGE | DRIVER (0x01 | 0x02).
     port_outb(io_base + 18, 3);
-    // 4. Set up RX and TX queues (3-page legacy layout each).
+    // 4. Set up RX and TX queues using the device-reported geometry.
     let qrx: Int = queue_setup(pm, 0, virtio_net_rx_qmem_base(pm));
     if (qrx == 0) {
       port_outb(io_base + 18, 128);   // VIRTIO_CONFIG_S_FAILED 0x80
@@ -754,14 +771,16 @@ fn net_tx_send(pm: cap phys.mem, len: Int) -> Int {
         phys_write_u16(desc + 12, 0);     // flags 0 — device reads the TX buffer
       }
       curlee_sfence();   // desc[] + ring[] stores visible before idx
-      let entry: Int = vring_avail_entry(tx_ring_base, tx_avail_head % 256);
+      let entry: Int = vring_avail_entry(
+        tx_ring_base, tx_ring_size, tx_avail_head % tx_ring_size);
       unsafe {
         phys_write_u16(entry, desc_id);
       }
       tx_avail_head = tx_avail_head + 1;
       tx_buf_state[stage] = 1;
       tx_stage = (tx_stage + 1) % 2;   // NET_TX_BUFS
-      let idx_addr: Int = vring_avail_idx_addr(tx_ring_base);
+      let idx_addr: Int = vring_avail_idx_addr(
+        tx_ring_base, tx_ring_size);
       unsafe {
         phys_write_u16(idx_addr, tx_avail_head);
       }
@@ -780,11 +799,13 @@ fn net_tx_send(pm: cap phys.mem, len: Int) -> Int {
 fn net_mac_byte(i: Int) -> Int {
   if (mac_known == 0) {
     return 0;
+  } else {
+    if (i < 0 || i > 5) {
+      return 0;
+    } else {
+      return guest_mac[i];
+    }
   }
-  if (i < 0 || i > 5) {
-    return 0;
-  }
-  return guest_mac[i];
 }
 
 // Advance the rings and return the Curlee-owned tick counter (bounded-poll

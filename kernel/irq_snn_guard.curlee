@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// Fixed-point reference SNN guard for interrupt telemetry. This is the target
+// ABI for a future Spikeforge/NIR-generated detector: the detector infers a
+// typed event, while an explicit Curlee FSM owns state and actions.
+//
+// All values are integer and bounded. There is no allocation, floating point,
+// model loader, or hidden controller state. Model weights are provisional
+// calibration constants, not a claim of a trained production detector.
+
+fn irq_snn_clamp(v: Int, lo: Int, hi: Int) -> Int
+  [ requires lo <= hi; ensures result >= lo && result <= hi; ] {
+  if (v < lo) {
+    return lo;
+  } else {
+    if (v > hi) {
+      return hi;
+    } else {
+      return v;
+    }
+  }
+}
+
+// One leaky-integrate step. Inputs are normalized feature bins in 0..255.
+// The membrane is Q0 integer state in 0..4095. Constant integer weights keep
+// target execution bit-identical across the VM, generated C, and JOE.
+fn irq_snn_step(
+  membrane: Int,
+  irq_rate: Int,
+  timeout_count: Int,
+  queue_pressure: Int,
+  error_count: Int
+) -> Int
+  [
+    requires membrane >= 0; requires membrane <= 4095;
+    requires irq_rate >= 0; requires irq_rate <= 255;
+    requires timeout_count >= 0; requires timeout_count <= 255;
+    requires queue_pressure >= 0; requires queue_pressure <= 255;
+    requires error_count >= 0; requires error_count <= 255;
+    ensures result >= 0; ensures result <= 4095;
+  ] {
+  // 7/8 leak, then a weighted event-energy accumulation.
+  let leaked: Int = membrane - (membrane / 8);
+  let raw: Int = leaked + irq_rate * 3 + timeout_count * 12
+    + queue_pressure * 2 + error_count * 16 - 192;
+  let bounded: Int = irq_snn_clamp(raw, 0, 4095);
+  return bounded;
+}
+
+// Event ABI: 0 normal, 1 elevated, 2 storm, 3 unknown/invalid.
+fn irq_snn_event(score: Int) -> Int
+  [ requires score >= 0; requires score <= 4095;
+    ensures result >= 0; ensures result <= 2; ] {
+  if (score >= 2048) { return 2; }
+  if (score >= 768) { return 1; }
+  return 0;
+}
+
+// Exhaustively verifiable logic-unit profile for CURLEE #316. Each telemetry
+// feature is quantized to two bits (0..3), and the retained membrane has only
+// 32 states. The complete transition table is therefore 32 * 4^4 = 8192
+// rows: small enough to enumerate on every host-side verification run.
+//
+// These constants are provisional. A future Spikeforge export may replace
+// them only after regenerating the truth-table digest and passing the same
+// exhaustive Curlee/C parity gates.
+fn irq_snn_logic_step(
+  membrane: Int,
+  irq_rate_bin: Int,
+  timeout_bin: Int,
+  queue_pressure_bin: Int,
+  error_bin: Int
+) -> Int
+  [
+    requires membrane >= 0; requires membrane <= 31;
+    requires irq_rate_bin >= 0; requires irq_rate_bin <= 3;
+    requires timeout_bin >= 0; requires timeout_bin <= 3;
+    requires queue_pressure_bin >= 0; requires queue_pressure_bin <= 3;
+    requires error_bin >= 0; requires error_bin <= 3;
+    ensures result >= 0; ensures result <= 31;
+  ] {
+  let leaked: Int = membrane - (membrane / 4);
+  let raw: Int = leaked + irq_rate_bin * 2 + timeout_bin * 5
+    + queue_pressure_bin + error_bin * 7 - 4;
+  let bounded: Int = irq_snn_clamp(raw, 0, 31);
+  return bounded;
+}
+
+// A spike is the unit's boolean value; callers do not apply an additional
+// floating-point threshold or interpret an untyped score.
+fn irq_snn_logic_spike(score: Int) -> Bool
+  [ requires score >= 0; requires score <= 31; ] {
+  return score >= 16;
+}
+
+// Controller states: 0 observe, 1 suspect, 2 confirmed, 3 cooldown.
+// State is explicit and deterministic; the SNN never owns kernel authority.
+fn irq_guard_next(state: Int, event: Int) -> Int
+  [ requires state >= 0; requires state <= 3;
+    requires event >= 0; requires event <= 3;
+    ensures result >= 0; ensures result <= 3; ] {
+  if (event == 3) { return 0; } // fail closed to observation, no action
+  if (state == 0) {
+    if (event >= 1) { return 1; }
+    return 0;
+  }
+  if (state == 1) {
+    if (event == 2) { return 2; }
+    if (event == 0) { return 0; }
+    return 1;
+  }
+  if (state == 2) { return 3; }
+  if (event == 0) { return 0; }
+  return 3;
+}
+
+// Actions: 0 none, 1 collect-extra-sample, 2 throttle-and-reset.
+// Only an explicit confirmed transition can authorize a disruptive action.
+fn irq_guard_action(state: Int, event: Int) -> Int
+  [ requires state >= 0; requires state <= 3;
+    requires event >= 0; requires event <= 3;
+    ensures result >= 0; ensures result <= 2; ] {
+  if (state == 1 && event == 2) { return 2; }
+  if (state == 0 && event >= 1 && event <= 2) { return 1; }
+  return 0;
+}

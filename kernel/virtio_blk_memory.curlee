@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-3.0
+// Build-sized DMA memory for the legacy VirtIO block driver.
+
+static vblk_qmem: [U8; BLK_QMEM_PAGES * 4096] =
+  [0; BLK_QMEM_PAGES * 4096];
+static vblk_header: [U8; 16] = [0; 16];
+static vblk_data: [U8; BLK_DATA_BYTES] = [0; BLK_DATA_BYTES];
+static vblk_status: [U8; 1] = [0; 1];
+
+fn vblk_is_stub() -> Bool {
+  return JOE_PVH_BOOT == 1;
+}
+
+fn vblk_qmem_base(pm: cap phys.mem) -> Int {
+  if (vblk_is_stub()) { return 0; }
+  unsafe { return addr_of(vblk_qmem); }
+  return 0;
+}
+
+fn vblk_header_base(pm: cap phys.mem) -> Int {
+  if (vblk_is_stub()) { return 0; }
+  unsafe { return addr_of(vblk_header); }
+  return 0;
+}
+
+fn vblk_data_base(pm: cap phys.mem) -> Int {
+  if (vblk_is_stub()) { return 0; }
+  unsafe { return addr_of(vblk_data); }
+  return 0;
+}
+
+fn vblk_status_base(pm: cap phys.mem) -> Int {
+  if (vblk_is_stub()) { return 0; }
+  unsafe { return addr_of(vblk_status); }
+  return 0;
+}
+
+fn vblk_max_sectors() -> Int {
+  if (vblk_is_stub()) { return 0; }
+  return BLK_DATA_BYTES / 512;
+}
