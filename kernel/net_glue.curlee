@@ -158,10 +158,11 @@ fn net_resp_len_set(n: Int) -> Unit {
 
 // Byte i of the store (0 when invalidated, or out of range).
 fn net_resp_byte(i: Int) -> Int {
-  if (ns_resp_len < 0 || i < 0 || i >= ns_resp_len) {
+  if (ns_resp_len < 0 || i < 0 || i >= ns_resp_len || i >= 256) {
     return 0;
+  } else {
+    return ns_resp_body[i];
   }
-  return ns_resp_body[i];
 }
 
 // Append one body byte. Bounded by the 256-byte cap and gated on the store
