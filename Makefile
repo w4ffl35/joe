@@ -39,6 +39,8 @@ VGA_SETUP_SRC := kernel/vga_setup.curlee
 VBE_SRC       := kernel/vbe.curlee
 VIRTIO_NET_SRC := kernel/virtio_net.curlee
 E1000_SRC     := kernel/e1000.curlee
+IRQ_SNN_GUARD_SRC := kernel/irq_snn_guard.curlee
+IRQ_SNN_GUARD_TEST := kernel/irq_snn_guard_test.curlee
 NET_STACK_SRC := kernel/net_stack.curlee
 NET_GLUE_SRC  := kernel/net_glue.curlee
 # Pure virtio-blk modules (raw sector-read driver foundation). All are
@@ -48,7 +50,8 @@ NET_GLUE_SRC  := kernel/net_glue.curlee
 VIRTIO_BLK_SRC := kernel/virtio_blk_helpers.curlee kernel/virtio_blk_layout.curlee \
                   kernel/virtio_blk_queue.curlee kernel/virtio_blk_requests.curlee \
                   kernel/virtio_blk_bounds.curlee kernel/virtio_blk_reqbuf.curlee \
-                  kernel/virtio_blk_alloc.curlee
+                  kernel/virtio_blk_alloc.curlee kernel/virtio_blk_memory.curlee \
+                  kernel/virtio_blk_transport.curlee kernel/virtio_blk_io.curlee
 CANVAS_TEST   := kernel/canvas_test.curlee
 JSON_TEST     := kernel/json_test.curlee
 NET_STACK_TEST := kernel/net_stack_test.curlee
@@ -73,11 +76,13 @@ MERGE_SCRIPT  := scripts/build-kernel.sh
 PVH_DEFINES := --define JOE_PVH_BOOT=1 \
   --define ASSET_REGION_W=1 --define ASSET_REGION_H=1 \
   --define FRAME_RING_SLOTS=1 --define FRAME_RING_MAX_W=1 --define FRAME_RING_MAX_H=1 \
-  --define NET_QMEM_PAGES=1 --define NET_RX_BUFS=1 --define NET_TX_BUFS=1 --define NET_BUF_BYTES=1
+  --define NET_QMEM_PAGES=1 --define NET_RX_BUFS=1 --define NET_TX_BUFS=1 --define NET_BUF_BYTES=1 \
+  --define BLK_QMEM_PAGES=1 --define BLK_DATA_BYTES=1
 GRUB_DEFINES := --define JOE_PVH_BOOT=0 \
   --define ASSET_REGION_W=128 --define ASSET_REGION_H=128 \
   --define FRAME_RING_SLOTS=2 --define FRAME_RING_MAX_W=640 --define FRAME_RING_MAX_H=480 \
-  --define NET_QMEM_PAGES=5 --define NET_RX_BUFS=2 --define NET_TX_BUFS=2 --define NET_BUF_BYTES=2048
+  --define NET_QMEM_PAGES=9 --define NET_RX_BUFS=2 --define NET_TX_BUFS=2 --define NET_BUF_BYTES=2048 \
+  --define BLK_QMEM_PAGES=9 --define BLK_DATA_BYTES=4096
 CHECK_DEFINES := $(GRUB_DEFINES)
 # Curlee runtime (crt0.S, linker.ld, rt.c, libgcc32_helpers.c) lives at the
 # source root, not under build/. Prefer CURLEE_ROOT (repo root); otherwise
@@ -103,8 +108,9 @@ CC := cc
 AS := as
 LD := ld
 
-.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run mb2-codegen-run iso iso-fb qemu run verify clean \
-        qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
+.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test mb2-codegen-run iso iso-fb qemu run verify clean \
+	qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
+	qemu-blk-smoke \
         c-boundary
 
 all: kernel
@@ -116,7 +122,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
 	@mkdir -p $(BUILD_DIR)
 	bash $(MERGE_SCRIPT) $@
 
@@ -174,7 +180,7 @@ $(KERNEL_ELF): $(MERGED_SRC)
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(NET_STACK_SRC) $(VIRTIO_BLK_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(VIRTIO_BLK_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
@@ -196,10 +202,12 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	# phys_read_u32/phys_write_u32 builtins — no Phys<T> literals, no C shim).
 	# Standalone-checkable (no cross-module calls); re-verified in the merged TU.
 	$(CURLEE) check $(E1000_SRC)
+	# Fixed-point SNN event detector + explicit deterministic FSM reference.
+	$(CURLEE) check $(IRQ_SNN_GUARD_SRC)
 	# The pure protocol core stays VM-checkable standalone (extern-free).
 	$(CURLEE) check $(NET_STACK_SRC)
 	# The pure virtio-blk foundation modules (slice-built, standalone pure).
-	# curlee check takes ONE file, so loop the 7 modules individually.
+	# curlee check takes one file, so check each block module individually.
 	$(CURLEE) check kernel/virtio_blk_helpers.curlee
 	$(CURLEE) check kernel/virtio_blk_layout.curlee
 	$(CURLEE) check kernel/virtio_blk_queue.curlee
@@ -207,6 +215,8 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	$(CURLEE) check kernel/virtio_blk_bounds.curlee
 	$(CURLEE) check kernel/virtio_blk_reqbuf.curlee
 	$(CURLEE) check kernel/virtio_blk_alloc.curlee
+	$(CURLEE) check $(CHECK_DEFINES) kernel/virtio_blk_memory.curlee
+	# Hardware-facing block modules compose through the merged kernel below.
 	# gh issue #20: kernel/vbe.curlee and kernel/mb2.curlee are NOT checked
 	# standalone anymore — they call fb.curlee's fb_state_set (the shared
 	# framebuffer-state setter), so they verify through the MERGED TU below
@@ -258,6 +268,20 @@ net-stack-run: $(NET_STACK_TEST) $(NET_STACK_SRC)
 net-stack-codegen-run:
 	bash scripts/run-net-stack-codegen.sh
 
+# Reference fixed-point SNN detector and deterministic FSM behavior.
+irq-snn-guard-run: $(IRQ_SNN_GUARD_TEST) $(IRQ_SNN_GUARD_SRC)
+	$(CURLEE) run --fuel 1000000 $(IRQ_SNN_GUARD_TEST)
+
+# Row-by-row differential proof against nir-c-runtime: all 8192 bounded
+# logic transitions plus the complete 4x4 controller truth table.
+irq-snn-codegen-run: $(IRQ_SNN_GUARD_SRC)
+	bash scripts/run-irq-snn-codegen.sh
+
+# gh issue #52: filesystem-free placement and exact read-back verification of
+# an opaque model blob at a known LBA in a raw VirtIO disk image.
+raw-blob-placement-test:
+	bash scripts/test-raw-blob-placement.sh
+
 # gh issue #15: the HOST-SIDE proof of the Curlee multiboot2 tag walk
 # (kernel/mb2.curlee, ported from the deleted kernel/mb2.c). The GRUB boot
 # gates (qemu-fb-smoke / qemu-loop-smoke) prove the live path; this harness
@@ -298,7 +322,7 @@ $(BUILD_DIR)/kernel-grub.elf: $(MERGED_SRC) $(BOOT_ASM) $(LIBGCC32_HELPERS_C) $(
 	@mkdir -p $(BUILD_DIR)
 	# GRUB/ISO path (gh issue #296): the GRUB --define set (JOE_PVH_BOOT=0)
 	# sizes the Curlee buffers to the FULL geometry — 128x128 asset region,
-	# 2x640x480 frame ring, 5-page net qmem + 2x2048 data buffers — which is
+	# 2x640x480 frame ring, 9-page net qmem + 2x2048 data buffers — which is
 	# where the framebuffer flip and the NIC actually run. kernel/fb.c +
 	# kernel/virtio_net.c are DELETED; nothing C links for them.
 	$(CURLEE) build --target freestanding-c $(GRUB_DEFINES) -o $(BUILD_DIR)/kernel.c $(MERGED_SRC)
@@ -438,6 +462,11 @@ qemu-pvh-fb-smoke: $(BUILD_DIR)/kernel-smoke.elf
 	  && echo "PASS: PVH path framebuffer active (fb_ready=1 via VBE probe) -> serial: $$(cat $(BUILD_DIR)/serial-pvh-fb.log)" \
 	  || (echo "FAIL: FB: 1 marker not in serial log (PVH VBE probe / draw target broken)"; \
 	      echo "serial log: $$(cat $(BUILD_DIR)/serial-pvh-fb.log)"; exit 1)
+
+# gh issue #51: live legacy VirtIO block read from the raw LBA image produced
+# by issue #52's filesystem-free placement tool.
+qemu-blk-smoke: $(BUILD_DIR)/joeos-net.iso
+	bash scripts/run-virtio-blk-smoke.sh
 
 # Phase 2e gate: boot the FB-mode GRUB ISO under QEMU with a linear
 # framebuffer and assert the serial log contains the "FB:" marker — proving
@@ -588,7 +617,7 @@ run: qemu
 # ---------------------------------------------------------------------------
 # Verify (all acceptance gates)
 # ---------------------------------------------------------------------------
-verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run mb2-codegen-run c-boundary kernel
+verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test mb2-codegen-run c-boundary kernel
 	@echo "=== Verification gates ==="
 	@test -s $(KERNEL_ELF) || (echo "FAIL: kernel.elf missing"; exit 1)
 	@objdump -f $(KERNEL_ELF) | grep -q 'start address 0x' && echo "PASS: ELF entry set"
@@ -635,6 +664,16 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' curlee_e1000_reset$$' && echo "PASS: curlee_e1000_reset linked (e1000 MMIO reset, Workstream C)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_e1000_bringup$$' && echo "PASS: curlee_e1000_bringup linked (e1000 bring-up glue, Workstream C)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_serial_e1000_marker$$' && echo "PASS: curlee_serial_e1000_marker linked (E1000 serial markers, Workstream C)"
+	# Fixed-point event detector and explicit FSM are statically linked. They
+	# are intentionally not wired to a hardware action until calibrated model
+	# weights and trace-replay gates exist.
+	@nm $(KERNEL_ELF) | grep -q ' curlee_irq_snn_step$$' && echo "PASS: curlee_irq_snn_step linked (fixed-point SNN guard)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_irq_guard_next$$' && echo "PASS: curlee_irq_guard_next linked (deterministic FSM)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_irq_snn_logic_step$$' && echo "PASS: curlee_irq_snn_logic_step linked (8192-row truth-table unit)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_irq_snn_logic_spike$$' && echo "PASS: curlee_irq_snn_logic_spike linked (typed Bool event)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_probe$$' && echo "PASS: curlee_blk_probe linked (VirtIO block PCI discovery)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_init$$' && echo "PASS: curlee_blk_init linked (VirtIO block queue)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_read_sectors$$' && echo "PASS: curlee_blk_read_sectors linked (raw sector API)"
 	# Phase 2d-4: the tool-queue producer API the LLM bridge drives
 	# (fb_tool_enqueue(2, arg) — the 2d-3 contract, wired into the 2b ring).
 	# gh issue #13: the blitter + event loop moved to Curlee (kernel/fb.curlee),

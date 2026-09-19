@@ -44,7 +44,8 @@ fn valid_col(col: Int) -> Bool {
 // The ASCII codes for "Hello World from Curlee".
 static hello: [Int; 24] = [0; 24];
 
-fn hello_char_at(i: Int) -> Int {
+fn hello_char_at(i: Int) -> Int
+  [ requires i >= 0 && i < 24; ] {
   hello[0] = 72;
   hello[1] = 101;
   hello[2] = 108;
