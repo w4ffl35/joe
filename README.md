@@ -55,6 +55,11 @@ application can take over instead:
 make qemu-app-smoke APP=apps/hello   # boot with apps/hello bundled
 ```
 
+`APP=<dir>` also works with `make iso-fb` (an app that draws to the
+framebuffer, unlike `apps/hello`, needs this GRUB path, not the PVH
+`-kernel` path `qemu-app-smoke` boots): `make iso-fb APP=apps/hello`
+bundles it into `build/joeos-fb.iso` the same way.
+
 `APP=<dir>` is shorthand for `APP_MODULES=<dir>/app.curlee` (the
 one-file-per-app convention `apps/hello` and `apps/noop` follow).
 `APP_MODULES="path1 path2 …"` is the lower-level knob for a multi-file

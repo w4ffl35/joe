@@ -686,6 +686,95 @@ fn render_frame(pm: cap phys.mem, frame: Int) -> Unit {
   return;
 }
 
+// The built-in demo path `main` ran directly before the application slot
+// existed — unchanged here, just moved into its own function so `main`
+// can choose it or `run_app` with a two-line branch.
+fn run_demo(pm: cap phys.mem) -> Unit {
+  if (fb_ready() == 1) {
+    // The linear framebuffer is active. Two sub-paths, distinguished by
+    // whether the frame ring/asset region are compiled in:
+    //
+    // (a) GRUB path (kernel-grub.elf, 32-bit multiboot2 entry): the 32-bit
+    //     boot stub (kernel/boot.S, as --32) captured the trusted info
+    //     pointer in %ebx and mb2.curlee parsed the framebuffer tag (type 8)
+    //     into the blitter globals (gh issue #15); the frame ring is
+    //     compiled in and fb_present() performs a REAL back-buffer flip.
+    //     Phase 2b: hand off to the deterministic 60 FPS loop (see fb.c
+    //     fb_run_loop) — the loop renders N frames, then returns to halt.
+    // (b) PVH path (kernel.elf, qemu -kernel): no multiboot2 info; the
+    //     framebuffer comes from the Phase 2f Bochs VBE probe
+    //     (kernel/vbe.curlee, ported from vbe.c in gh issue #11).
+    //     The frame ring/asset region are compiled OUT (JOE_PVH_BOOT — QEMU's
+    //     PVH loader rejects a large BSS, see fb.c), so fb_asset_region_w()
+    //     reads 0 and fb_present() is a single-buffer no-op. Render ONE frame
+    //     directly into the VBE LFB, emit the FB: 1 marker, then halt — the
+    //     ring loop stays a GRUB-path feature.
+    let region_w: Int = fb_asset_region_w();
+    if (region_w == 0) {
+      // PVH path: single frame into the VBE-probed LFB (frame 0), then the
+      // FB: 1 marker proves fb_ready()==1 and the renderer ran under
+      // `qemu -kernel` (make qemu-pvh-fb-smoke greps for it).
+      render_frame(pm, 0);
+      serial_fb_marker(pm);
+    } else {
+      // GRUB path: the 60 FPS ring loop.
+      fb_loop_init();
+      while (fb_loop_frame() < 4) {
+        // One tick: render the current frame, emit the loop marker, enqueue
+        // a tool intent (exercising the producer API + slot mapping), then
+        // let fb_run_loop advance the counter and drain the ring.
+        let f: Int = fb_loop_frame();
+        render_frame(pm, f);
+        serial_frame_marker(pm, f);
+        // Producer: enqueue a "frame-tick" intent (kind 1, arg = the frame
+        // number). The slot for this frame comes from tool_queue_slot
+        // (division-free wrap). kind 1 is the reserved "frame tick" intent
+        // kind; future producers (LLM bridge, input) use their own kinds.
+        let slot: Int = tool_queue_slot(f);
+        let enq: Int = fb_tool_enqueue(1, slot);
+        // The ring has 8 slots and we enqueue 1 intent per frame, so enqueue
+        // always succeeds here; ignore the return for the smoke path.
+        let drained: Int = fb_tool_drained();
+        let pending: Int = fb_tool_pending();
+        fb_run_loop();
+      }
+      // After the loop, the frame ring has been exercised (fb_present
+      // flipped each frame). Emit the ring-active marker so the smoke gate
+      // can prove the Phase 2c flip ran (grep "RING: 1" alongside "FB:").
+      let ring_on: Int = fb_ring_active();
+      if (ring_on == 1) {
+        serial_ring_marker(pm);
+      }
+      serial_fb_marker(pm);
+    }
+  } else {
+    // No trusted framebuffer (text-mode ISO, no VBE device): VGA text +
+    // serial fallback keeps the Phase 1 gates green. vga_text_setup is a
+    // genuine Curlee function (kernel/vga_setup.curlee, ported from the
+    // deleted kernel/vga_setup.c in issue #10): it programs the VGA CRT
+    // controller for text mode 3, then clears the 0xB8000 buffer via
+    // vga_clear_text_buffer — a genuine Curlee loop over the runtime-address
+    // phys_write_u16 builtin (gh issue #20; the former vga_text_clear.c
+    // raw-memory-move extern is deleted).
+    vga_text_setup(pm);
+  }
+  return;
+}
+
+// The application slot's frame loop: app_init once, then app_frame until
+// it signals done. app_init/app_frame always have a real definition —
+// a real app's, or the in-tree no-op default — since Curlee has no weak
+// symbols (see scripts/build-kernel.sh); README.md documents the
+// interface in full.
+fn run_app(pm: cap phys.mem) -> Unit {
+  app_init(pm);
+  let app_done: Int = 0;
+  while (app_done == 0) {
+    app_done = app_frame(pm);
+  }
+  return;
+}
+
 // Kernel entry point (codegen exports this as curlee_main).
 //
 // Renders the Phase 2 demo scene when the linear framebuffer is available,
@@ -755,92 +844,13 @@ fn main(pm: cap phys.mem) -> Unit {
       }
     }
   }
-  // Application slot: when a real app is bundled (APP_BUNDLED == 1,
-  // build-time --define), it owns the whole frame loop instead of the
-  // built-in demo below — app_init once, then app_frame until it signals
-  // done — so the demo never draws before app_init or after the app's
-  // last frame overwrites what the app left on screen. app_init/
-  // app_frame always have a real definition (the in-tree no-op app when
-  // no APP_MODULES are given, since Curlee has no weak symbols), so this
-  // branch is well-typed either way; APP_BUNDLED just decides which path
-  // runs. The framebuffer-vs-VGA-fallback choice is nested one level
-  // inside this branch's `else` (Curlee has no `else if` chain).
+  // Application slot (README.md "Bundling an application"): a real app
+  // owns the frame loop instead of the built-in demo, so neither runs
+  // before the other or after it finishes.
   if (APP_BUNDLED == 1) {
-    app_init(pm);
-    let app_done: Int = 0;
-    while (app_done == 0) {
-      app_done = app_frame(pm);
-    }
+    run_app(pm);
   } else {
-    if (fb_ready() == 1) {
-      // The linear framebuffer is active. Two sub-paths, distinguished by
-      // whether the frame ring/asset region are compiled in:
-      //
-      // (a) GRUB path (kernel-grub.elf, 32-bit multiboot2 entry): the 32-bit
-      //     boot stub (kernel/boot.S, as --32) captured the trusted info
-      //     pointer in %ebx and mb2.curlee parsed the framebuffer tag (type 8)
-      //     into the blitter globals (gh issue #15); the frame ring is
-      //     compiled in and fb_present() performs a REAL back-buffer flip.
-      //     Phase 2b: hand off to the deterministic 60 FPS loop (see fb.c
-      //     fb_run_loop) — the loop renders N frames, then returns to halt.
-      // (b) PVH path (kernel.elf, qemu -kernel): no multiboot2 info; the
-      //     framebuffer comes from the Phase 2f Bochs VBE probe
-      //     (kernel/vbe.curlee, ported from vbe.c in gh issue #11).
-      //     The frame ring/asset region are compiled OUT (JOE_PVH_BOOT —
-      //     QEMU's PVH loader rejects a large BSS, see fb.c), so
-      //     fb_asset_region_w() reads 0 and fb_present() is a single-buffer
-      //     no-op. Render ONE frame directly into the VBE LFB, emit the
-      //     FB: 1 marker, then halt — the ring loop stays a GRUB-path
-      //     feature.
-      let region_w: Int = fb_asset_region_w();
-      if (region_w == 0) {
-        // PVH path: single frame into the VBE-probed LFB (frame 0), then the
-        // FB: 1 marker proves fb_ready()==1 and the renderer ran under
-        // `qemu -kernel` (make qemu-pvh-fb-smoke greps for it).
-        render_frame(pm, 0);
-        serial_fb_marker(pm);
-      } else {
-        // GRUB path: the 60 FPS ring loop.
-        fb_loop_init();
-        while (fb_loop_frame() < 4) {
-          // One tick: render the current frame, emit the loop marker, enqueue
-          // a tool intent (exercising the producer API + slot mapping), then
-          // let fb_run_loop advance the counter and drain the ring.
-          let f: Int = fb_loop_frame();
-          render_frame(pm, f);
-          serial_frame_marker(pm, f);
-          // Producer: enqueue a "frame-tick" intent (kind 1, arg = the frame
-          // number). The slot for this frame comes from tool_queue_slot
-          // (division-free wrap). kind 1 is the reserved "frame tick" intent
-          // kind; future producers (LLM bridge, input) use their own kinds.
-          let slot: Int = tool_queue_slot(f);
-          let enq: Int = fb_tool_enqueue(1, slot);
-          // The ring has 8 slots and we enqueue 1 intent per frame, so enqueue
-          // always succeeds here; ignore the return for the smoke path.
-          let drained: Int = fb_tool_drained();
-          let pending: Int = fb_tool_pending();
-          fb_run_loop();
-        }
-        // After the loop, the frame ring has been exercised (fb_present
-        // flipped each frame). Emit the ring-active marker so the smoke gate
-        // can prove the Phase 2c flip ran (grep "RING: 1" alongside "FB:").
-        let ring_on: Int = fb_ring_active();
-        if (ring_on == 1) {
-          serial_ring_marker(pm);
-        }
-        serial_fb_marker(pm);
-      }
-    } else {
-      // No trusted framebuffer (text-mode ISO, no VBE device): VGA text +
-      // serial fallback keeps the Phase 1 gates green. vga_text_setup is a
-      // genuine Curlee function (kernel/vga_setup.curlee, ported from the
-      // deleted kernel/vga_setup.c in issue #10): it programs the VGA CRT
-      // controller for text mode 3, then clears the 0xB8000 buffer via
-      // vga_clear_text_buffer — a genuine Curlee loop over the runtime-address
-      // phys_write_u16 builtin (gh issue #20; the former vga_text_clear.c
-      // raw-memory-move extern is deleted).
-      vga_text_setup(pm);
-    }
+    run_demo(pm);
   }
   unsafe {
     // Row 0, columns 0..22 (2 bytes per cell, base 0xB8000).
