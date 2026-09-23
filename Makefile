@@ -508,14 +508,9 @@ qemu-loop-smoke: $(BUILD_DIR)/joeos-fb.iso
 	      echo "expected: FR:0 FR:1 FR:2 FR:3 RING: 1 FB: 1 Hello World from JOE!"; \
 	      echo "serial log: $$(cat $(BUILD_DIR)/serial-loop.log)"; exit 1)
 
-# gh issue #6 (T06): the framebuffer PIXEL gate. qemu-fb-smoke and
-# qemu-loop-smoke above only assert serial markers — they prove the
-# renderer ran, not that it drew the right pixels at the right memory
-# addresses (fb_xy_addr mixed a pixel offset with a byte address and both
-# gates above still passed). This target boots the FB-mode ISO, takes a
-# QEMU monitor (QMP) screendump once the deterministic 4-frame loop has
-# halted, and checks known render_frame pixels against their expected
-# colour (scripts/run-fb-pixels-smoke.sh + scripts/qemu_fb_pixel_check.py).
+# Boots the FB-mode ISO, takes a QEMU (QMP) screendump once the 4-frame
+# loop has halted, and checks known render_frame pixels against their
+# expected colour — a serial-marker-only smoke gate cannot catch this.
 qemu-fb-pixels: $(BUILD_DIR)/joeos-fb.iso
 	bash scripts/run-fb-pixels-smoke.sh
 

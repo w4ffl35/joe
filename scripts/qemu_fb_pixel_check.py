@@ -2,12 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0
 """qemu_fb_pixel_check.py — QMP screendump + known-pixel colour check.
 
-gh issue #6 (T06): fb_xy_addr (kernel/fb.curlee) mixed a pixel offset
-with a byte address, and no test caught it because nothing ever read a
-rendered pixel back. This script drives the QEMU monitor (QMP) to
-screendump the running kernel's display to a PPM file, then checks
-that specific coordinates render_frame is known to draw match their
-expected RGB colour.
+Drives the QEMU monitor (QMP) to screendump the running kernel's
+display to a PPM file, then checks that specific coordinates
+render_frame is known to draw match their expected RGB colour.
 
 Usage:
     qemu_fb_pixel_check.py --qmp-sock PATH --ppm-out PATH \
@@ -26,6 +23,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 
 @dataclass(frozen=True)
@@ -45,38 +43,46 @@ class PixelCheck:
         return PixelCheck(x, y, r, g, b)
 
 
-def _read_json_line(sock: socket.socket) -> dict:
-    """Read one newline-terminated JSON object from a QMP socket."""
-    buf = b""
-    while b"\n" not in buf:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise ConnectionError("QMP socket closed unexpectedly")
-        buf += chunk
-    line, _, _ = buf.partition(b"\n")
+def _read_json_line(reader: IO[bytes]) -> dict[str, object]:
+    """Read one newline-terminated JSON object from a buffered reader."""
+    line = reader.readline()
+    if not line:
+        raise ConnectionError("QMP socket closed unexpectedly")
     return json.loads(line.decode("ascii"))
 
 
-def qmp_call(sock: socket.socket, payload: dict) -> dict:
-    """Send one QMP command and return its JSON reply."""
+def qmp_call(
+    reader: IO[bytes],
+    sock: socket.socket,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Send one QMP command and return its return/error reply.
+
+    QEMU may interleave asynchronous {"event": ...} messages before a
+    command's actual reply; those are read here and skipped.
+    """
     sock.sendall(json.dumps(payload).encode("ascii") + b"\n")
-    return _read_json_line(sock)
+    reply = _read_json_line(reader)
+    while "event" in reply:
+        reply = _read_json_line(reader)
+    return reply
 
 
 def take_screendump(qmp_sock: Path, ppm_out: Path) -> None:
     """Negotiate QMP capabilities and screendump the display to a PPM."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.connect(str(qmp_sock))
-        _read_json_line(sock)  # greeting
-        reply = qmp_call(sock, {"execute": "qmp_capabilities"})
-        if "error" in reply:
-            raise RuntimeError(f"qmp_capabilities failed: {reply}")
-        reply = qmp_call(sock, {
-            "execute": "screendump",
-            "arguments": {"filename": str(ppm_out)},
-        })
-        if "error" in reply:
-            raise RuntimeError(f"screendump failed: {reply}")
+        with sock.makefile("rb") as reader:
+            _read_json_line(reader)  # greeting
+            reply = qmp_call(reader, sock, {"execute": "qmp_capabilities"})
+            if "error" in reply:
+                raise RuntimeError(f"qmp_capabilities failed: {reply}")
+            reply = qmp_call(reader, sock, {
+                "execute": "screendump",
+                "arguments": {"filename": str(ppm_out)},
+            })
+            if "error" in reply:
+                raise RuntimeError(f"screendump failed: {reply}")
 
 
 def read_ppm(path: Path) -> tuple[int, int, bytes]:
@@ -141,11 +147,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def wait_for_file(path: Path, attempts: int = 20, delay: float = 0.1) -> None:
-    """Poll for a non-empty file (screendump's reply precedes the write)."""
+    """Poll for a non-empty file; raise if it never appears."""
     for _ in range(attempts):
         if path.exists() and path.stat().st_size > 0:
             return
         time.sleep(delay)
+    raise RuntimeError(
+        f"{path} did not appear within {attempts * delay:.1f}s of the "
+        "screendump command being accepted"
+    )
 
 
 def main() -> int:

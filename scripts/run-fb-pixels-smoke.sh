@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0
 #
-# run-fb-pixels-smoke.sh — gh issue #6 (T06): the framebuffer PIXEL gate.
+# run-fb-pixels-smoke.sh — the framebuffer PIXEL gate.
 #
-# qemu-fb-smoke / qemu-loop-smoke only assert serial markers (FB:, RING: 1,
-# FR:0..FR:3) — they prove the renderer RAN, not that it drew the right
-# pixels at the right memory addresses. fb_xy_addr (kernel/fb.curlee) mixed
-# a pixel offset with a byte address and every one of those serial gates
-# still passed, because nothing ever read a pixel back (gh issue #6). This
-# gate boots the FB-mode ISO, waits for the deterministic 4-frame loop to
+# Boots the FB-mode ISO, waits for the deterministic 4-frame loop to
 # reach its halt path, takes a QEMU monitor (QMP) screendump of the live
 # display, and checks the colour of pixels render_frame
 # (kernel/kernel.curlee) is known to draw for the LAST rendered frame

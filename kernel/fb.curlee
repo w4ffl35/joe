@@ -197,12 +197,9 @@ fn fb_state_set(addr: Int, pitch: Int, width: Int, height: Int) -> Unit {
 // pattern: hide variable*variable multiplication in opaque helpers).
 // ---------------------------------------------------------------------------
 
-// Byte address of (x, y) on a 32bpp surface: base + y*stride + x*4, where
-// stride is the BYTE stride (bytes per row) and each pixel is 4 bytes. The
-// callers all hand this straight to phys_write_u32 / phys_read_u32, which
-// take byte addresses (gh issue #6: this used to return a PIXEL offset —
-// base + y*(stride/4) + x — the C original indexed an `unsigned int*`,
-// which scaled by 4 implicitly; Curlee's Int arithmetic does not).
+// Byte address of (x, y) on a 32bpp surface: base + y*stride + x*4.
+// stride is the BYTE stride (bytes per row); each pixel is 4 bytes. The
+// callers pass this straight to phys_write_u32 / phys_read_u32.
 fn fb_xy_addr(base: Int, stride: Int, x: Int, y: Int) -> Int {
   return base + y * stride + x * 4;
 }
