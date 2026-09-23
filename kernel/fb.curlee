@@ -578,6 +578,20 @@ fn fb_ring_advance(pm: cap phys.mem) -> Unit {
 // tool_slot_bytes()==16 — canvas_test.curlee §12 asserts the exact values; a
 // drift fails `make canvas-run` before any boot.
 
+// Normalize an arbitrary Int into a valid tool-ring slot [0, 8). tool_head
+// and tool_count are opaque module statics (unconstrained per call), so
+// `x % 8` alone is not provably in [0, 8): `%` truncates toward zero, so
+// it lands in (-8, 8) for an arbitrary sign, not [0, 8) as Euclidean `%`
+// would give. Adding 8 first makes the intermediate positive, and `%` on
+// a positive operand behaves like Euclidean `%` either way, so the final
+// result is provably in [0, 8) regardless of x's sign — the same
+// normalization Curlee's own ring-buffer test fixture uses for this
+// exact pattern.
+fn tool_ring_slot(x: Int) -> Int
+  [ ensures result >= 0 && result < 8; ] {
+  return ((x % 8) + 8) % 8;
+}
+
 // Enqueue a (kind, arg) tool intent into the fixed ring.
 // Returns 1 on success, 0 when the ring is full (producers must back off).
 // Kind 0 is reserved (null intent) — never enqueue kind 0.
@@ -589,8 +603,9 @@ fn fb_tool_enqueue(kind: Int, arg: Int) -> Int {
     return 0;              // ring full
   }
   let h: Int = tool_head;
-  tool_kinds[h % 8] = kind;
-  tool_args[h % 8] = arg;
+  let slot: Int = tool_ring_slot(h);
+  tool_kinds[slot] = kind;
+  tool_args[slot] = arg;
   tool_head = (tool_head + 1) % 8;
   tool_count = tool_count + 1;
   return 1;
@@ -655,7 +670,7 @@ fn fb_run_loop() -> Unit {
   let c: Int = tool_count;
   while (c > 0) {
     let h: Int = tool_head;
-    let idx: Int = (h + 8 - c) % 8;   // tool_ring_oldest (canvas_test §12)
+    let idx: Int = tool_ring_slot(h + 8 - c);  // tool_ring_oldest (§12)
     tool_kinds[idx] = 0;              // consume: clear the reserved kind 0
     tool_args[idx] = 0;
     tool_count = tool_count - 1;
