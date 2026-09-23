@@ -110,7 +110,7 @@ LD := ld
 
 .PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test mb2-codegen-run iso iso-fb qemu run verify clean \
 	qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
-	qemu-blk-smoke \
+	qemu-blk-smoke qemu-fb-pixels \
         c-boundary
 
 all: kernel
@@ -507,6 +507,17 @@ qemu-loop-smoke: $(BUILD_DIR)/joeos-fb.iso
 	  || (echo "FAIL: serial log does not contain the exact ordered loop sequence"; \
 	      echo "expected: FR:0 FR:1 FR:2 FR:3 RING: 1 FB: 1 Hello World from JOE!"; \
 	      echo "serial log: $$(cat $(BUILD_DIR)/serial-loop.log)"; exit 1)
+
+# gh issue #6 (T06): the framebuffer PIXEL gate. qemu-fb-smoke and
+# qemu-loop-smoke above only assert serial markers — they prove the
+# renderer ran, not that it drew the right pixels at the right memory
+# addresses (fb_xy_addr mixed a pixel offset with a byte address and both
+# gates above still passed). This target boots the FB-mode ISO, takes a
+# QEMU monitor (QMP) screendump once the deterministic 4-frame loop has
+# halted, and checks known render_frame pixels against their expected
+# colour (scripts/run-fb-pixels-smoke.sh + scripts/qemu_fb_pixel_check.py).
+qemu-fb-pixels: $(BUILD_DIR)/joeos-fb.iso
+	bash scripts/run-fb-pixels-smoke.sh
 
 # Phase 2d-1 acceptance gate: boot the GRUB ISO with a VirtIO-net NIC attached
 # and assert the serial log contains, IN ORDER, NET: 1 (PCI found), NET: 2
