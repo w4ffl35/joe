@@ -13,10 +13,13 @@
 # display, and checks the colour of pixels render_frame
 # (kernel/kernel.curlee) is known to draw for the LAST rendered frame
 # (loop index 3, panel_y=100 — render_frame's panel_parity math):
-#   (150,150) panel interior, away from the line and the "JOE" glyphs
+#   (150,150) panel interior, near the panel's own top-left corner
 #   (200,170) on the line drawn OVER the panel (line wins; exercises x AND y)
-#   (300,300) plain background, far from the top-left (catches a stride or
-#             scale error that only misbehaves once x or y grows)
+#   (230,210) panel interior again, close to the panel's FAR corner (large
+#             x AND y) — a stride/scale error that only misbehaves once x
+#             or y grows cannot coincidentally agree with (150,150) too
+#   (300,300) plain background, outside every shape (checks the fix does
+#             not bleed a write into neighbouring, untouched pixels)
 # None of these sit on the "JOE" glyph text (T12: glyph rendering is
 # incomplete, so text pixels are not a reliable oracle).
 #
@@ -37,9 +40,10 @@ PPM="$BUILD/fb-pixels.ppm"
 QEMU_TIMEOUT="${QEMU_FB_PIXELS_TIMEOUT:-25}"
 
 CHECKS=(
-    "150,150,220,80,40"   # panel interior: rgb(220,80,40)
+    "150,150,220,80,40"   # panel interior, near corner: rgb(220,80,40)
     "200,170,40,220,80"   # line drawn over the panel: rgb(40,220,80)
-    "300,300,8,8,12"      # background, far from the top-left: rgb(8,8,12)
+    "230,210,220,80,40"   # panel interior, far corner: rgb(220,80,40)
+    "300,300,8,8,12"      # background, outside every shape: rgb(8,8,12)
 )
 
 if [[ ! -f "$ISO" ]]; then
