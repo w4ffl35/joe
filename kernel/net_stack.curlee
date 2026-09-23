@@ -75,18 +75,23 @@
 // Big-endian byte helpers (the ns_wr16/ns_wr32 byte-extraction pattern).
 // ---------------------------------------------------------------------------
 
-// High byte of a 16-bit value (ns_wr16 p[0]).
-fn be16_hi(v: Int) -> Int {
+// High byte of a 16-bit value (ns_wr16 p[0]). ensures lets callers store
+// the result into a U8 element without a further narrowing-store proof:
+// `& 255` already puts it in range, this just states that fact.
+fn be16_hi(v: Int) -> Int
+  [ ensures result >= 0 && result < 256; ] {
   return (v >> 8) & 255;
 }
 
 // Low byte of a 16-bit value (ns_wr16 p[1]).
-fn be16_lo(v: Int) -> Int {
+fn be16_lo(v: Int) -> Int
+  [ ensures result >= 0 && result < 256; ] {
   return v & 255;
 }
 
 // Byte k (0..3, big-endian) of a 32-bit value (ns_wr32 p[k]).
-fn be32_k(v: Int, k: Int) -> Int {
+fn be32_k(v: Int, k: Int) -> Int
+  [ ensures result >= 0 && result < 256; ] {
   if (k == 0) {
     return (v >> 24) & 255;
   } else {
@@ -190,7 +195,8 @@ fn ip_checksum(tcp_len: Int) -> Int {
 
 // "POST /completion HTTP/1.1\r\n" — 27 bytes.
 fn req_sub0_byte(j: Int) -> Int
-  [ requires j >= 0 && j < 28; ] {
+  [ requires j >= 0 && j < 28;
+    ensures result >= 0 && result < 256; ] {
   let arr: [Int; 28] = [0; 28];
   arr[0] = 80;
   arr[1] = 79;
@@ -224,7 +230,8 @@ fn req_sub0_byte(j: Int) -> Int
 
 // "Host: 10.0.2.2:8080\r\n" — 21 bytes.
 fn req_sub1_byte(j: Int) -> Int
-  [ requires j >= 0 && j < 22; ] {
+  [ requires j >= 0 && j < 22;
+    ensures result >= 0 && result < 256; ] {
   let arr: [Int; 22] = [0; 22];
   arr[0] = 72;
   arr[1] = 111;
@@ -252,7 +259,8 @@ fn req_sub1_byte(j: Int) -> Int
 
 // "Content-Type: application/json\r\n" — 32 bytes.
 fn req_sub2_byte(j: Int) -> Int
-  [ requires j >= 0 && j < 33; ] {
+  [ requires j >= 0 && j < 33;
+    ensures result >= 0 && result < 256; ] {
   let arr: [Int; 33] = [0; 33];
   arr[0] = 67;
   arr[1] = 111;
@@ -292,7 +300,8 @@ fn req_sub2_byte(j: Int) -> Int
 
 // "Content-Length: 36\r\n" — 20 bytes.
 fn req_sub3_byte(j: Int) -> Int
-  [ requires j >= 0 && j < 21; ] {
+  [ requires j >= 0 && j < 21;
+    ensures result >= 0 && result < 256; ] {
   let arr: [Int; 21] = [0; 21];
   arr[0] = 67;
   arr[1] = 111;
@@ -320,7 +329,8 @@ fn req_sub3_byte(j: Int) -> Int
 
 // "Connection: close\r\n" — 19 bytes.
 fn req_sub4_byte(j: Int) -> Int
-  [ requires j >= 0 && j < 20; ] {
+  [ requires j >= 0 && j < 20;
+    ensures result >= 0 && result < 256; ] {
   let arr: [Int; 20] = [0; 20];
   arr[0] = 67;
   arr[1] = 111;
@@ -346,7 +356,8 @@ fn req_sub4_byte(j: Int) -> Int
 
 // "\r\n" — the blank line terminating the request header — 2 bytes.
 fn req_sub5_byte(j: Int) -> Int
-  [ requires j >= 0 && j < 3; ] {
+  [ requires j >= 0 && j < 3;
+    ensures result >= 0 && result < 256; ] {
   let arr: [Int; 3] = [0; 3];
   arr[0] = 13;
   arr[1] = 10;
@@ -356,7 +367,8 @@ fn req_sub5_byte(j: Int) -> Int
 
 // The 36-byte wire body: {"tool":"frame_tick","args":[0,1,2]}
 fn req_body_byte(j: Int) -> Int
-  [ requires j >= 0 && j < 37; ] {
+  [ requires j >= 0 && j < 37;
+    ensures result >= 0 && result < 256; ] {
   let arr: [Int; 37] = [0; 37];
   arr[0] = 123;
   arr[1] = 34;
@@ -399,30 +411,41 @@ fn req_body_byte(j: Int) -> Int
 
 // Byte i of the fixed 157-byte request payload (121 header + 36 body).
 // Total and total-by-construction: out-of-range returns 0.
-fn req_payload_byte(i: Int) -> Int {
+fn req_payload_byte(i: Int) -> Int
+  [ ensures result >= 0 && result < 256; ] {
+  // Verifier quirk (matches tcp_frame_byte's own note above): a call
+  // cannot appear directly in a `return` once the function has a
+  // contract to prove — bind it to a `let` first.
   if (i < 0) {
     return 0;
   } else {
     if (i < 27) {
-      return req_sub0_byte(i);
+      let b0: Int = req_sub0_byte(i);
+      return b0;
     } else {
     if (i < 48) {
-      return req_sub1_byte(i - 27);
+      let b1: Int = req_sub1_byte(i - 27);
+      return b1;
     } else {
       if (i < 80) {
-        return req_sub2_byte(i - 48);
+        let b2: Int = req_sub2_byte(i - 48);
+        return b2;
       } else {
         if (i < 100) {
-          return req_sub3_byte(i - 80);
+          let b3: Int = req_sub3_byte(i - 80);
+          return b3;
         } else {
           if (i < 119) {
-            return req_sub4_byte(i - 100);
+            let b4: Int = req_sub4_byte(i - 100);
+            return b4;
           } else {
             if (i < 121) {
-              return req_sub5_byte(i - 119);
+              let b5: Int = req_sub5_byte(i - 119);
+              return b5;
             } else {
               if (i < 157) {
-                return req_body_byte(i - 121);
+                let bb: Int = req_body_byte(i - 121);
+                return bb;
               } else {
                 return 0;
               }
@@ -734,12 +757,18 @@ fn tcp_frame_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int, m5: Int,
   f[3] = 0;
   f[4] = 2;
   f[5] = 2;
-  f[6] = m0;
-  f[7] = m1;
-  f[8] = m2;
-  f[9] = m3;
-  f[10] = m4;
-  f[11] = m5;
+  // m0..m5 (guest MAC) and flags (TCP flags byte) below are unconstrained
+  // Int parameters with no proof they already fit a byte, so the store
+  // is masked with `& 255` — the exact truncation the old compiled C
+  // performed implicitly on an unchecked int -> uint8_t store, so this
+  // changes no runtime behaviour for values already in range and matches
+  // it exactly for values that were not.
+  f[6] = m0 & 255;
+  f[7] = m1 & 255;
+  f[8] = m2 & 255;
+  f[9] = m3 & 255;
+  f[10] = m4 & 255;
+  f[11] = m5 & 255;
   f[12] = 8;
   f[13] = 0;
   // IPv4 header (20 bytes; the ip_byte_ck layout with the checksum filled).
@@ -792,7 +821,7 @@ fn tcp_frame_byte(i: Int, m0: Int, m1: Int, m2: Int, m3: Int, m4: Int, m5: Int,
   f[44] = ack2;
   f[45] = ack3;
   f[46] = 80;   // data offset 5 (5 << 4)
-  f[47] = flags;
+  f[47] = flags & 255;
   f[48] = 255;  // window 0xFFFF
   f[49] = 255;
   f[50] = ck_hi;
