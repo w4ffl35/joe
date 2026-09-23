@@ -46,6 +46,48 @@ loop, `make qemu-serial` prints boot output to the terminal (Ctrl-A X to
 quit). VirtualBox is exercised via `bash scripts/vbox-setup.sh --headless`
 after `make iso`.
 
+### Bundling an application
+
+By default the kernel runs its own built-in demo scene. An external
+application can take over instead:
+
+```sh
+make qemu-app-smoke APP=apps/hello   # boot with apps/hello bundled
+```
+
+`APP=<dir>` is shorthand for `APP_MODULES=<dir>/app.curlee` (the
+one-file-per-app convention `apps/hello` and `apps/noop` follow).
+`APP_MODULES="path1 path2 …"` is the lower-level knob for a multi-file
+app — a space-separated list of `.curlee` files, which may be absolute
+paths outside this tree (`scripts/build-kernel.sh` appends them after
+the kernel's own modules; a missing file is a build error naming it).
+
+An application implements two functions:
+
+```
+fn app_init(pm: cap phys.mem) -> Unit    // called once, before the loop
+fn app_frame(pm: cap phys.mem) -> Int    // called each frame; 0 = continue,
+                                          // non-zero = this was the last frame
+```
+
+`main` calls `app_init` once, then `app_frame` in a loop until it
+returns non-zero, then falls through to the kernel's normal halt path
+(unchanged either way) — the built-in demo never runs before `app_init`
+or after the app's last frame, so nothing overwrites what the app left
+on screen. Every app module is concatenated into the same single
+translation unit as the rest of the kernel (see `scripts/build-kernel.sh`
+and `kernel/kernel.curlee`'s `main`), so an app can call any function
+the kernel already defines by name — `fb.curlee`'s blitter
+(`fb_pixel`/`fb_fill_rect`/`fb_blit_asset`/`fb_present`/...) and
+`serial.curlee`'s `putc` included. Reaching either requires the
+`pm: cap phys.mem` capability; an app gets it the same way `main` and
+every kernel function already do — as a plain parameter, threaded down
+from the entry point rather than held globally. Curlee has no weak
+symbols, so a real `app_init`/`app_frame` definition (an app's own, or
+the in-tree `apps/noop` default) is always present; a build-time
+`--define` tells `main` whether to actually run it. See `apps/hello/`
+for a minimal, fully worked example.
+
 ## What it does today
 
 Everything below is proven by the serial markers the project's own smoke

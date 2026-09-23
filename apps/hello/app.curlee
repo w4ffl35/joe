@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// apps/hello — minimal application-slot example.
+//
+// Prints a "HELLO: <n>" frame counter over serial (via kernel/
+// serial.curlee's `putc`, reachable because every app module is
+// concatenated into the same translation unit as the rest of the
+// kernel) for a fixed number of frames, then signals app_frame is
+// done. Demonstrates the whole app interface: app_init resets state
+// once, app_frame does one frame of work and returns 0 to continue or
+// non-zero to stop.
+
+static hello_frame: Int = 0;
+
+fn app_init(pm: cap phys.mem) -> Unit {
+  hello_frame = 0;
+  return;
+}
+
+// "HELLO: <n>\n" — n is a single digit (HELLO_FRAMES stays under 10).
+fn hello_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 72);  // H
+  putc(pm, 69);  // E
+  putc(pm, 76);  // L
+  putc(pm, 76);  // L
+  putc(pm, 79);  // O
+  putc(pm, 58);  // :
+  putc(pm, 32);  // space
+  putc(pm, 48 + n);
+  putc(pm, 10);  // newline
+  return;
+}
+
+fn app_frame(pm: cap phys.mem) -> Int {
+  let n: Int = hello_frame;
+  hello_marker(pm, n);
+  hello_frame = n + 1;
+  if (n >= 4) {
+    return 1;
+  }
+  return 0;
+}

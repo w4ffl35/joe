@@ -63,6 +63,26 @@ MODULES=(
   "$ROOT/kernel/kernel.curlee"
 )
 
+# Application slot: APP_MODULES (space-separated .curlee file paths, may
+# be absolute and outside this tree) are appended after the kernel
+# modules. Curlee has no weak symbols and `--define` only resolves
+# constants inside expressions (no text substitution — see `curlee
+# build --help`), so main()'s app_init/app_frame calls need a real
+# definition every build; when APP_MODULES is empty this falls back to
+# the in-tree no-op app so the build still links.
+if [[ -n "${APP_MODULES:-}" ]]; then
+  APP_FILES=(${APP_MODULES})
+else
+  APP_FILES=("$ROOT/apps/noop/app.curlee")
+fi
+for f in "${APP_FILES[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    echo "build-kernel: error: APP_MODULES file not found: $f" >&2
+    exit 1
+  fi
+done
+MODULES+=("${APP_FILES[@]}")
+
 # Guard: the freestanding codegen cannot handle `import` statements.
 for f in "${MODULES[@]}"; do
   if grep -q '^import ' "$f"; then

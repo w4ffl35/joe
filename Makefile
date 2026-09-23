@@ -59,6 +59,28 @@ BOOT_ASM      := kernel/boot.S
 MB2_SRC       := kernel/mb2.curlee
 LINKER_GRUB   := scripts/linker-grub.ld
 MERGE_SCRIPT  := scripts/build-kernel.sh
+APP_NOOP_SRC  := apps/noop/app.curlee
+
+# Application slot: APP=<dir> is shorthand for APP_MODULES=<dir>/app.curlee
+# (the one-file-per-app convention apps/hello and apps/noop follow);
+# APP_MODULES itself (a space-separated list, set directly) is the lower-
+# level knob build-kernel.sh reads for a multi-file app. APP_BUNDLED tells
+# kernel.curlee's main() at build time whether a real app is bundled (see
+# scripts/build-kernel.sh for why Curlee needs a real app_init/app_frame
+# definition, real app or the in-tree no-op, on every build regardless).
+APP ?=
+APP_MODULES ?= $(if $(strip $(APP)),$(APP)/app.curlee,)
+ifeq ($(strip $(APP_MODULES)),)
+APP_BUNDLED := 0
+else
+APP_BUNDLED := 1
+endif
+APP_DEFINE := --define APP_BUNDLED=$(APP_BUNDLED)
+# make's staleness check is file-mtime based, so switching APP_MODULES
+# between invocations with no source file touched would not otherwise
+# invalidate an already-built kernel-merged.curlee. This stamp file only
+# changes mtime when the APP_MODULES *value* actually changes.
+APP_STAMP := $(BUILD_DIR)/.app-modules-stamp
 
 # Per-build-target static array sizing (gh issue #296): the SAME merged
 # kernel.curlee source declares the large static buffers (fb.curlee's asset
@@ -77,12 +99,14 @@ PVH_DEFINES := --define JOE_PVH_BOOT=1 \
   --define ASSET_REGION_W=1 --define ASSET_REGION_H=1 \
   --define FRAME_RING_SLOTS=1 --define FRAME_RING_MAX_W=1 --define FRAME_RING_MAX_H=1 \
   --define NET_QMEM_PAGES=1 --define NET_RX_BUFS=1 --define NET_TX_BUFS=1 --define NET_BUF_BYTES=1 \
-  --define BLK_QMEM_PAGES=1 --define BLK_DATA_BYTES=1
+  --define BLK_QMEM_PAGES=1 --define BLK_DATA_BYTES=1 \
+  $(APP_DEFINE)
 GRUB_DEFINES := --define JOE_PVH_BOOT=0 \
   --define ASSET_REGION_W=128 --define ASSET_REGION_H=128 \
   --define FRAME_RING_SLOTS=2 --define FRAME_RING_MAX_W=640 --define FRAME_RING_MAX_H=480 \
   --define NET_QMEM_PAGES=9 --define NET_RX_BUFS=2 --define NET_TX_BUFS=2 --define NET_BUF_BYTES=2048 \
-  --define BLK_QMEM_PAGES=9 --define BLK_DATA_BYTES=4096
+  --define BLK_QMEM_PAGES=9 --define BLK_DATA_BYTES=4096 \
+  $(APP_DEFINE)
 CHECK_DEFINES := $(GRUB_DEFINES)
 # Curlee runtime (crt0.S, linker.ld, rt.c, libgcc32_helpers.c) lives at the
 # source root, not under build/. Prefer CURLEE_ROOT (repo root); otherwise
@@ -110,7 +134,7 @@ LD := ld
 
 .PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test mb2-codegen-run iso iso-fb qemu run verify clean \
 	qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
-	qemu-blk-smoke qemu-fb-pixels \
+	qemu-blk-smoke qemu-fb-pixels qemu-app-smoke \
         c-boundary
 
 all: kernel
@@ -122,9 +146,19 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(MERGE_SCRIPT)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(APP_NOOP_SRC) $(APP_MODULES) $(MERGE_SCRIPT) $(APP_STAMP)
 	@mkdir -p $(BUILD_DIR)
-	bash $(MERGE_SCRIPT) $@
+	APP_MODULES="$(APP_MODULES)" bash $(MERGE_SCRIPT) $@
+
+# See APP_STAMP above: only rewritten (new mtime) when APP_MODULES's
+# *value* changes, so a plain `make kernel` with no APP stays fast.
+.PHONY: FORCE_APP_STAMP
+FORCE_APP_STAMP:
+$(APP_STAMP): FORCE_APP_STAMP
+	@mkdir -p $(BUILD_DIR)
+	@if [ ! -f $@ ] || [ "$$(cat $@ 2>/dev/null)" != "$(APP_MODULES)" ]; then \
+	  printf '%s' "$(APP_MODULES)" > $@; \
+	fi
 
 $(KERNEL_ELF): $(MERGED_SRC)
 	@mkdir -p $(BUILD_DIR)
@@ -445,6 +479,26 @@ qemu-smoke: $(BUILD_DIR)/kernel-smoke.elf
 	@grep -q 'Hello World from JOE' $(BUILD_DIR)/serial.log \
 	  && echo "PASS: qemu boot -> serial output: $$(cat $(BUILD_DIR)/serial.log)" \
 	  || (echo "FAIL: expected message not in serial log"; exit 1)
+
+# Application-slot gate: boots kernel-smoke.elf (the PVH `-kernel` path —
+# the app slot has no framebuffer dependency, so this is the fast/simple
+# boot path) with whatever APP=<dir> named on the command line, and
+# asserts apps/hello's own ordered counter markers followed by the
+# kernel's normal halt marker — proving app_init/app_frame ran to
+# completion and control returned to main afterwards. The assertion
+# below is apps/hello-specific (its own known marker text); a different
+# app bundled the same way would need its own target modeled on this
+# one. `make qemu-app-smoke APP=apps/hello` is the documented example.
+qemu-app-smoke: $(BUILD_DIR)/kernel-smoke.elf
+	rm -f $(BUILD_DIR)/serial-app.log
+	@timeout 20 qemu-system-x86_64 -display none -no-reboot -net none \
+	  -serial file:$(BUILD_DIR)/serial-app.log \
+	  -kernel $(BUILD_DIR)/kernel-smoke.elf || true
+	@grep -Pzo 'HELLO: 0\nHELLO: 1\nHELLO: 2\nHELLO: 3\nHELLO: 4\nHello World from JOE!\n' \
+	    $(BUILD_DIR)/serial-app.log > /dev/null \
+	  && echo "PASS: app slot ran to completion -> serial: $$(cat $(BUILD_DIR)/serial-app.log)" \
+	  || (echo "FAIL: serial log does not contain the ordered app + halt sequence"; \
+	      echo "serial log: $$(cat $(BUILD_DIR)/serial-app.log)"; exit 1)
 
 # Phase 2f acceptance gate: boot the PVH kernel (qemu -kernel, kernel-smoke.elf
 # built exactly like kernel.elf with JOE_PVH_BOOT + the Curlee vbe_probe from

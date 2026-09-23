@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// apps/noop — default application-slot filler.
+//
+// Curlee has no weak symbols and no conditional compilation of whole
+// function definitions (`--define` only resolves constants inside
+// expressions, not text substitution), so main()'s app_init/app_frame
+// calls must always resolve to a real definition. build-kernel.sh
+// merges this module in whenever APP_MODULES is empty; APP_BUNDLED is
+// then 0, so main() never actually calls either function below — they
+// exist only so the build still links.
+
+fn app_init(pm: cap phys.mem) -> Unit {
+  return;
+}
+
+fn app_frame(pm: cap phys.mem) -> Int {
+  return 1;
+}
