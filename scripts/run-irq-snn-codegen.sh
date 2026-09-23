@@ -108,7 +108,13 @@ int main(void) {
 }
 EOF
 
+# scripts/host_panic.c supplies curlee_panic: `curlee build` wraps every
+# array access it cannot prove in bounds with curlee_bounds_guard(...),
+# which calls it, and no C shim/kernel runtime links here to provide it
+# otherwise (irq_snn_guard.curlee has no unproven access today, but a
+# future one would otherwise fail to link, not fail loudly at the guard).
 cc -std=c11 -Wall -Wextra -Werror \
   -I"$BUILD" -I"$NIR_C_RUNTIME_ROOT/include" \
-  "$HARNESS" "$NIR_SOURCE" -o "$BUILD/irq_snn_codegen_run"
+  "$HARNESS" "$NIR_SOURCE" "$ROOT/scripts/host_panic.c" \
+  -o "$BUILD/irq_snn_codegen_run"
 "$BUILD/irq_snn_codegen_run"

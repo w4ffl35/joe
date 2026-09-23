@@ -395,9 +395,16 @@ int main(void)
 EOF
 
 # 4. Compile: the codegen probe (freestanding) + the host harness, link host.
+#    scripts/host_panic.c supplies curlee_panic: `curlee build` wraps every
+#    array access it cannot prove in bounds with curlee_bounds_guard(...),
+#    which calls it, and no C shim/kernel runtime links here to provide it
+#    otherwise (mb2.curlee has no unproven access today, but a future one
+#    would otherwise fail to link, not fail loudly at the guard).
 cc -ffreestanding -fno-builtin -nostdlib -std=c11 -c "$BUILD/mb2_codegen_probe.c" -o "$BUILD/mb2_codegen_probe.o"
 cc -ffreestanding -fno-builtin -nostdlib -std=c11 -c "$HARNESS" -o "$BUILD/mb2_codegen_harness.o"
-cc "$BUILD/mb2_codegen_probe.o" "$BUILD/mb2_codegen_harness.o" -o "$BUILD/mb2_codegen_run"
+cc -std=c11 -c "$ROOT/scripts/host_panic.c" -o "$BUILD/mb2_codegen_host_panic.o"
+cc "$BUILD/mb2_codegen_probe.o" "$BUILD/mb2_codegen_harness.o" \
+  "$BUILD/mb2_codegen_host_panic.o" -o "$BUILD/mb2_codegen_run"
 
 if "$BUILD/mb2_codegen_run"; then
   echo "PASS: Curlee mb2_parse walks the multiboot2 structure and extracts the framebuffer tag on the host (no QEMU needed)"

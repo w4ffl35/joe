@@ -159,9 +159,17 @@ int main(void)
 }
 EOF
 
+# scripts/host_panic.c supplies curlee_panic: `curlee build` wraps every
+# array access it cannot prove in bounds with curlee_bounds_guard(...),
+# which calls it, and no C shim/kernel runtime links here to provide it
+# otherwise (json.curlee has no unproven access today, but a future one
+# would otherwise fail to link, not fail loudly at the guard).
 cc -ffreestanding -fno-builtin -nostdlib -std=c11 -c "$BUILD/json_codegen_probe.c" -o "$BUILD/json_codegen_probe.o"
 cc -ffreestanding -fno-builtin -nostdlib -std=c11 -c "$HARNESS" -o "$BUILD/json_codegen_harness.o"
-cc "$BUILD/json_codegen_probe.o" "$BUILD/json_codegen_harness.o" -o "$BUILD/json_codegen_run"
+cc -std=c11 -c "$ROOT/scripts/host_panic.c" \
+  -o "$BUILD/json_codegen_host_panic.o"
+cc "$BUILD/json_codegen_probe.o" "$BUILD/json_codegen_harness.o" \
+  "$BUILD/json_codegen_host_panic.o" -o "$BUILD/json_codegen_run"
 
 if "$BUILD/json_codegen_run"; then
   echo "PASS: full 36-byte locked envelope parses (tool=frame_tick, args=[0,1,2]) on the freestanding codegen path"

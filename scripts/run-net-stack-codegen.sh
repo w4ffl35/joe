@@ -439,9 +439,16 @@ EOF
 
 # 4. Compile: the codegen probe + the host harness (the net state is genuine
 #    Curlee statics inside the probe TU — gh issue #20 — so no C shim links).
+#    scripts/host_panic.c supplies curlee_panic: `curlee build` wraps every
+#    array access it cannot prove in bounds with curlee_bounds_guard(...),
+#    which calls it, and net_stack.curlee's tcp_frame_byte has one such
+#    access (no C shim/kernel runtime links here to provide it otherwise).
 cc -ffreestanding -fno-builtin -nostdlib -std=c11 -c "$BUILD/net_stack_codegen_probe.c" -o "$BUILD/net_stack_codegen_probe.o"
 cc -ffreestanding -fno-builtin -nostdlib -std=c11 -c "$HARNESS" -o "$BUILD/net_stack_codegen_harness.o"
-cc "$BUILD/net_stack_codegen_probe.o" "$BUILD/net_stack_codegen_harness.o" -o "$BUILD/net_stack_codegen_run"
+cc -std=c11 -c "$ROOT/scripts/host_panic.c" \
+  -o "$BUILD/net_stack_codegen_host_panic.o"
+cc "$BUILD/net_stack_codegen_probe.o" "$BUILD/net_stack_codegen_harness.o" \
+  "$BUILD/net_stack_codegen_host_panic.o" -o "$BUILD/net_stack_codegen_run"
 
 if "$BUILD/net_stack_codegen_run"; then
   echo "PASS: net_stack glue stages the exact C wire frames and streams the stub response on the host (no NIC needed)"
