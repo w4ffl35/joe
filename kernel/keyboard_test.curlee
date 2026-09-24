@@ -1,0 +1,243 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// keyboard_test.curlee — VM checks of the scancode decoding in
+// kernel/keyboard_keys.curlee (`make keyboard-run`). feed() repeats the
+// order of kbd_feed() in kernel/keyboard.curlee over statics of its own,
+// since an imported module cannot name the statics of another.
+//
+// Each returned code names the check that failed; 0 means all passed.
+
+import keyboard_keys as k;
+
+// Make codes in scancode set 1 (a break code is the make code plus 128).
+const ESC: Int = 1;      // 0x01
+const ENTER: Int = 28;   // 0x1C
+const KEY_Z: Int = 44;   // 0x2C
+const KEY_X: Int = 45;   // 0x2D
+const KEY_C: Int = 46;   // 0x2E
+const UP: Int = 72;      // 0x48
+const LEFT: Int = 75;    // 0x4B
+const RIGHT: Int = 77;   // 0x4D
+const DOWN: Int = 80;    // 0x50
+const PREFIX: Int = 224; // 0xE0
+const BREAK: Int = 128;
+
+static held: Int = 0;
+static seen: Int = 0;
+static prefix: Int = 0;
+
+fn reset() -> Unit {
+  held = 0;
+  seen = 0;
+  prefix = 0;
+  return;
+}
+
+fn feed(byte: Int) -> Unit {
+  let b: Int = byte & 255;
+  let mask: Int = k.kbd_byte_mask(prefix == 1, b);
+  let held_next: Int = k.kbd_held_after(held & 511, mask, b);
+  let seen_next: Int = k.kbd_seen_after(seen & 511, mask, b);
+  let prefix_next: Int = k.kbd_prefix_after(b);
+  held = held_next;
+  seen = seen_next;
+  prefix = prefix_next;
+  return;
+}
+
+// A plain key going down, and up.
+fn press(code: Int) -> Unit {
+  feed(code);
+  return;
+}
+
+fn release(code: Int) -> Unit {
+  feed(code + BREAK);
+  return;
+}
+
+// The same after the 0xE0 prefix.
+fn press_e0(code: Int) -> Unit {
+  feed(PREFIX);
+  feed(code);
+  return;
+}
+
+fn release_e0(code: Int) -> Unit {
+  feed(PREFIX);
+  feed(code + BREAK);
+  return;
+}
+
+// Each plain key alone sets its own bit on make and clears it on break.
+fn check_plain_keys() -> Int {
+  reset();
+  press(ESC);     if (held != 256) { return 1; }
+  release(ESC);   if (held != 0) { return 2; }
+  press(ENTER);   if (held != 128) { return 3; }
+  release(ENTER); if (held != 0) { return 4; }
+  press(KEY_Z);   if (held != 16) { return 5; }
+  release(KEY_Z); if (held != 0) { return 6; }
+  press(KEY_X);   if (held != 32) { return 7; }
+  release(KEY_X); if (held != 0) { return 8; }
+  press(KEY_C);   if (held != 64) { return 9; }
+  release(KEY_C); if (held != 0) { return 10; }
+  return 0;
+}
+
+// The arrows, and keypad Enter, with the prefix (a PC keyboard's arrows) and
+// the arrows without it (the keypad, NumLock on): the same bits either way.
+fn check_arrows() -> Int {
+  reset();
+  press_e0(UP);       if (held != 1) { return 1; }
+  release_e0(UP);     if (held != 0) { return 2; }
+  press_e0(DOWN);     if (held != 2) { return 3; }
+  release_e0(DOWN);   if (held != 0) { return 4; }
+  press_e0(LEFT);     if (held != 4) { return 5; }
+  release_e0(LEFT);   if (held != 0) { return 6; }
+  press_e0(RIGHT);    if (held != 8) { return 7; }
+  release_e0(RIGHT);  if (held != 0) { return 8; }
+  press_e0(ENTER);    if (held != 128) { return 9; }
+  release_e0(ENTER);  if (held != 0) { return 10; }
+  return check_plain_arrows();
+}
+
+fn check_plain_arrows() -> Int {
+  press(UP);      if (held != 1) { return 11; }
+  release(UP);    if (held != 0) { return 12; }
+  press(DOWN);    if (held != 2) { return 13; }
+  release(DOWN);  if (held != 0) { return 14; }
+  press(LEFT);    if (held != 4) { return 15; }
+  release(LEFT);  if (held != 0) { return 16; }
+  press(RIGHT);   if (held != 8) { return 17; }
+  release(RIGHT); if (held != 0) { return 18; }
+  press_e0(UP);   release(UP);
+  if (held != 0) { return 19; }
+  return 0;
+}
+
+// A code after 0xE0 is not the plain key of the same number: 0xE0 0x2E is
+// Volume Down, not C, and its break code does not release a held C.
+fn check_prefix_is_not_the_plain_key() -> Int {
+  reset();
+  press_e0(KEY_C);
+  if (held != 0 || seen != 0) { return 1; }
+  press(KEY_C);
+  release_e0(KEY_C);
+  if (held != 64) { return 2; }
+  release(KEY_C);
+  if (held != 0) { return 3; }
+  press_e0(KEY_Z);
+  press_e0(ESC);
+  if (held != 0 || seen != 64) { return 4; }
+  return 0;
+}
+
+// The prefix applies to the one byte after it: an unread prefixed code (a
+// fake shift, 0xE0 0x2A) is consumed, and the next byte is plain.
+fn check_prefix_lasts_one_byte() -> Int {
+  reset();
+  press_e0(42);
+  press(KEY_C);
+  if (held != 64) { return 1; }
+  feed(PREFIX);
+  feed(PREFIX);
+  press(UP);
+  if (held != 65) { return 2; }
+  return 0;
+}
+
+// Bytes that are no key change nothing, held keys included.
+fn check_other_bytes() -> Int {
+  reset();
+  press(KEY_Z);
+  press_e0(42);
+  feed(250);
+  feed(170);
+  feed(0);
+  feed(255);
+  feed(225);
+  feed(29);
+  feed(69);
+  feed(225);
+  feed(157);
+  feed(197);
+  if (held != 16 || seen != 16) { return 1; }
+  return 0;
+}
+
+// The latch keeps a key pressed and released between two polls, and only
+// a make code adds to it.
+fn check_seen() -> Int {
+  reset();
+  press(KEY_Z);
+  release(KEY_Z);
+  if (held != 0 || seen != 16) { return 1; }
+  release(KEY_X);
+  if (seen != 16) { return 2; }
+  press_e0(RIGHT);
+  press(KEY_Z);
+  press(KEY_Z);
+  if (held != 24 || seen != 24) { return 3; }
+  seen = 0;
+  release(KEY_Z);
+  if (seen != 0 || held != 8) { return 4; }
+  return 0;
+}
+
+// Keys held together do not disturb each other, and the break code of a
+// key that was never down changes nothing.
+fn check_chords() -> Int {
+  reset();
+  press(KEY_Z);
+  press(KEY_X);
+  press(KEY_C);
+  if (held != 112) { return 1; }
+  release(KEY_X);
+  if (held != 80) { return 2; }
+  release(KEY_X);
+  release(ESC);
+  if (held != 80) { return 3; }
+  press_e0(UP);
+  press_e0(DOWN);
+  release_e0(UP);
+  if (held != 82) { return 4; }
+  return 0;
+}
+
+// Over all 256 bytes, with and without the prefix before them: the prefix
+// byte itself is no key; 18 bytes are keys after no prefix (9 keys, make
+// and break) and 10 after a prefix (5 keys).
+fn check_sweep() -> Int {
+  let plain: Int = 0;
+  let prefixed: Int = 0;
+  for (b in 0..256) {
+    if (k.kbd_byte_mask(false, b) != 0) { plain = plain + 1; }
+    if (k.kbd_byte_mask(true, b) != 0) { prefixed = prefixed + 1; }
+  }
+  if (k.kbd_byte_mask(false, PREFIX) != 0) { return 1; }
+  if (k.kbd_byte_mask(true, PREFIX) != 0) { return 2; }
+  if (plain != 18) { return 3; }
+  if (prefixed != 10) { return 4; }
+  return 0;
+}
+
+fn main() -> Int {
+  let r: Int = check_plain_keys();
+  if (r != 0) { return 10 + r; }
+  r = check_arrows();
+  if (r != 0) { return 30 + r; }
+  r = check_prefix_is_not_the_plain_key();
+  if (r != 0) { return 50 + r; }
+  r = check_prefix_lasts_one_byte();
+  if (r != 0) { return 60 + r; }
+  r = check_other_bytes();
+  if (r != 0) { return 70 + r; }
+  r = check_seen();
+  if (r != 0) { return 80 + r; }
+  r = check_chords();
+  if (r != 0) { return 90 + r; }
+  r = check_sweep();
+  if (r != 0) { return 100 + r; }
+  return 0;
+}

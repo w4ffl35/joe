@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// keyboard.curlee — polled PS/2 keyboard driver (i8042 controller).
+//
+// No interrupts, no timer, nothing blocks: `kbd_poll` reads what the
+// controller has queued and returns, so a caller may call it once per frame
+// or as often as it likes. What the bytes mean, and the bit of each key in
+// the state, is in kernel/keyboard_keys.curlee (merged in before this
+// file). The controller's registers (x86 I/O ports):
+//   DATA   0x60 — read: the next byte from the device
+//   STATUS 0x64 — read: bit 0 (mask 1) = an output byte is waiting;
+//                 bit 5 (mask 32) = that byte is from the mouse port;
+//                 bits 6 and 7 (mask 64, 128) = a timeout or parity error
+//                 on it
+// A byte the status marks as the mouse's or as an error is read, to clear
+// it, and dropped: it is not a scancode. This driver does not reprogram the
+// controller; it relies on what the loader (BIOS, GRUB) leaves: the
+// keyboard enabled and its bytes translated to scancode set 1.
+//
+// State: `kbd_state()` is the keys held down now, as the KBD_* bits of
+// keyboard_keys.curlee. `kbd_take_seen()` is the keys whose make code
+// arrived since it was last called, so that a key pressed and released
+// between two polls is still seen once, though `kbd_state()` never showed
+// it.
+//
+// Each `kbd_poll` reads up to KBD_POLL_MAX bytes, one status read and one
+// data read each, and returns how many it read. Whatever is still queued
+// stays in the controller for the next call, so no byte, and no break
+// code, is lost when more than that are waiting. 16 is what QEMU's
+// keyboard queues, so one call reads everything it can be holding.
+//
+// Design laws honored:
+//   - Single address space, Ring 0: port I/O is direct x86 in/out asm.
+//   - Deterministic verification: `curlee check --strict-loops` passes on
+//     this file with keyboard_keys.curlee, and the merged kernel
+//     re-verifies both (`make check`). The emitted C has no runtime bounds
+//     guard for either module.
+//   - Only the two functions that read a port take the `cap phys.mem`
+//     capability, and their callers mask what they read: a function with a
+//     capability parameter does not pass its `ensures` on to its callers.
+
+// Bytes read by one kbd_poll at most, and by kbd_init to clear stale ones.
+const KBD_POLL_MAX: Int = 16;
+const KBD_DRAIN_MAX: Int = 64;
+
+// The keys held now; the keys whose make code has arrived since
+// kbd_take_seen; 1 while the byte after a 0xE0 is still to come. Each is
+// masked where it is read (no invariant on a static is visible to `check`).
+static kbd_held: Int = 0;
+static kbd_seen: Int = 0;
+static kbd_prefix: Int = 0;
+
+// The controller's status byte and the byte waiting in its data register.
+// Each reads the port once, so a caller sees the status that went with the
+// data it reads next.
+fn kbd_status(pm: cap phys.mem) -> Int
+  [ ensures 0 <= result && result <= 255; ]
+{
+  let status: Int = 0;
+  unsafe {
+    status = port_inb(0x64);
+  }
+  return status;
+}
+
+fn kbd_data(pm: cap phys.mem) -> Int
+  [ ensures 0 <= result && result <= 255; ]
+{
+  let data: Int = 0;
+  unsafe {
+    data = port_inb(0x60);
+  }
+  return data;
+}
+
+// One byte from the keyboard: applies it to the state.
+fn kbd_feed(byte: Int) -> Unit
+  [ requires 0 <= byte && byte <= 255; ]
+{
+  let prefixed: Bool = kbd_prefix == 1;
+  let mask: Int = kbd_byte_mask(prefixed, byte);
+  let held: Int = kbd_held & KBD_ALL;
+  let seen: Int = kbd_seen & KBD_ALL;
+  let held_next: Int = kbd_held_after(held, mask, byte);
+  let seen_next: Int = kbd_seen_after(seen, mask, byte);
+  let prefix_next: Int = kbd_prefix_after(byte);
+  kbd_held = held_next;
+  kbd_seen = seen_next;
+  kbd_prefix = prefix_next;
+  return;
+}
+
+// Reads what the controller has queued, at most KBD_POLL_MAX bytes, and
+// applies each keyboard byte to the state; returns the number of bytes
+// read, 0 when nothing was waiting.
+fn kbd_poll(pm: cap phys.mem) -> Int
+  [ ensures 0 <= result && result <= KBD_POLL_MAX; ]
+{
+  let count: Int = 0;
+  for (i in 0..KBD_POLL_MAX)
+    [ invariant 0 <= count && count <= i; ]
+  {
+    let status: Int = kbd_status(pm);
+    if ((status & 1) == 0) {
+      break;
+    }
+    let byte: Int = kbd_data(pm);
+    if ((status & 224) == 0) {
+      kbd_feed(byte & 255);
+    }
+    count = count + 1;
+  }
+  return count;
+}
+
+// Starts from nothing held: reads and drops whatever the controller
+// already holds (up to KBD_DRAIN_MAX bytes, typed before the driver ran or
+// left by the loader), and clears the state.
+fn kbd_init(pm: cap phys.mem) -> Unit {
+  kbd_held = 0;
+  kbd_seen = 0;
+  kbd_prefix = 0;
+  for (i in 0..KBD_DRAIN_MAX) {
+    let status: Int = kbd_status(pm);
+    if ((status & 1) == 0) {
+      break;
+    }
+    kbd_data(pm);
+  }
+  return;
+}
+
+// The keys held down now, as the KBD_* bits.
+fn kbd_state() -> Int
+  [ ensures 0 <= result && result <= KBD_ALL; ]
+{
+  let held: Int = kbd_held & KBD_ALL;
+  return held;
+}
+
+// The keys whose make code has arrived since the last call, as the KBD_*
+// bits; clears them.
+fn kbd_take_seen() -> Int
+  [ ensures 0 <= result && result <= KBD_ALL; ]
+{
+  let seen: Int = kbd_seen & KBD_ALL;
+  kbd_seen = 0;
+  return seen;
+}

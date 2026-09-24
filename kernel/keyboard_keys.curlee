@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// keyboard_keys.curlee — what the bytes of a PS/2 keyboard mean, for the
+// polled driver in kernel/keyboard.curlee. It has no port I/O and no state,
+// so it is verified standalone (`make check`) and run on the VM
+// (`make keyboard-run`); the driver keeps the state between bytes.
+//
+// The bytes are scancode set 1, the set a PC's controller translates the
+// keyboard's own set to:
+//   - a make code (bit 7 clear) when a key goes down, and the same code
+//     with bit 7 set (the break code) when it goes up;
+//   - 0xE0 before the codes of the keys added to the original 84-key
+//     layout: the arrows, keypad Enter and others. The prefix applies to
+//     the one byte after it, and that code is looked up on its own:
+//     0xE0 0x2E is Volume Down and must not be read as C (0x2E).
+// The keys read, and the bits they set in the key-state field:
+//   bit 0 up     0xE0 0x48 (or 0x48)     bit 4 Z      0x2C
+//   bit 1 down   0xE0 0x50 (or 0x50)     bit 5 X      0x2D
+//   bit 2 left   0xE0 0x4B (or 0x4B)     bit 6 C      0x2E
+//   bit 3 right  0xE0 0x4D (or 0x4D)     bit 7 Enter  0x1C (or 0xE0 0x1C)
+//                                        bit 8 Escape 0x01
+// The arrows are also read without the prefix, which is what the numeric
+// keypad (NumLock on) and some keyboards and emulators send. Every other
+// byte reads as no key: fake shifts (0xE0 0x2A), the Pause sequence
+// (0xE1 ...), the ACK (0xFA) and self-test (0xAA) bytes, and the codes of
+// keys not listed.
+//
+// The functions that take the state so far (`held`, `seen`) and return the
+// state after a byte keep it in range whatever the byte; the state is passed
+// in and out rather than kept here because a module's statics are opaque to
+// the verifier. Their contracts state ranges only. That a make code sets a
+// bit and a break code clears it is checked by `make keyboard-run`, not
+// proven: relating the result of `|`, `&` and `~` to their operands inside
+// a contract makes `curlee check` take minutes.
+
+const KBD_UP: Int = 1;
+const KBD_DOWN: Int = 2;
+const KBD_LEFT: Int = 4;
+const KBD_RIGHT: Int = 8;
+const KBD_Z: Int = 16;
+const KBD_X: Int = 32;
+const KBD_C: Int = 64;
+const KBD_ENTER: Int = 128;
+const KBD_ESC: Int = 256;
+// Every key's bit together.
+const KBD_ALL: Int = 511;
+// The byte that prefixes the codes of the extended keys.
+const KBD_PREFIX: Int = 224;
+
+// The bit of the arrow key with make code `code`, 0 for any other code.
+fn kbd_arrow_mask(code: Int) -> Int
+  [ ensures code != 72 || result == KBD_UP;
+    ensures code != 80 || result == KBD_DOWN;
+    ensures code != 75 || result == KBD_LEFT;
+    ensures code != 77 || result == KBD_RIGHT;
+    ensures code == 72 || code == 80 || code == 75 || code == 77
+            || result == 0; ]
+{
+  let mask: Int = 0;
+  if (code == 72) {
+    mask = KBD_UP;
+  } else if (code == 80) {
+    mask = KBD_DOWN;
+  } else if (code == 75) {
+    mask = KBD_LEFT;
+  } else if (code == 77) {
+    mask = KBD_RIGHT;
+  }
+  return mask;
+}
+
+// The bit of the Z, X or C key with make code `code`, 0 for any other code.
+fn kbd_letter_mask(code: Int) -> Int
+  [ ensures code != 44 || result == KBD_Z;
+    ensures code != 45 || result == KBD_X;
+    ensures code != 46 || result == KBD_C;
+    ensures code == 44 || code == 45 || code == 46 || result == 0; ]
+{
+  let mask: Int = 0;
+  if (code == 44) {
+    mask = KBD_Z;
+  } else if (code == 45) {
+    mask = KBD_X;
+  } else if (code == 46) {
+    mask = KBD_C;
+  }
+  return mask;
+}
+
+// The bit of the Escape or Enter key with make code `code`, 0 for any
+// other code.
+fn kbd_control_mask(code: Int) -> Int
+  [ ensures code != 1 || result == KBD_ESC;
+    ensures code != 28 || result == KBD_ENTER;
+    ensures code == 1 || code == 28 || result == 0; ]
+{
+  let mask: Int = 0;
+  if (code == 1) {
+    mask = KBD_ESC;
+  } else if (code == 28) {
+    mask = KBD_ENTER;
+  }
+  return mask;
+}
+
+// The bit of the key with make code `code`, which came after a 0xE0 byte
+// if `prefixed`: after the prefix only the arrows and keypad Enter are
+// read, and a prefixed code is never taken for the plain key of the same
+// number. A code is at most one of an arrow, a letter and a control key,
+// so the sum of the three masks is the mask.
+fn kbd_key_mask(prefixed: Bool, code: Int) -> Int
+  [ requires 0 <= code && code < 128;
+    ensures 0 <= result && result <= KBD_ALL;
+    ensures code != 72 || result == KBD_UP;
+    ensures prefixed || code != 44 || result == KBD_Z;
+    ensures !prefixed || code != 46 || result == 0;
+    ensures !prefixed || code != 28 || result == KBD_ENTER; ]
+{
+  let arrow: Int = kbd_arrow_mask(code);
+  let letter: Int = kbd_letter_mask(code);
+  let control: Int = kbd_control_mask(code);
+  let mask: Int = arrow + letter + control;
+  if (prefixed) {
+    mask = arrow;
+    if (code == 28) {
+      mask = KBD_ENTER;
+    }
+  }
+  return mask;
+}
+
+// The bit of the key that `byte` makes or breaks, 0 if it is none: the
+// prefix byte itself is no key.
+fn kbd_byte_mask(prefixed: Bool, byte: Int) -> Int
+  [ requires 0 <= byte && byte <= 255;
+    ensures 0 <= result && result <= KBD_ALL;
+    ensures byte != KBD_PREFIX || result == 0; ]
+{
+  let mask: Int = 0;
+  if (byte != KBD_PREFIX) {
+    mask = kbd_key_mask(prefixed, byte & 127);
+  }
+  return mask;
+}
+
+// 1 if the next byte comes after a prefix: only after `byte` is the prefix.
+fn kbd_prefix_after(byte: Int) -> Int
+  [ ensures byte != KBD_PREFIX || result == 1;
+    ensures byte == KBD_PREFIX || result == 0; ]
+{
+  let next: Int = 0;
+  if (byte == KBD_PREFIX) {
+    next = 1;
+  }
+  return next;
+}
+
+// The keys held after `byte`, whose key bit is `mask`: a make code (bit 7
+// clear) sets it and a break code clears it.
+fn kbd_held_after(held: Int, mask: Int, byte: Int) -> Int
+  [ requires 0 <= held && held <= KBD_ALL;
+    requires 0 <= mask && mask <= KBD_ALL;
+    requires 0 <= byte && byte <= 255;
+    ensures 0 <= result && result <= KBD_ALL; ]
+{
+  let next: Int = held | mask;
+  if (byte >= 128) {
+    next = held & (~mask);
+  }
+  return next;
+}
+
+// The keys seen since the latch was last cleared, after `byte`: a make
+// code adds its key and a break code changes nothing.
+fn kbd_seen_after(seen: Int, mask: Int, byte: Int) -> Int
+  [ requires 0 <= seen && seen <= KBD_ALL;
+    requires 0 <= mask && mask <= KBD_ALL;
+    requires 0 <= byte && byte <= 255;
+    ensures 0 <= result && result <= KBD_ALL; ]
+{
+  let next: Int = seen;
+  if (byte < 128) {
+    next = seen | mask;
+  }
+  return next;
+}

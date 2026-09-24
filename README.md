@@ -141,6 +141,50 @@ host, and requires 60 frames per second within 1% over the 10 seconds. The
 KVM runs are skipped, with a message, when `/dev/kvm` is not accessible.
 `make timer-run` runs the clock arithmetic on the VM.
 
+### Keyboard
+
+`kernel/keyboard.curlee` reads the PS/2 keyboard by polling: nothing blocks
+and there are no interrupts, so an application can poll once per frame. It
+calls:
+
+```
+fn kbd_init(pm: cap phys.mem) -> Unit
+    // once: drops queued bytes, clears the state
+fn kbd_poll(pm: cap phys.mem) -> Int
+    // reads up to 16 queued bytes, returns how many
+fn kbd_state() -> Int
+    // the keys held now, as the bits below
+fn kbd_take_seen() -> Int
+    // the keys pressed since the last call; clears them
+```
+
+- **Bits of `kbd_state()`.** up 1, down 2, left 4, right 8, Z 16, X 32,
+  C 64, Enter 128, Escape 256 (`KBD_UP` to `KBD_ESC`). They are raw keys;
+  the driver does not map them to game actions, and its contracts state the
+  bit of each scancode (`kernel/keyboard_keys.curlee`).
+- **Scancodes.** The driver reads scancode set 1, make and break codes,
+  which a PC's controller produces from the keyboard's own codes. The
+  arrows are read both with the `0xE0` prefix a PC keyboard sends and
+  without it, which is what the numeric keypad sends with NumLock on, and
+  keypad Enter counts as Enter. A code after `0xE0` is looked up as an
+  extended key only, so `0xE0 0x2E` (Volume Down) is not read as C
+  (`0x2E`). Bytes that are no listed key change nothing.
+- **Mouse and error bytes.** A byte the controller flags as coming from the
+  mouse port (status bit 5) or as a timeout or parity error (bits 6 and 7)
+  is read, to clear it, and dropped.
+- **Bound.** One `kbd_poll` reads at most 16 bytes, which is how many
+  QEMU's keyboard queues. What is left waits in the controller for the next
+  call, so no break code is lost.
+- **Quick taps.** A key pressed and released between two polls never shows
+  in `kbd_state()`. `kbd_take_seen()` returns it, once.
+- **What it relies on.** The driver does not configure the controller. It
+  expects the BIOS or GRUB to have left the keyboard enabled and its bytes
+  translated to scancode set 1, as SeaBIOS does under QEMU. It has been run
+  under QEMU only, not on hardware.
+
+`make keyboard-run` runs the decoding on the VM, including a sweep of all 256
+bytes.
+
 ## What it does today
 
 Everything below is proven by the serial markers the project's own smoke
@@ -172,6 +216,9 @@ gates assert. Serial (COM1) is the authoritative console.
   envelope `{"tool":"frame_tick","args":[0,1,2]}`); pointing it at a real
   llama.cpp server is documented but intentionally not part of the
   deterministic gate. The gate needs host port 8080 free.
+- **Polled PS/2 keyboard** (`kernel/keyboard.curlee`): `kbd_state()` is a
+  bit field of nine keys (arrows, Z, X, C, Enter, Escape); the decoding runs
+  on the VM (`make keyboard-run`).
 - **Polled frame clock** (`kernel/timer.curlee`): PIT channel 0,
   microsecond `timer_now`/`timer_wait_until`, no interrupts; `apps/pace`
   runs 600 frames at 60 Hz on it and `make qemu-pace-smoke` measures the

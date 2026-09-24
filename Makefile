@@ -40,6 +40,9 @@ TIMER_SRC     := kernel/timer.curlee
 TIMER_TEST    := kernel/timer_test.curlee
 VGA_SETUP_SRC := kernel/vga_setup.curlee
 VBE_SRC       := kernel/vbe.curlee
+KEYBOARD_KEYS_SRC := kernel/keyboard_keys.curlee
+KEYBOARD_SRC  := kernel/keyboard.curlee
+KEYBOARD_TEST := kernel/keyboard_test.curlee
 VIRTIO_NET_SRC := kernel/virtio_net.curlee
 E1000_SRC     := kernel/e1000.curlee
 IRQ_SNN_GUARD_SRC := kernel/irq_snn_guard.curlee
@@ -138,7 +141,7 @@ CC := cc
 AS := as
 LD := ld
 
-.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run mb2-codegen-run iso iso-fb qemu run verify clean \
+.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run keyboard-run mb2-codegen-run iso iso-fb qemu run verify clean \
 	qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
 	qemu-blk-smoke qemu-fb-pixels qemu-app-smoke qemu-pace-smoke \
         c-boundary
@@ -152,7 +155,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(TIMER_MATH_SRC) $(TIMER_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(APP_NOOP_SRC) $(APP_MODULES) $(APP_DATA) $(MERGE_SCRIPT) $(APP_STAMP)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(TIMER_MATH_SRC) $(TIMER_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(KEYBOARD_KEYS_SRC) $(KEYBOARD_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(APP_NOOP_SRC) $(APP_MODULES) $(APP_DATA) $(MERGE_SCRIPT) $(APP_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	APP_MODULES="$(APP_MODULES)" APP_DATA="$(APP_DATA)" bash $(MERGE_SCRIPT) $@
 
@@ -220,7 +223,7 @@ $(KERNEL_ELF): $(MERGED_SRC)
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(TIMER_MATH_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(VIRTIO_BLK_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(TIMER_MATH_SRC) $(VGA_SETUP_SRC) $(KEYBOARD_KEYS_SRC) $(KEYBOARD_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(VIRTIO_BLK_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
@@ -237,6 +240,13 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	# the MERGED TU below (the vbe.curlee precedent).
 	$(CURLEE) check $(TIMER_MATH_SRC)
 	$(CURLEE) check $(VGA_SETUP_SRC)
+	# The polled PS/2 keyboard: the decoding (pure) and the driver that calls
+	# it (checked together, so as one unit) must have every loop and lookup
+	# proven, not guarded at run time.
+	$(CURLEE) check --strict-loops $(KEYBOARD_KEYS_SRC)
+	@mkdir -p $(BUILD_DIR)
+	cat $(KEYBOARD_KEYS_SRC) $(KEYBOARD_SRC) > $(BUILD_DIR)/keyboard-merged.curlee
+	$(CURLEE) check --strict-loops $(BUILD_DIR)/keyboard-merged.curlee
 	# gh issue #14 + #296: the VirtIO-net driver is genuine Curlee; its
 	# ring/buffer statics are sized by --define (checked with the full GRUB
 	# define set here) and its only extern is the runtime curlee_sfence.
@@ -332,6 +342,13 @@ raw-blob-placement-test:
 # (kernel/timer.curlee) needs the hardware, so it only runs under QEMU.
 timer-run: $(TIMER_TEST) $(TIMER_MATH_SRC)
 	$(CURLEE) run --fuel 60000000 $(TIMER_TEST)
+
+# The keyboard's scancode decoding (kernel/keyboard_keys.curlee) is
+# VM-runnable: every key with and without the 0xE0 prefix, the prefix's
+# reach, bytes that are no key, the tap latch and a sweep of all 256 bytes.
+# The port-level driver (kernel/keyboard.curlee) only runs under QEMU.
+keyboard-run: $(KEYBOARD_TEST) $(KEYBOARD_KEYS_SRC)
+	$(CURLEE) run --fuel 1000000 $(KEYBOARD_TEST)
 
 # APP_DATA: the merge script copies an app's data files next to the merged
 # source, and rejects a missing file or two files of one name.
@@ -709,7 +726,7 @@ run: qemu
 # ---------------------------------------------------------------------------
 # Verify (all acceptance gates)
 # ---------------------------------------------------------------------------
-verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run mb2-codegen-run c-boundary kernel
+verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run keyboard-run mb2-codegen-run c-boundary kernel
 	@echo "=== Verification gates ==="
 	@test -s $(KERNEL_ELF) || (echo "FAIL: kernel.elf missing"; exit 1)
 	@objdump -f $(KERNEL_ELF) | grep -q 'start address 0x' && echo "PASS: ELF entry set"
@@ -768,6 +785,10 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' curlee_timer_us_after$$' && echo "PASS: curlee_timer_us_after linked (monotonic clock update)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_timer_now$$' && echo "PASS: curlee_timer_now linked (polled PIT clock)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_timer_wait_until$$' && echo "PASS: curlee_timer_wait_until linked (polled PIT clock)"
+	# The polled PS/2 keyboard (kernel/keyboard.curlee): the poll and the
+	# key-state bit field an application reads.
+	@nm $(KERNEL_ELF) | grep -q ' curlee_kbd_poll$$' && echo "PASS: curlee_kbd_poll linked (polled PS/2 keyboard)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_kbd_state$$' && echo "PASS: curlee_kbd_state linked (key-state bit field)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_probe$$' && echo "PASS: curlee_blk_probe linked (VirtIO block PCI discovery)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_init$$' && echo "PASS: curlee_blk_init linked (VirtIO block queue)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_read_sectors$$' && echo "PASS: curlee_blk_read_sectors linked (raw sector API)"
