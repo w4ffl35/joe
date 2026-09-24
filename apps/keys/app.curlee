@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// apps/keys — echoes the polled keyboard (kernel/keyboard.curlee) on serial.
+//
+// Every frame polls the controller once and prints
+//   KEYS: <hhh>   when the set of held keys changed: the three hex digits
+//                 of kbd_state(), so 001 is up, 010 is Z, 030 is Z and X
+//   TAP: <hhh>    when keys were pressed and released within one poll, so
+//                 that kbd_state() never showed them: the keys, from
+//                 kbd_take_seen()
+// after "KEYS: ready" at start. It does not wait for a timer, so it polls
+// as fast as the machine runs. It returns when Z, X and C are held together
+// (the kernel then prints its halt line), so `make qemu-kbd-smoke` can end
+// the run from the keyboard.
+
+const KEYS_QUIT: Int = 112;
+
+static keys_last: Int = 0;
+
+// Prints the low 12 bits of `v` (0..4095) as 3 lowercase hex digits.
+fn keys_put_hex(pm: cap phys.mem, v: Int) -> Unit
+  [ requires 0 <= v && v < 4096; ]
+{
+  let hundreds: Int = v / 256;
+  let rest: Int = v - hundreds * 256;
+  let tens: Int = rest / 16;
+  let ones: Int = rest - tens * 16;
+  keys_put_digit(pm, hundreds);
+  keys_put_digit(pm, tens);
+  keys_put_digit(pm, ones);
+  return;
+}
+
+fn keys_put_digit(pm: cap phys.mem, d: Int) -> Unit
+  [ requires 0 <= d && d < 16; ]
+{
+  if (d < 10) {
+    putc(pm, 48 + d);
+  } else {
+    putc(pm, 87 + d);
+  }
+  return;
+}
+
+// "KEYS: " or "TAP: " (label) then the value and a newline.
+fn keys_line(pm: cap phys.mem, tap: Bool, v: Int) -> Unit
+  [ requires 0 <= v && v < 4096; ]
+{
+  if (tap) {
+    putc(pm, 84);  // T
+    putc(pm, 65);  // A
+    putc(pm, 80);  // P
+  } else {
+    putc(pm, 75);  // K
+    putc(pm, 69);  // E
+    putc(pm, 89);  // Y
+    putc(pm, 83);  // S
+  }
+  putc(pm, 58);  // :
+  putc(pm, 32);  // space
+  keys_put_hex(pm, v);
+  putc(pm, 10);  // newline
+  return;
+}
+
+fn keys_ready(pm: cap phys.mem) -> Unit {
+  putc(pm, 75);   // K
+  putc(pm, 69);   // E
+  putc(pm, 89);   // Y
+  putc(pm, 83);   // S
+  putc(pm, 58);   // :
+  putc(pm, 32);   // space
+  putc(pm, 114);  // r
+  putc(pm, 101);  // e
+  putc(pm, 97);   // a
+  putc(pm, 100);  // d
+  putc(pm, 121);  // y
+  putc(pm, 10);   // newline
+  return;
+}
+
+fn app_init(pm: cap phys.mem) -> Unit {
+  kbd_init(pm);
+  keys_last = 0;
+  keys_ready(pm);
+  return;
+}
+
+// One poll. Returns 1 once Z, X and C are held together.
+fn app_frame(pm: cap phys.mem) -> Int {
+  kbd_poll(pm);
+  let held: Int = kbd_state();
+  let seen: Int = kbd_take_seen();
+  let tapped: Int = seen & (~held);
+  if (held != keys_last) {
+    keys_line(pm, false, held);
+    keys_last = held;
+  }
+  if (tapped != 0) {
+    keys_line(pm, true, tapped);
+  }
+  if ((held & KEYS_QUIT) == KEYS_QUIT) {
+    return 1;
+  }
+  return 0;
+}

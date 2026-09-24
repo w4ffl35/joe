@@ -182,7 +182,13 @@ fn kbd_take_seen() -> Int
   translated to scancode set 1, as SeaBIOS does under QEMU. It has been run
   under QEMU only, not on hardware.
 
-`make keyboard-run` runs the decoding on the VM, including a sweep of all 256
+`make qemu-kbd-smoke` bundles `apps/keys`, which prints `KEYS: <hhh>` (the
+state, in hex) whenever the held keys change and `TAP: <hhh>` for keys
+tapped within one poll. It boots the PVH `-kernel` image and the text ISO,
+under TCG and, where `/dev/kvm` is accessible, KVM, and sends key events
+through QMP: a held key, two keys, the arrows with and without the prefix,
+Enter, Escape, Volume Down, a tap, and a full 16-byte queue. `make
+keyboard-run` runs the decoding on the VM, including a sweep of all 256
 bytes.
 
 ## What it does today
@@ -217,8 +223,8 @@ gates assert. Serial (COM1) is the authoritative console.
   llama.cpp server is documented but intentionally not part of the
   deterministic gate. The gate needs host port 8080 free.
 - **Polled PS/2 keyboard** (`kernel/keyboard.curlee`): `kbd_state()` is a
-  bit field of nine keys (arrows, Z, X, C, Enter, Escape); the decoding runs
-  on the VM (`make keyboard-run`).
+  bit field of nine keys (arrows, Z, X, C, Enter, Escape); `apps/keys` echoes
+  it on serial and `make qemu-kbd-smoke` drives QEMU's keyboard through QMP.
 - **Polled frame clock** (`kernel/timer.curlee`): PIT channel 0,
   microsecond `timer_now`/`timer_wait_until`, no interrupts; `apps/pace`
   runs 600 frames at 60 Hz on it and `make qemu-pace-smoke` measures the

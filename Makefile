@@ -143,7 +143,7 @@ LD := ld
 
 .PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run keyboard-run mb2-codegen-run iso iso-fb qemu run verify clean \
 	qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
-	qemu-blk-smoke qemu-fb-pixels qemu-app-smoke qemu-pace-smoke \
+	qemu-blk-smoke qemu-fb-pixels qemu-app-smoke qemu-pace-smoke qemu-kbd-smoke \
         c-boundary
 
 all: kernel
@@ -548,6 +548,20 @@ qemu-pace-smoke:
 	$(MAKE) --no-print-directory APP=apps/pace \
 	  $(BUILD_DIR)/kernel-smoke.elf $(ISO)
 	bash scripts/run-pace-smoke.sh
+
+# Keyboard gate: builds apps/keys into the PVH smoke kernel and the text ISO,
+# boots each, and drives QEMU's PS/2 keyboard through QMP
+# (scripts/qemu_kbd_smoke.py): held keys and chords, arrows with and without
+# the 0xE0 prefix, Enter, Escape, keys tapped within one poll and a full
+# controller queue read by one poll. Each boot runs under TCG, and under KVM
+# when /dev/kvm is usable. The sub-make bundles the app whatever APP says.
+qemu-kbd-smoke:
+	$(MAKE) --no-print-directory APP=apps/keys \
+	  $(BUILD_DIR)/kernel-smoke.elf $(ISO)
+	python3 scripts/qemu_kbd_smoke.py --kernel $(BUILD_DIR)/kernel-smoke.elf \
+	  --iso $(ISO) --out-dir $(BUILD_DIR)/kbd-smoke --accel tcg \
+	  $$(if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then echo --accel kvm; \
+	     else echo "kbd-smoke: kvm skipped, /dev/kvm is not usable" >&2; fi)
 
 # Phase 2f acceptance gate: boot the PVH kernel (qemu -kernel, kernel-smoke.elf
 # built exactly like kernel.elf with JOE_PVH_BOOT + the Curlee vbe_probe from
