@@ -347,8 +347,11 @@ timer-run: $(TIMER_TEST) $(TIMER_MATH_SRC)
 # VM-runnable: every key with and without the 0xE0 prefix, the prefix's
 # reach, bytes that are no key, the tap latch and a sweep of all 256 bytes.
 # The port-level driver (kernel/keyboard.curlee) only runs under QEMU.
+# `curlee run` exits 0 whatever main returns, so the result line is checked.
 keyboard-run: $(KEYBOARD_TEST) $(KEYBOARD_KEYS_SRC)
-	$(CURLEE) run --fuel 1000000 $(KEYBOARD_TEST)
+	@out="$$($(CURLEE) run --fuel 1000000 $(KEYBOARD_TEST))" || exit 1; \
+	echo "$(KEYBOARD_TEST): $$out"; \
+	test "$$out" = "curlee run: result 0"
 
 # APP_DATA: the merge script copies an app's data files next to the merged
 # source, and rejects a missing file or two files of one name.
