@@ -140,7 +140,7 @@ LD := ld
 
 .PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run mb2-codegen-run iso iso-fb qemu run verify clean \
 	qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
-	qemu-blk-smoke qemu-fb-pixels qemu-app-smoke \
+	qemu-blk-smoke qemu-fb-pixels qemu-app-smoke qemu-pace-smoke \
         c-boundary
 
 all: kernel
@@ -521,6 +521,16 @@ qemu-app-smoke: $(BUILD_DIR)/kernel-smoke.elf
 	  && echo "PASS: app slot ran to completion -> serial: $$(cat $(BUILD_DIR)/serial-app.log)" \
 	  || (echo "FAIL: serial log does not contain the ordered app + halt sequence"; \
 	      echo "serial log: $$(cat $(BUILD_DIR)/serial-app.log)"; exit 1)
+
+# Frame pacing gate: builds apps/pace into the PVH smoke kernel and the text
+# ISO, boots each under KVM and under TCG, and measures the frame rate on the
+# host by timestamping the app's serial lines (scripts/run-pace-smoke.sh):
+# 60 fps +-1% over 600 frames. KVM runs are skipped with a message when
+# /dev/kvm is not usable. The sub-make bundles the app whatever APP says.
+qemu-pace-smoke:
+	$(MAKE) --no-print-directory APP=apps/pace \
+	  $(BUILD_DIR)/kernel-smoke.elf $(ISO)
+	bash scripts/run-pace-smoke.sh
 
 # Phase 2f acceptance gate: boot the PVH kernel (qemu -kernel, kernel-smoke.elf
 # built exactly like kernel.elf with JOE_PVH_BOOT + the Curlee vbe_probe from

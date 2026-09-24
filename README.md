@@ -100,6 +100,47 @@ the in-tree `apps/noop` default) is always present; a build-time
 `--define` tells `main` whether to actually run it. See `apps/hello/`
 for a minimal, fully worked example.
 
+### Frame pacing timer
+
+The kernel starts a polled clock on PIT channel 0 before `app_init`
+(`kernel/timer.curlee`; no interrupts). An application calls:
+
+```
+fn timer_now(pm: cap phys.mem) -> Int
+    // microseconds since the kernel started the clock
+fn timer_wait_until(pm: cap phys.mem, target: Int) -> Int
+    // spins until timer_now() >= target and returns that reading
+```
+
+- **Unit and cost.** Microseconds. The counter itself ticks every 838 ns
+  (1193182 Hz); a microsecond unit keeps applications independent of that
+  chip. A call is a latch and two port reads plus one multiply, with no
+  division, on the 64-bit and on the 32-bit GRUB build alike.
+- **Non-decreasing.** `timer_now()` never returns less than the call before
+  it. Module-level state is opaque to the verifier, so the contract sits on
+  the pure update (`timer_us_after` in `kernel/timer_math.curlee`:
+  `ensures result >= us`, and at most 54925 us per poll), which is the only
+  place the clock advances. `timer_wait_until` has `ensures result >= target`.
+- **Poll at least once every 54.9 ms.** The counter is 16 bits and wraps
+  every 65536 ticks (54.9 ms), and one counter cannot say how many times it
+  wrapped. A longer gap between two calls is not detected: whole periods are
+  lost (a 60 ms gap counts as 5 ms), the clock stays non-decreasing, and it
+  runs late by the lost time from then on. `timer_wait_until` polls back to
+  back, so it stays inside the limit. An application that calls
+  `timer_now` once per 60 Hz frame is inside it while no frame takes longer
+  than 54.9 ms. The same loss happens if the host stops the virtual CPU for
+  that long.
+- **Pacing.** Take each frame's deadline from a fixed start
+  (`start + n * 1000000 / 60`), not from the end of the previous frame, so
+  one late frame does not push the rest back. `apps/pace` does this.
+
+`make qemu-pace-smoke` bundles `apps/pace` (600 frames at 60 Hz, one
+`PACE: <nnn>` line per frame), boots it under KVM and under TCG on both the
+PVH `-kernel` path and the GRUB ISO, timestamps each line as it reaches the
+host, and requires 60 frames per second within 1% over the 10 seconds. The
+KVM runs are skipped, with a message, when `/dev/kvm` is not accessible.
+`make timer-run` runs the clock arithmetic on the VM.
+
 ## What it does today
 
 Everything below is proven by the serial markers the project's own smoke
@@ -131,6 +172,10 @@ gates assert. Serial (COM1) is the authoritative console.
   envelope `{"tool":"frame_tick","args":[0,1,2]}`); pointing it at a real
   llama.cpp server is documented but intentionally not part of the
   deterministic gate. The gate needs host port 8080 free.
+- **Polled frame clock** (`kernel/timer.curlee`): PIT channel 0,
+  microsecond `timer_now`/`timer_wait_until`, no interrupts; `apps/pace`
+  runs 600 frames at 60 Hz on it and `make qemu-pace-smoke` measures the
+  rate from the host under KVM and TCG.
 - **Verification model:** pure modules are VM-runnable (`make canvas-run`,
   `make net-stack-run`); freestanding paths are proven by host-side codegen
   harnesses (`json-codegen-run`, `net-stack-codegen-run`, `mb2-codegen-run`);

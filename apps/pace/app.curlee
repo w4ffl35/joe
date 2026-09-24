@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// apps/pace — frame pacing example: 600 frames at 60 Hz (10 seconds),
+// each announced on serial as "PACE: <nnn>" with a three digit counter.
+//
+// The kernel starts the polled clock (kernel/timer.curlee) before
+// app_init. Frame n is due at start + n * 10^6 / 60 microseconds, so the
+// deadlines come from one fixed start, not from the end of the previous
+// frame: a late frame does not push the following ones back, and the
+// average rate stays 60 Hz. timer_wait_until returns at once for a
+// frame that is already late.
+//
+// It is a separate app from apps/hello so that hello keeps its short
+// five-line output; `make qemu-pace-smoke` measures the rate from the
+// host by timestamping these lines.
+
+const PACE_FRAMES: Int = 600;
+
+static pace_frame: Int = 0;
+static pace_start: Int = 0;
+
+fn app_init(pm: cap phys.mem) -> Unit {
+  pace_frame = 0;
+  pace_start = timer_now(pm);
+  return;
+}
+
+// Microseconds after `start` at which frame `n` is due: n / 60 seconds
+// is n * 50000 / 3 microseconds.
+fn pace_deadline(start: Int, n: Int) -> Int {
+  return start + (n * 50000) / 3;
+}
+
+// "PACE: <nnn>\n" for n in 0..999.
+fn pace_marker(pm: cap phys.mem, n: Int) -> Unit {
+  putc(pm, 80);  // P
+  putc(pm, 65);  // A
+  putc(pm, 67);  // C
+  putc(pm, 69);  // E
+  putc(pm, 58);  // :
+  putc(pm, 32);  // space
+  let hundreds: Int = n / 100;
+  let rest: Int = n - hundreds * 100;
+  let tens: Int = rest / 10;
+  putc(pm, 48 + hundreds);
+  putc(pm, 48 + tens);
+  putc(pm, 48 + rest - tens * 10);
+  putc(pm, 10);  // newline
+  return;
+}
+
+// One frame: wait for its deadline, announce it. Returns 1 after the
+// last frame.
+fn app_frame(pm: cap phys.mem) -> Int {
+  let n: Int = pace_frame;
+  let due: Int = pace_deadline(pace_start, n);
+  timer_wait_until(pm, due);
+  pace_marker(pm, n);
+  pace_frame = n + 1;
+  if (n + 1 >= PACE_FRAMES) {
+    return 1;
+  }
+  return 0;
+}
