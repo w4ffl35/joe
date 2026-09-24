@@ -27,8 +27,9 @@ from types import TracebackType
 from typing import IO
 
 from qemu_fb_pixel_check import qmp_call
-from qemu_kbd_steps import Step, all_steps
+from qemu_kbd_steps import Step, all_steps, tap
 
+BOOTED = "KEYS: booted"
 READY = "KEYS: ready"
 READY_S = 20.0
 WAIT_S = 5.0
@@ -101,6 +102,14 @@ class Guest:
         return reply
 
     def send(self, step: Step) -> None:
+        if not step.events and step.mouse_dx is None:
+            return
+        if step.mouse_dx is not None:
+            move = {"type": "rel", "data": {"axis": "x",
+                                             "value": step.mouse_dx}}
+            self.call({"execute": "input-send-event",
+                       "arguments": {"events": [move]}})
+            return
         if step.hold_ms is None:
             events = [key_event(key, is_down) for key, is_down in step.events]
             self.call({"execute": "input-send-event",
@@ -124,13 +133,14 @@ class Guest:
             return [], self.mark
         return text[self.mark:end].splitlines(), end
 
-    def wait_ready(self) -> None:
+    def wait_for(self, text: str) -> None:
+        """Waits for `text` on serial and moves the mark past it."""
         deadline = time.monotonic() + READY_S
-        while READY not in self.serial():
+        while text not in self.serial():
             if time.monotonic() > deadline:
-                raise RuntimeError(f"no {READY!r} on serial")
+                raise RuntimeError(f"no {text!r} on serial")
             time.sleep(POLL_S)
-        self.mark = self.serial().index(READY) + len(READY) + 1
+        self.mark = self.serial().index(text) + len(text) + 1
 
 
 def run_step(guest: Guest, step: Step) -> str | None:
@@ -155,7 +165,10 @@ def run_boot(label: str, boot: list[str], out_dir: Path) -> int:
     print(f"kbd-smoke: {label}")
     try:
         with Guest(label, boot, out_dir) as guest:
-            guest.wait_ready()
+            guest.wait_for(BOOTED)
+            guest.send(Step("keys typed before the driver starts",
+                            tap("z", "up"), []))
+            guest.wait_for(READY)
             for step in all_steps():
                 problem = run_step(guest, step)
                 print(f"  {'FAIL' if problem else 'PASS'}: {step.name}")

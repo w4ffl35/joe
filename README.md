@@ -187,7 +187,9 @@ state, in hex) whenever the held keys change and `TAP: <hhh>` for keys
 tapped within one poll. It boots the PVH `-kernel` image and the text ISO,
 under TCG and, where `/dev/kvm` is accessible, KVM, and sends key events
 through QMP: a held key, two keys, the arrows with and without the prefix,
-Enter, Escape, Volume Down, a tap, and a full 16-byte queue. `make
+Enter, Escape, Volume Down, a tap, and a full 16-byte queue. It also sends
+keys while the app waits before starting the driver, and moves the mouse
+after the app has switched its reports on: the driver must drop both. `make
 keyboard-run` runs the decoding on the VM, including a sweep of all 256
 bytes.
 

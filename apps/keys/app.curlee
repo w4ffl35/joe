@@ -8,12 +8,22 @@
 //   TAP: <hhh>    when keys were pressed and released within one poll, so
 //                 that kbd_state() never showed them: the keys, from
 //                 kbd_take_seen()
-// after "KEYS: ready" at start. It does not wait for a timer, so it polls
-// as fast as the machine runs. It returns when Z, X and C are held together
-// (the kernel then prints its halt line), so `make qemu-kbd-smoke` can end
-// the run from the keyboard.
+// after "KEYS: ready" at start. Its frame loop does not wait for the timer,
+// so it polls as fast as the machine runs. It returns when Z, X and C are
+// held together (the kernel then prints its halt line), so `make
+// qemu-kbd-smoke` can end the run from the keyboard.
+//
+// Two things at start exist for that smoke test. It prints "KEYS: booted"
+// and waits half a second before it starts the driver, so that keys sent in
+// that time are bytes the driver finds already queued, and must drop. And it
+// asks the controller to report the mouse, so that mouse bytes arrive on the
+// same data port as the keyboard's: the driver must not read them as keys.
+// A mouse byte is a movement, and a move of 44 counts sends 0x2C, the make
+// code of Z.
 
 const KEYS_QUIT: Int = 112;
+// Microseconds between "KEYS: booted" and starting the driver.
+const KEYS_STALE_WINDOW_US: Int = 500000;
 
 static keys_last: Int = 0;
 
@@ -42,6 +52,17 @@ fn keys_put_digit(pm: cap phys.mem, d: Int) -> Unit
   return;
 }
 
+// "KEYS: " (the label of a line about the keys, whatever it says).
+fn keys_label(pm: cap phys.mem) -> Unit {
+  putc(pm, 75);  // K
+  putc(pm, 69);  // E
+  putc(pm, 89);  // Y
+  putc(pm, 83);  // S
+  putc(pm, 58);  // :
+  putc(pm, 32);  // space
+  return;
+}
+
 // "KEYS: " or "TAP: " (label) then the value and a newline.
 fn keys_line(pm: cap phys.mem, tap: Bool, v: Int) -> Unit
   [ requires 0 <= v && v < 4096; ]
@@ -50,39 +71,70 @@ fn keys_line(pm: cap phys.mem, tap: Bool, v: Int) -> Unit
     putc(pm, 84);  // T
     putc(pm, 65);  // A
     putc(pm, 80);  // P
+    putc(pm, 58);  // :
+    putc(pm, 32);  // space
   } else {
-    putc(pm, 75);  // K
-    putc(pm, 69);  // E
-    putc(pm, 89);  // Y
-    putc(pm, 83);  // S
+    keys_label(pm);
   }
-  putc(pm, 58);  // :
-  putc(pm, 32);  // space
   keys_put_hex(pm, v);
   putc(pm, 10);  // newline
   return;
 }
 
-fn keys_ready(pm: cap phys.mem) -> Unit {
-  putc(pm, 75);   // K
-  putc(pm, 69);   // E
-  putc(pm, 89);   // Y
-  putc(pm, 83);   // S
-  putc(pm, 58);   // :
-  putc(pm, 32);   // space
-  putc(pm, 114);  // r
-  putc(pm, 101);  // e
-  putc(pm, 97);   // a
-  putc(pm, 100);  // d
-  putc(pm, 121);  // y
-  putc(pm, 10);   // newline
+// "KEYS: <word>\n", word being "ready" or "booted" (ready is true).
+fn keys_status(pm: cap phys.mem, ready: Bool) -> Unit {
+  keys_label(pm);
+  if (ready) {
+    putc(pm, 114);  // r
+    putc(pm, 101);  // e
+    putc(pm, 97);   // a
+    putc(pm, 100);  // d
+    putc(pm, 121);  // y
+  } else {
+    putc(pm, 98);   // b
+    putc(pm, 111);  // o
+    putc(pm, 111);  // o
+    putc(pm, 116);  // t
+    putc(pm, 101);  // e
+    putc(pm, 100);  // d
+  }
+  putc(pm, 10);  // newline
+  return;
+}
+
+// Waits (a bounded number of polls) until the controller can take a byte.
+fn keys_wait_input_free(pm: cap phys.mem) -> Unit {
+  for (i in 0..100000) {
+    let status: Int = kbd_status(pm);
+    if ((status & 2) == 0) {
+      break;
+    }
+  }
+  return;
+}
+
+// Command 0xD4 sends the next data byte to the mouse; 0xF4 starts its
+// movement reports. The mouse answers 0xFA, which arrives as a mouse byte.
+fn keys_enable_mouse(pm: cap phys.mem) -> Unit {
+  keys_wait_input_free(pm);
+  unsafe {
+    port_outb(0x64, 0xD4);
+  }
+  keys_wait_input_free(pm);
+  unsafe {
+    port_outb(0x60, 0xF4);
+  }
   return;
 }
 
 fn app_init(pm: cap phys.mem) -> Unit {
+  keys_status(pm, false);
+  let start: Int = timer_now(pm);
+  timer_wait_until(pm, start + KEYS_STALE_WINDOW_US);
   kbd_init(pm);
+  keys_enable_mouse(pm);
   keys_last = 0;
-  keys_ready(pm);
+  keys_status(pm, true);
   return;
 }
 

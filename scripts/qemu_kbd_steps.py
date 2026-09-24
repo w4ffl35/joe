@@ -27,12 +27,14 @@ Event = tuple[str, bool]
 @dataclass(frozen=True)
 class Step:
     """Events sent as one batch (or, with hold_ms, one key pressed by
-    `send-key` and released after that many ms), and the serial lines
-    that must follow, in order, with no others."""
+    `send-key` and released after that many ms; or, with mouse_dx, a mouse
+    move that many counts to the right instead of keys), and the serial
+    lines that must follow, in order, with no others."""
     name: str
     events: list[Event]
     expect: list[str]
     hold_ms: int | None = None
+    mouse_dx: int | None = None
 
 
 def keys_line(value: int) -> str:
@@ -59,6 +61,13 @@ def press_release(name: str, key: str, value: int) -> list[Step]:
     """`key` down sets `value` in the state and keeps it set; up clears."""
     return [Step(f"{name} down", down(key), [keys_line(value)]),
             Step(f"{name} up", up(key), [keys_line(0)])]
+
+
+def stale_steps() -> list[Step]:
+    """Z and up were tapped before the driver started (qemu_kbd_smoke.py
+    sends them between apps/keys' "KEYS: booted" and "KEYS: ready"): the
+    driver drops bytes already queued, so neither is seen."""
+    return [Step("keys queued before kbd_init are dropped", [], [])]
 
 
 def hold_steps() -> list[Step]:
@@ -115,6 +124,18 @@ def tap_steps() -> list[Step]:
     ]
 
 
+def mouse_steps() -> list[Step]:
+    """apps/keys has the controller report the mouse. A move of 44 counts
+    puts the bytes 0x08 0x2C 0x00 on the data port, flagged as the mouse's
+    in the status: 0x2C is Z's make code, so a driver that read them as keys
+    would show Z held. Nothing may change; Z pressed afterwards works."""
+    return [
+        Step("mouse moved 44 right", [], [], mouse_dx=44),
+        Step("Z after the mouse", down("z"), [keys_line(0x010)]),
+        Step("Z released after the mouse", up("z"), [keys_line(0)]),
+    ]
+
+
 def quit_steps() -> list[Step]:
     """Z, X and C together end the app; the kernel prints its halt line."""
     return [Step("Z, X and C together", down("z", "x", "c"),
@@ -122,5 +143,6 @@ def quit_steps() -> list[Step]:
 
 
 def all_steps() -> list[Step]:
-    return (hold_steps() + arrow_steps() + other_key_steps()
-            + tap_steps() + quit_steps())
+    return (stale_steps() + hold_steps() + arrow_steps()
+            + other_key_steps() + tap_steps() + mouse_steps()
+            + quit_steps())
