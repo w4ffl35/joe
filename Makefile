@@ -279,9 +279,20 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	$(CURLEE) check $(CHECK_DEFINES) $(MERGED_SRC)
 	@echo "curlee check: OK (all modules + merged kernel verified)"
 
+# A VM test passes only if `curlee run` prints "result 0": it exits 0 whatever
+# `main` returns, so its exit status says nothing about the test. Usage:
+# $(call vm_test,<test file>[,<extra options for curlee run>]).
+define vm_test
+@out="$$($(CURLEE) run $(2) $(1))" \
+  || { echo "FAIL: curlee run could not run $(1)" >&2; exit 1; }; \
+echo "$(1): $$out"; \
+test "$$out" = "curlee run: result 0" \
+  || { echo "FAIL: $(1) returned '$$out', expected 'curlee run: result 0'" >&2; exit 1; }
+endef
+
 # Pure packer is VM-runnable; assert the deterministic cell math.
 pack-run: $(PACK_SRC)
-	$(CURLEE) run $(PACK_SRC)
+	$(call vm_test,$(PACK_SRC))
 
 # C boundary policy gate (docs/c-boundary-policy.md): no logic in C — only
 # I/O touches and raw memory moves. Fails if a kernel/*.c exceeds the line
@@ -291,12 +302,12 @@ c-boundary:
 
 # Pure renderer math is VM-runnable; assert color/geometry/glyph/asset math.
 canvas-run: $(CANVAS_TEST) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC)
-	$(CURLEE) run $(CANVAS_TEST)
+	$(call vm_test,$(CANVAS_TEST))
 
 # Phase 2d-3: pure JSON/tool-call parser is VM-runnable; assert the scanner
 # phases the VM emitter can execute (see kernel/json_test.curlee's scope note).
 json-run: $(JSON_TEST) $(JSON_SRC)
-	$(CURLEE) run $(JSON_TEST)
+	$(call vm_test,$(JSON_TEST))
 
 # Phase 2d-3: the FULL locked 36-byte envelope (and the [12,34] / [0,-1,2]
 # regression payloads) through the freestanding codegen path — the VM cannot
@@ -310,7 +321,7 @@ json-codegen-run:
 # is VM-runnable; assert the checksums, wire bytes and the HTTP response state
 # machine against the ground truth captured from the former C implementation.
 net-stack-run: $(NET_STACK_TEST) $(NET_STACK_SRC)
-	$(CURLEE) run --fuel 1500000 $(NET_STACK_TEST)
+	$(call vm_test,$(NET_STACK_TEST),--fuel 1500000)
 
 # Phase 2d-2 (gh issue #12): the HOST-SIDE wire proof of the one-shot glue —
 # codegens net_stack.curlee + net_glue.curlee and drives net_connect /
@@ -324,7 +335,7 @@ net-stack-codegen-run:
 
 # Reference fixed-point SNN detector and deterministic FSM behavior.
 irq-snn-guard-run: $(IRQ_SNN_GUARD_TEST) $(IRQ_SNN_GUARD_SRC)
-	$(CURLEE) run --fuel 1000000 $(IRQ_SNN_GUARD_TEST)
+	$(call vm_test,$(IRQ_SNN_GUARD_TEST),--fuel 1000000)
 
 # Row-by-row differential proof against nir-c-runtime: all 8192 bounded
 # logic transitions plus the complete 4x4 controller truth table.
@@ -341,17 +352,14 @@ raw-blob-placement-test:
 # the documented loss when a gap exceeds one period. The port-level driver
 # (kernel/timer.curlee) needs the hardware, so it only runs under QEMU.
 timer-run: $(TIMER_TEST) $(TIMER_MATH_SRC)
-	$(CURLEE) run --fuel 60000000 $(TIMER_TEST)
+	$(call vm_test,$(TIMER_TEST),--fuel 60000000)
 
 # The keyboard's scancode decoding (kernel/keyboard_keys.curlee) is
 # VM-runnable: every key with and without the 0xE0 prefix, the prefix's
 # reach, bytes that are no key, the tap latch and a sweep of all 256 bytes.
 # The port-level driver (kernel/keyboard.curlee) only runs under QEMU.
-# `curlee run` exits 0 whatever main returns, so the result line is checked.
 keyboard-run: $(KEYBOARD_TEST) $(KEYBOARD_KEYS_SRC)
-	@out="$$($(CURLEE) run --fuel 1000000 $(KEYBOARD_TEST))" || exit 1; \
-	echo "$(KEYBOARD_TEST): $$out"; \
-	test "$$out" = "curlee run: result 0"
+	$(call vm_test,$(KEYBOARD_TEST),--fuel 1000000)
 
 # APP_DATA: the merge script copies an app's data files next to the merged
 # source, and rejects a missing file or two files of one name.
