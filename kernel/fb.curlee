@@ -305,6 +305,20 @@ fn fb_wire_draw_target() -> Unit {
   return;
 }
 
+// Byte address of pixel (0, y) on the draw target, for a caller that writes
+// whole rows itself (each pixel is 4 bytes, so pixel x of the row is at
+// address + 4 * x, for x below fb_get_width()). 0 when there is no draw
+// target or y is outside the framebuffer.
+fn fb_target_row(y: Int) -> Int {
+  let base: Int = fb_draw_target;
+  let h: Int = fb_height;
+  if (base == 0 || y < 0 || y >= h) {
+    return 0;
+  }
+  let stride: Int = fb_target_stride;
+  return fb_xy_addr(base, stride, 0, y);
+}
+
 // ---------------------------------------------------------------------------
 // Pixel primitives (all bounds-checked, all writing through the draw target
 // — defense-in-depth over the Curlee geometry layer, which is provably
@@ -502,21 +516,29 @@ fn fb_present(pm: cap phys.mem) -> Unit {
   let pitch: Int = fb_pitch;
   let w: Int = fb_width;
   let h: Int = fb_height;
-  unsafe {
-    let row: Int = 0;
-    while (row < h) {
-      let col: Int = 0;
-      while (col < w) {
-        let sa: Int = fb_xy_addr(base, stride, col, row);
-        let v: U32 = phys_read_u32(sa);
-        let da: Int = fb_xy_addr(addr, pitch, col, row);
-        phys_write_u32(da, v);
-        col = col + 1;
-      }
-      row = row + 1;
-    }
+  let row: Int = 0;
+  while (row < h) {
+    let sa: Int = fb_xy_addr(base, stride, 0, row);
+    let da: Int = fb_xy_addr(addr, pitch, 0, row);
+    fb_copy_row(pm, da, sa, w);
+    row = row + 1;
   }
   fb_ring_advance(pm);
+  return;
+}
+
+// Copies `count` 32bpp pixels from byte address `src` to byte address `dst`.
+// The flip calls it once per row, so the work for a pixel is a load, a
+// store and two additions, with no function call.
+fn fb_copy_row(pm: cap phys.mem, dst: Int, src: Int, count: Int) -> Unit {
+  unsafe {
+    let i: Int = 0;
+    while (i < count) {
+      let v: U32 = phys_read_u32(src + i * 4);
+      phys_write_u32(dst + i * 4, v);
+      i = i + 1;
+    }
+  }
   return;
 }
 

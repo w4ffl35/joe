@@ -100,6 +100,13 @@ the in-tree `apps/noop` default) is always present; a build-time
 `--define` tells `main` whether to actually run it. See `apps/hello/`
 for a minimal, fully worked example.
 
+An app that writes pixels itself, rather than calling the blitter once per
+pixel, gets a row's address from `fb_target_row(y)`: the byte address of
+pixel (0, y) on the current draw target, or 0 when there is no draw target
+or `y` is outside the framebuffer. A pixel is 4 bytes and a row is
+`fb_get_width()` pixels. The draw target changes at each `fb_present` (the
+two back buffers alternate), so ask again after a present.
+
 ### Frame pacing timer
 
 The kernel starts a polled clock on PIT channel 0 before `app_init`
