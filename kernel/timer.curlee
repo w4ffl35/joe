@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// timer.curlee — a polled clock on PIT channel 0. No interrupts.
+//
+//   timer_init(pm)             program the PIT, start the clock at 0
+//   timer_now(pm)              microseconds since timer_init
+//   timer_wait_until(pm, t)    spin until timer_now() >= t, return it
+//
+// Hardware. Channel 0 of the 8253/8254 counts down at 1193182 Hz, one
+// tick every 838 ns. timer_init sets it to mode 2 (rate generator) with
+// reload 0, which the chip reads as 65536, so the counter runs
+// 65536 .. 1 and starts over every 54.9 ms. A read is a latch command on
+// port 0x43 and two byte reads of port 0x40.
+//
+// Resolution. The counter changes every 838 ns; timer_now() reports
+// whole microseconds. The unit is microseconds because that is what a
+// game loop reasons in (a 60 Hz frame is 16666.7 us) and it does not
+// tie callers to this chip's tick. The tick-to-us conversion is one
+// multiply and a split at bit 32 (kernel/timer_math.curlee), so a poll
+// costs the three port accesses plus a few dozen instructions and no
+// division. On the 32-bit GRUB build the 64-bit multiply and the shifts
+// compile to inline instructions; no libgcc helper is called.
+//
+// Monotonic. The clock only moves through timer_us_after(), whose
+// contract is `result >= us`, so two calls never return a smaller value
+// the second time. Its second bound, at most 54925 us per poll, follows
+// from the 16-bit counter.
+//
+// Polling limit. A 16-bit counter cannot say how many times it wrapped
+// between two reads. timer_now() takes the distance from the previous
+// read modulo 65536, so the clock is exact only if the gap between two
+// calls is under one period: 65536 ticks, 54.9 ms. A longer gap is not
+// detected. The clock loses whole periods (a 60 ms gap counts as 5 ms),
+// stays monotonic, and runs late by the lost time from then on; deadlines
+// are measured on that clock, so a frame schedule slips by the same
+// amount and keeps its rate. An application that polls once per 60 Hz
+// frame (16.7 ms) is inside the limit while no frame takes longer than
+// 54.9 ms. The same loss happens if the host stops the virtual CPU for
+// that long while the PIT keeps running. timer_wait_until polls back to
+// back (a few microseconds apart), far inside the limit.
+//
+// Verification. Module-level statics are opaque to the verifier, so the
+// monotonic contract sits on the pure update in timer_math.curlee, and
+// timer_now stores and returns its result. timer_wait_until proves that
+// it returns only once the target is reached. This file is verified
+// through the merged kernel, like vbe.curlee.
+
+static timer_last: Int = 0;
+static timer_frac: Int = 0;
+static timer_us: Int = 0;
+
+// Latch channel 0 and read its 16-bit count (a down-counter).
+fn timer_read_count(pm: cap phys.mem) -> Int {
+  unsafe {
+    port_outb(0x43, 0);
+    let lo: U8 = port_inb(0x40);
+    let hi: U8 = port_inb(0x40);
+    return lo + hi * 256;
+  }
+}
+
+// Channel 0, lobyte/hibyte access, mode 2, binary counting (0x34), then
+// the reload value 0 (65536). The clock starts at 0 from the first read.
+fn timer_init(pm: cap phys.mem) -> Unit {
+  unsafe {
+    port_outb(0x43, 0x34);
+    port_outb(0x40, 0);
+    port_outb(0x40, 0);
+  }
+  timer_last = timer_read_count(pm);
+  timer_frac = 0;
+  timer_us = 0;
+  return;
+}
+
+// Microseconds since timer_init. Call at least once per 54.9 ms.
+fn timer_now(pm: cap phys.mem) -> Int {
+  let count: Int = timer_read_count(pm);
+  let us: Int = timer_us_after(timer_us, timer_frac, timer_last, count);
+  let frac: Int = timer_frac_after(timer_frac, timer_last, count);
+  timer_us = us;
+  timer_frac = frac;
+  timer_last = count;
+  return us;
+}
+
+// Spin until timer_now() reaches `target` and return that reading. It
+// returns at once when the target has passed, and it never returns early.
+fn timer_wait_until(pm: cap phys.mem, target: Int) -> Int
+  [ ensures result >= target; ] {
+  while (true) {
+    let now: Int = timer_now(pm);
+    if (now >= target) {
+      return now;
+    }
+  }
+}

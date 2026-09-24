@@ -765,8 +765,10 @@ fn run_demo(pm: cap phys.mem) -> Unit {
 // it signals done. app_init/app_frame always have a real definition —
 // a real app's, or the in-tree no-op default — since Curlee has no weak
 // symbols (see scripts/build-kernel.sh); README.md documents the
-// interface in full.
+// interface in full. The polled clock (kernel/timer.curlee) is started
+// first, so an app can call timer_now/timer_wait_until from app_init on.
 fn run_app(pm: cap phys.mem) -> Unit {
+  timer_init(pm);
   app_init(pm);
   let app_done: Int = 0;
   while (app_done == 0) {

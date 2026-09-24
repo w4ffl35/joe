@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// timer_test.curlee — VM checks of the clock arithmetic in
+// kernel/timer_math.curlee (`make timer-run`). The real counter is
+// modelled by count_at(t): the PIT counter t ticks after it reads 0
+// (reload 65536), a down-counter that wraps every 65536 ticks. poll()
+// repeats the update order of timer_now() in kernel/timer.curlee.
+//
+// Each returned code names the check that failed; 0 means all passed.
+
+import timer_math as tm;
+
+static clk_us: Int = 0;
+static clk_frac: Int = 0;
+static clk_last: Int = 0;
+static clk_worst: Int = 0;
+
+fn count_at(t: Int) -> Int {
+  return (0 - t) & 65535;
+}
+
+fn poll(t: Int) -> Int {
+  let count: Int = count_at(t);
+  let us: Int = tm.timer_us_after(clk_us, clk_frac, clk_last, count);
+  let frac: Int = tm.timer_frac_after(clk_frac, clk_last, count);
+  clk_us = us;
+  clk_frac = frac;
+  clk_last = count;
+  return us;
+}
+
+fn reset() -> Unit {
+  clk_us = 0;
+  clk_frac = 0;
+  clk_last = count_at(0);
+  clk_worst = 0;
+  return;
+}
+
+fn abs(v: Int) -> Int {
+  if (v < 0) {
+    return 0 - v;
+  }
+  return v;
+}
+
+// Poll at tick `t`; return 1 when the reading went backwards, and record
+// the largest distance from the exact value t * 10^6 / 1193182 (us).
+fn step(t: Int) -> Int {
+  let before: Int = clk_us;
+  let us: Int = poll(t);
+  let err: Int = abs(us - (t * 1000000) / 1193182);
+  if (err > clk_worst) {
+    clk_worst = err;
+  }
+  if (us < before) {
+    return 1;
+  }
+  return 0;
+}
+
+// `polls` polls, `gap` ticks apart. Returns 1 on any backwards step.
+fn run_gap(gap: Int, polls: Int) -> Int {
+  reset();
+  let backwards: Int = 0;
+  let t: Int = 0;
+  for (i in 0..polls) {
+    t = t + gap;
+    backwards = backwards + step(t);
+  }
+  return backwards;
+}
+
+// One poll per 60 Hz frame: 600 frames, 10 s, gaps of 19886 or 19887.
+fn run_frames() -> Int {
+  reset();
+  let backwards: Int = 0;
+  for (n in 1..601) {
+    backwards = backwards + step((n * 1193182) / 60);
+  }
+  return backwards;
+}
+
+// The ticks that pass between two polls, over a wrap and beyond it.
+fn check_elapsed() -> Int {
+  if (tm.timer_elapsed(1000, 400) != 600) { return 1; }
+  if (tm.timer_elapsed(100, 65500) != 136) { return 2; }
+  if (tm.timer_elapsed(0, 65535) != 1) { return 3; }
+  if (tm.timer_elapsed(7, 7) != 0) { return 4; }
+  if (tm.timer_elapsed(0, 1) != 65535) { return 5; }
+  return 0;
+}
+
+// A gap of a whole period or more is not seen: only the remainder is
+// counted (documented in timer.curlee), and the clock never goes back.
+fn check_missed_wrap() -> Int {
+  reset();
+  step(1000);
+  let base: Int = clk_us;
+  let one: Int = poll(1000 + 65536 + 100) - base;
+  if (one < 83 || one > 84) { return 1; }
+  let two: Int = poll(1000 + 65536 + 100 + 131072) - clk_us;
+  if (two != 0) { return 2; }
+  return 0;
+}
+
+fn main() -> Int {
+  let e: Int = check_elapsed();
+  if (e != 0) { return 10 + e; }
+  if (run_gap(1, 2000) != 0) { return 20; }
+  if (clk_worst > 1) { return 21; }
+  if (run_gap(37, 3500) != 0) { return 22; }
+  if (clk_worst > 1) { return 23; }
+  if (run_gap(65535, 200) != 0) { return 30; }
+  if (clk_worst > 1) { return 31; }
+  if (run_frames() != 0) { return 40; }
+  if (clk_worst > 1) { return 41; }
+  if (clk_us < 9999999 || clk_us > 10000000) { return 42; }
+  let m: Int = check_missed_wrap();
+  if (m != 0) { return 50 + m; }
+  return 0;
+}

@@ -13,11 +13,12 @@
 #
 # Order matters (dependencies first): canvas.curlee -> glyphs.curlee ->
 # assets.curlee -> fb.curlee -> json.curlee -> serial.curlee ->
-# vga_setup.curlee -> vbe.curlee -> virtio_net.curlee -> e1000.curlee ->
-# net_stack.curlee -> net_glue.curlee -> mb2.curlee -> kernel.curlee. Each
-# pure module contains NO `main`, so the merged file has exactly one `main`
-# (from kernel.curlee). All modules are already individually verified by
-# `make check` (net_glue.curlee is verified via the merged file too — it
+# timer_math.curlee -> timer.curlee -> vga_setup.curlee -> vbe.curlee ->
+# virtio_net.curlee -> e1000.curlee -> net_stack.curlee -> net_glue.curlee
+# -> mb2.curlee -> kernel.curlee. Each pure module contains NO `main`, so
+# the merged file has exactly one `main` (from kernel.curlee). All modules
+# are already individually verified by `make check` (net_glue.curlee is
+# verified via the merged file too — it
 # calls net_stack.curlee's + (since gh issue #14) virtio_net.curlee's
 # functions; fb.curlee is standalone-checkable because it inlines its ring/
 # geometry constants rather than calling assets.curlee — the C-#define
@@ -42,6 +43,8 @@ MODULES=(
   "$ROOT/kernel/fb.curlee"
   "$ROOT/kernel/json.curlee"
   "$ROOT/kernel/serial.curlee"
+  "$ROOT/kernel/timer_math.curlee"
+  "$ROOT/kernel/timer.curlee"
   "$ROOT/kernel/vga_setup.curlee"
   "$ROOT/kernel/vbe.curlee"
   "$ROOT/kernel/virtio_net.curlee"
@@ -126,7 +129,7 @@ done
   echo "// and re-run the merge. When the Curlee codegen import bug is fixed,"
   echo "// this script is deleted and kernel.curlee imports the modules."
   echo "//"
-  echo "// Modules (in dependency order): canvas, glyphs, assets, fb, json, serial, vga_setup, vbe, virtio_net, e1000, irq_snn_guard, net_stack, net_glue, mb2, kernel."
+  echo "// Modules (in dependency order): canvas, glyphs, assets, fb, json, serial, timer_math, timer, vga_setup, vbe, virtio_net, e1000, irq_snn_guard, net_stack, net_glue, mb2, kernel."
   echo
   for f in "${MODULES[@]}"; do
     echo "// ==== $(basename "$f") ===="

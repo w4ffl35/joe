@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: GPL-3.0
+//
+// timer_math.curlee — the arithmetic behind the polled PIT clock in
+// kernel/timer.curlee. It has no port I/O, so it is verified standalone
+// (`make check`) and run on the VM (`make timer-run`).
+//
+// The clock keeps three numbers between polls: `last`, the counter value
+// at the previous poll; `frac`, the sub-microsecond remainder; and `us`,
+// the microseconds counted so far. The PIT counts DOWN, so the ticks that
+// passed since the previous poll are (last - count) modulo 65536.
+//
+// Ticks become microseconds with one multiply and no true division: one
+// tick is 10^6 / 1193182 us, held as the Q32 fixed-point constant below
+// (round(2^32 * 10^6 / 1193182); relative error 1.2e-11). Each poll adds
+// ticks * constant to `frac`. The part above bit 32 is the whole
+// microseconds to add to `us`, and the low 32 bits stay in `frac`, so the
+// rounding of one poll is carried into the next and never accumulates.
+//
+// Every function is total: operands are wrapped into range first, so a
+// stale or out of range `last` or `frac` cannot make a result leave its
+// documented range. (Module-level statics are opaque to the verifier, so
+// this is what lets the contracts hold without a `requires` the caller
+// could not prove.) The wrapping and the split at bit 32 are written as
+// remainder and division by a constant power of two, not as `&` and
+// `>>`: the solver proves the arithmetic form quickly inside the whole
+// kernel, while the bit-vector form of the same shift made `make check`
+// run for minutes. The compiler turns both into shifts and masks, on the
+// 32-bit GRUB build too, without calling a libgcc division helper.
+
+const TIMER_PERIOD: Int = 65536;
+const TIMER_Q32: Int = 4294967296;
+const TIMER_US_PER_TICK_Q32: Int = 3599591090;
+
+// v modulo 2^32, in 0 .. 2^32 - 1 for any v.
+fn timer_mod32(v: Int) -> Int
+  [ ensures result >= 0; ensures result <= 4294967295; ] {
+  let r: Int = v % TIMER_Q32;
+  if (r < 0) {
+    return r + TIMER_Q32;
+  } else {
+    return r;
+  }
+}
+
+// Ticks since the previous poll, modulo one counter period. `count` is
+// the value just read, `last` the value read at the previous poll.
+fn timer_elapsed(last: Int, count: Int) -> Int
+  [ ensures result >= 0; ensures result <= 65535; ] {
+  let d: Int = (last - count) % TIMER_PERIOD;
+  if (d < 0) {
+    return d + TIMER_PERIOD;
+  } else {
+    return d;
+  }
+}
+
+// The Q32 microseconds this poll adds: the carried fraction plus the
+// elapsed ticks. The bound is (2^32 - 1) + 65535 * TIMER_US_PER_TICK_Q32.
+fn timer_acc(frac: Int, last: Int, count: Int) -> Int
+  [ ensures result >= 0; ensures result <= 235903497050445; ] {
+  let carried: Int = timer_mod32(frac);
+  let ticks: Int = timer_elapsed(last, count);
+  return carried + ticks * TIMER_US_PER_TICK_Q32;
+}
+
+// The clock after a poll. This is the only place the clock advances, and
+// its contract is the guarantee timer_now() gives: the reading never
+// decreases, and one poll adds at most one counter period (54925 us).
+fn timer_us_after(us: Int, frac: Int, last: Int, count: Int) -> Int
+  [ ensures result >= us; ensures result - us <= 54925; ] {
+  let acc: Int = timer_acc(frac, last, count);
+  return us + acc / TIMER_Q32;
+}
+
+// The fraction to carry into the next poll.
+fn timer_frac_after(frac: Int, last: Int, count: Int) -> Int
+  [ ensures result >= 0; ensures result <= 4294967295; ] {
+  let acc: Int = timer_acc(frac, last, count);
+  return acc % TIMER_Q32;
+}

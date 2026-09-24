@@ -35,6 +35,9 @@ ASSETS_SRC    := kernel/assets.curlee
 FB_SRC        := kernel/fb.curlee
 JSON_SRC      := kernel/json.curlee
 SERIAL_SRC    := kernel/serial.curlee
+TIMER_MATH_SRC := kernel/timer_math.curlee
+TIMER_SRC     := kernel/timer.curlee
+TIMER_TEST    := kernel/timer_test.curlee
 VGA_SETUP_SRC := kernel/vga_setup.curlee
 VBE_SRC       := kernel/vbe.curlee
 VIRTIO_NET_SRC := kernel/virtio_net.curlee
@@ -135,7 +138,7 @@ CC := cc
 AS := as
 LD := ld
 
-.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test mb2-codegen-run iso iso-fb qemu run verify clean \
+.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run mb2-codegen-run iso iso-fb qemu run verify clean \
 	qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
 	qemu-blk-smoke qemu-fb-pixels qemu-app-smoke \
         c-boundary
@@ -149,7 +152,7 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(APP_NOOP_SRC) $(APP_MODULES) $(APP_DATA) $(MERGE_SCRIPT) $(APP_STAMP)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(TIMER_MATH_SRC) $(TIMER_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(APP_NOOP_SRC) $(APP_MODULES) $(APP_DATA) $(MERGE_SCRIPT) $(APP_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	APP_MODULES="$(APP_MODULES)" APP_DATA="$(APP_DATA)" bash $(MERGE_SCRIPT) $@
 
@@ -217,7 +220,7 @@ $(KERNEL_ELF): $(MERGED_SRC)
 # ---------------------------------------------------------------------------
 # kernel.curlee is only valid when merged (it calls helpers from the modules),
 # so `check` verifies the modules standalone + the merged kernel.
-check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(VIRTIO_BLK_SRC) $(MERGED_SRC)
+check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(TIMER_MATH_SRC) $(VGA_SETUP_SRC) $(VIRTIO_NET_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(VIRTIO_BLK_SRC) $(MERGED_SRC)
 	$(CURLEE) check $(PACK_SRC)
 	$(CURLEE) check $(CANVAS_SRC)
 	$(CURLEE) check $(GLYPHS_SRC)
@@ -229,6 +232,10 @@ check: $(PACK_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SR
 	$(CURLEE) check $(CHECK_DEFINES) $(FB_SRC)
 	$(CURLEE) check $(JSON_SRC)
 	$(CURLEE) check $(SERIAL_SRC)
+	# The polled PIT clock: its arithmetic is pure and standalone-checkable;
+	# kernel/timer.curlee calls it, so the port-level driver verifies through
+	# the MERGED TU below (the vbe.curlee precedent).
+	$(CURLEE) check $(TIMER_MATH_SRC)
 	$(CURLEE) check $(VGA_SETUP_SRC)
 	# gh issue #14 + #296: the VirtIO-net driver is genuine Curlee; its
 	# ring/buffer statics are sized by --define (checked with the full GRUB
@@ -318,6 +325,13 @@ irq-snn-codegen-run: $(IRQ_SNN_GUARD_SRC)
 # an opaque model blob at a known LBA in a raw VirtIO disk image.
 raw-blob-placement-test:
 	bash scripts/test-raw-blob-placement.sh
+
+# The clock arithmetic (kernel/timer_math.curlee) is VM-runnable: gap sizes
+# from one tick to just under a counter period, a 60 Hz frame cadence, and
+# the documented loss when a gap exceeds one period. The port-level driver
+# (kernel/timer.curlee) needs the hardware, so it only runs under QEMU.
+timer-run: $(TIMER_TEST) $(TIMER_MATH_SRC)
+	$(CURLEE) run --fuel 60000000 $(TIMER_TEST)
 
 # APP_DATA: the merge script copies an app's data files next to the merged
 # source, and rejects a missing file or two files of one name.
@@ -685,7 +699,7 @@ run: qemu
 # ---------------------------------------------------------------------------
 # Verify (all acceptance gates)
 # ---------------------------------------------------------------------------
-verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test mb2-codegen-run c-boundary kernel
+verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run mb2-codegen-run c-boundary kernel
 	@echo "=== Verification gates ==="
 	@test -s $(KERNEL_ELF) || (echo "FAIL: kernel.elf missing"; exit 1)
 	@objdump -f $(KERNEL_ELF) | grep -q 'start address 0x' && echo "PASS: ELF entry set"
@@ -739,6 +753,11 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 	@nm $(KERNEL_ELF) | grep -q ' curlee_irq_guard_next$$' && echo "PASS: curlee_irq_guard_next linked (deterministic FSM)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_irq_snn_logic_step$$' && echo "PASS: curlee_irq_snn_logic_step linked (8192-row truth-table unit)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_irq_snn_logic_spike$$' && echo "PASS: curlee_irq_snn_logic_spike linked (typed Bool event)"
+	# The polled PIT clock (kernel/timer.curlee): the monotonic update and the
+	# two calls an application uses.
+	@nm $(KERNEL_ELF) | grep -q ' curlee_timer_us_after$$' && echo "PASS: curlee_timer_us_after linked (monotonic clock update)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_timer_now$$' && echo "PASS: curlee_timer_now linked (polled PIT clock)"
+	@nm $(KERNEL_ELF) | grep -q ' curlee_timer_wait_until$$' && echo "PASS: curlee_timer_wait_until linked (polled PIT clock)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_probe$$' && echo "PASS: curlee_blk_probe linked (VirtIO block PCI discovery)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_init$$' && echo "PASS: curlee_blk_init linked (VirtIO block queue)"
 	@nm $(KERNEL_ELF) | grep -q ' curlee_blk_read_sectors$$' && echo "PASS: curlee_blk_read_sectors linked (raw sector API)"
