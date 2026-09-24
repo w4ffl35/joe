@@ -83,6 +83,30 @@ for f in "${APP_FILES[@]}"; do
 done
 MODULES+=("${APP_FILES[@]}")
 
+# Application data: APP_DATA (space-separated file paths, may be absolute
+# and outside this tree) is copied next to the merged output. An `ingest`
+# path is relative to the file that declares it and may not leave that
+# file's directory, so an app that ingests arrays (`ingest("tiles.npy")`)
+# needs them beside kernel-merged.curlee. Two files with one name would
+# overwrite each other there, which is a build error.
+APP_DATA_FILES=(${APP_DATA:-})
+declare -A APP_DATA_SEEN=()
+for f in "${APP_DATA_FILES[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    echo "build-kernel: error: APP_DATA file not found: $f" >&2
+    exit 1
+  fi
+  if [[ -n "${APP_DATA_SEEN[$(basename "$f")]:-}" ]]; then
+    echo "build-kernel: error: APP_DATA names $(basename "$f") twice:" >&2
+    echo "  ${APP_DATA_SEEN[$(basename "$f")]} and $f" >&2
+    exit 1
+  fi
+  APP_DATA_SEEN[$(basename "$f")]="$f"
+done
+for f in "${APP_DATA_FILES[@]}"; do
+  cp "$f" "$(dirname "$OUT")/$(basename "$f")"
+done
+
 # Guard: the freestanding codegen cannot handle `import` statements.
 for f in "${MODULES[@]}"; do
   if grep -q '^import ' "$f"; then

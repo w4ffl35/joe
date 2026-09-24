@@ -66,6 +66,13 @@ one-file-per-app convention `apps/hello` and `apps/noop` follow).
 app — a space-separated list of `.curlee` files, which may be absolute
 paths outside this tree (`scripts/build-kernel.sh` appends them after
 the kernel's own modules; a missing file is a build error naming it).
+`APP_DATA="path1 path2 …"` names data files an app reads with `ingest`
+(for example NumPy `.npy` arrays): `scripts/build-kernel.sh` copies them
+next to `build/kernel-merged.curlee`, because an `ingest` path is relative
+to the file that declares it and may not leave that directory. The files are
+prerequisites of the merged file, so changing one rebuilds the kernel; a
+missing file, or two files with one name, is a build error
+(`make app-data-test`).
 
 An application implements two functions:
 

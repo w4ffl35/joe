@@ -70,6 +70,9 @@ APP_NOOP_SRC  := apps/noop/app.curlee
 # definition, real app or the in-tree no-op, on every build regardless).
 APP ?=
 APP_MODULES ?= $(if $(strip $(APP)),$(APP)/app.curlee,)
+# APP_DATA is a space-separated list of data files (the .npy arrays an app
+# reads with `ingest`) that build-kernel.sh copies next to the merged file.
+APP_DATA ?=
 ifeq ($(strip $(APP_MODULES)),)
 APP_BUNDLED := 0
 else
@@ -79,7 +82,7 @@ APP_DEFINE := --define APP_BUNDLED=$(APP_BUNDLED)
 # make's staleness check is file-mtime based, so switching APP_MODULES
 # between invocations with no source file touched would not otherwise
 # invalidate an already-built kernel-merged.curlee. This stamp file only
-# changes mtime when the APP_MODULES *value* actually changes.
+# changes mtime when the APP_MODULES or APP_DATA *value* actually changes.
 APP_STAMP := $(BUILD_DIR)/.app-modules-stamp
 
 # Per-build-target static array sizing (gh issue #296): the SAME merged
@@ -132,7 +135,7 @@ CC := cc
 AS := as
 LD := ld
 
-.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test mb2-codegen-run iso iso-fb qemu run verify clean \
+.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test mb2-codegen-run iso iso-fb qemu run verify clean \
 	qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
 	qemu-blk-smoke qemu-fb-pixels qemu-app-smoke \
         c-boundary
@@ -146,18 +149,18 @@ kernel: $(KERNEL_ELF)
 
 # Merge the pure modules + kernel.curlee into a single-TU file, then verify +
 # codegen it. The merged file depends on the modules so any change re-merges.
-$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(APP_NOOP_SRC) $(APP_MODULES) $(MERGE_SCRIPT) $(APP_STAMP)
+$(MERGED_SRC): $(KERNEL_SRC) $(CANVAS_SRC) $(GLYPHS_SRC) $(ASSETS_SRC) $(FB_SRC) $(JSON_SRC) $(SERIAL_SRC) $(VGA_SETUP_SRC) $(VBE_SRC) $(VIRTIO_NET_SRC) $(VIRTIO_BLK_SRC) $(E1000_SRC) $(IRQ_SNN_GUARD_SRC) $(NET_STACK_SRC) $(NET_GLUE_SRC) $(MB2_SRC) $(APP_NOOP_SRC) $(APP_MODULES) $(APP_DATA) $(MERGE_SCRIPT) $(APP_STAMP)
 	@mkdir -p $(BUILD_DIR)
-	APP_MODULES="$(APP_MODULES)" bash $(MERGE_SCRIPT) $@
+	APP_MODULES="$(APP_MODULES)" APP_DATA="$(APP_DATA)" bash $(MERGE_SCRIPT) $@
 
-# See APP_STAMP above: only rewritten (new mtime) when APP_MODULES's
-# *value* changes, so a plain `make kernel` with no APP stays fast.
+# See APP_STAMP above: only rewritten (new mtime) when APP_MODULES's or
+# APP_DATA's *value* changes, so a plain `make kernel` with no APP stays fast.
 .PHONY: FORCE_APP_STAMP
 FORCE_APP_STAMP:
 $(APP_STAMP): FORCE_APP_STAMP
 	@mkdir -p $(BUILD_DIR)
-	@if [ ! -f $@ ] || [ "$$(cat $@ 2>/dev/null)" != "$(APP_MODULES)" ]; then \
-	  printf '%s' "$(APP_MODULES)" > $@; \
+	@if [ ! -f $@ ] || [ "$$(cat $@ 2>/dev/null)" != "$(APP_MODULES)|$(APP_DATA)" ]; then \
+	  printf '%s' "$(APP_MODULES)|$(APP_DATA)" > $@; \
 	fi
 
 $(KERNEL_ELF): $(MERGED_SRC)
@@ -315,6 +318,11 @@ irq-snn-codegen-run: $(IRQ_SNN_GUARD_SRC)
 # an opaque model blob at a known LBA in a raw VirtIO disk image.
 raw-blob-placement-test:
 	bash scripts/test-raw-blob-placement.sh
+
+# APP_DATA: the merge script copies an app's data files next to the merged
+# source, and rejects a missing file or two files of one name.
+app-data-test:
+	bash scripts/test-app-data.sh
 
 # gh issue #15: the HOST-SIDE proof of the Curlee multiboot2 tag walk
 # (kernel/mb2.curlee, ported from the deleted kernel/mb2.c). The GRUB boot
@@ -677,7 +685,7 @@ run: qemu
 # ---------------------------------------------------------------------------
 # Verify (all acceptance gates)
 # ---------------------------------------------------------------------------
-verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test mb2-codegen-run c-boundary kernel
+verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test mb2-codegen-run c-boundary kernel
 	@echo "=== Verification gates ==="
 	@test -s $(KERNEL_ELF) || (echo "FAIL: kernel.elf missing"; exit 1)
 	@objdump -f $(KERNEL_ELF) | grep -q 'start address 0x' && echo "PASS: ELF entry set"
