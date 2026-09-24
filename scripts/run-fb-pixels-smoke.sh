@@ -15,7 +15,7 @@
 #             or y grows cannot coincidentally agree with (150,150) too
 #   (300,300) plain background, outside every shape (checks the fix does
 #             not bleed a write into neighbouring, untouched pixels)
-# None of these sit on the "JOE" glyph text (T12: glyph rendering is
+# None of these sit on the "JOE" glyph text (the glyph set is
 # incomplete, so text pixels are not a reliable oracle).
 #
 # QMP (not the legacy HMP monitor) is used because it is trivially
