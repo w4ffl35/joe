@@ -29,8 +29,7 @@
 // 16 >> c. A column is SET iff (bits mod (2*value)) >= value, computed with
 // division-free arithmetic: bits - (bits / (2*value)) * (2*value) >= value.
 fn glyph_pixel(ch: Int, col: Int, row: Int) -> Bool
-  [ requires col >= 0 && col < 5; requires row >= 0 && row < 7;
-    ensures true; ] {
+  [ requires col >= 0 && col < 5; requires row >= 0 && row < 7; ] {
   let bits: Int = glyph_row(ch, row);
   if (col == 0) {
     if (bits - (bits / 32) * 32 >= 16) {

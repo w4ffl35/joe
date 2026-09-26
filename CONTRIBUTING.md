@@ -64,8 +64,8 @@ and is configured by `quality.toml`. It needs Python 3.11 or later and no
 build.
 
 ```bash
-make quality      # magic numbers and sizes, from the Curlee checkout
-make quality QUALITY_CHECKS=contracts   # the contract check
+make quality      # contracts, magic numbers and sizes, from the Curlee checkout
+make quality QUALITY_CHECKS=contracts   # one check
 make hooks        # install the pre-commit and commit-msg hooks
 ```
 

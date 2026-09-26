@@ -914,6 +914,6 @@ fn main(pm: cap phys.mem) -> Unit {
 //   high byte = attribute (foreground | background << 4)
 // Pure and total: any Int in, a cell value out.
 fn vga_cell(ch: Int, attr: Int) -> Int
-  [ requires ch >= 0 && ch < 256; ensures true; ] {
+  [ requires ch >= 0 && ch < 256; ] {
   return ch + attr * 256;
 }

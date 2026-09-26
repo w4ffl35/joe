@@ -9,7 +9,7 @@
 // module provides those.
 
 fn vblk_req_header_size() -> Int
-  [ requires true; ensures result == 16; ] {
+  [ ensures result == 16; ] {
   return 16;
 }
 

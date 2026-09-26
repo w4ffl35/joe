@@ -1,10 +1,10 @@
 file apps/keys/app.curlee 158
-file kernel/assets.curlee 396
-file kernel/canvas.curlee 210
+file kernel/assets.curlee 393
+file kernel/canvas.curlee 209
 file kernel/canvas_test.curlee 375
 file kernel/e1000.curlee 213
 file kernel/fb.curlee 726
-file kernel/glyphs.curlee 315
+file kernel/glyphs.curlee 314
 file kernel/json.curlee 692
 file kernel/json_test.curlee 236
 file kernel/kernel.curlee 919

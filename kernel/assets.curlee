@@ -44,8 +44,7 @@
 fn blit_fits(src_w: Int, src_h: Int, dst_x: Int, dst_y: Int,
              fb_w: Int, fb_h: Int) -> Bool
   [ requires src_w >= 0 && src_h >= 0;
-    requires fb_w >= 0 && fb_h >= 0;
-    ensures true; ] {
+    requires fb_w >= 0 && fb_h >= 0; ] {
   if (dst_x >= 0 && dst_y >= 0 &&
       dst_x + src_w <= fb_w && dst_y + src_h <= fb_h) {
     return true;
@@ -58,8 +57,7 @@ fn blit_fits(src_w: Int, src_h: Int, dst_x: Int, dst_y: Int,
 // framebuffer of (fb_w x fb_h). Same gate as blit_fits but for already-sized
 // rects (used by fill/line/text primitives). Total and verified.
 fn dst_fits(x: Int, y: Int, w: Int, h: Int, fb_w: Int, fb_h: Int) -> Bool
-  [ requires w >= 0 && h >= 0; requires fb_w >= 0 && fb_h >= 0;
-    ensures true; ] {
+  [ requires w >= 0 && h >= 0; requires fb_w >= 0 && fb_h >= 0; ] {
   if (x >= 0 && y >= 0 && x + w <= fb_w && y + h <= fb_h) {
     return true;
   } else {
@@ -96,7 +94,7 @@ fn ring_capacity(count: Int, frame_bytes: Int) -> Int {
 // True when `slot` is a valid index into a ring of `count` slots
 // (0 <= slot < count). Total and verified.
 fn ring_valid_slot(slot: Int, count: Int) -> Bool
-  [ requires count > 0; ensures true; ] {
+  [ requires count > 0; ] {
   if (slot >= 0 && slot < count) {
     return true;
   } else {
@@ -245,7 +243,7 @@ fn asset_region_h() -> Int {
 // region — the C side only copies when this returns true (plus its own
 // bounds check). Total and verified.
 fn asset_region_fits(src_w: Int, src_h: Int, dst_x: Int, dst_y: Int) -> Bool
-  [ requires src_w >= 0 && src_h >= 0; ensures true; ] {
+  [ requires src_w >= 0 && src_h >= 0; ] {
   if (dst_x >= 0 && dst_y >= 0 &&
       dst_x + src_w <= 128 && dst_y + src_h <= 128) {
     return true;
@@ -259,8 +257,7 @@ fn asset_region_fits(src_w: Int, src_h: Int, dst_x: Int, dst_y: Int) -> Bool
 fn asset_blit_fits(src_w: Int, src_h: Int, dst_x: Int, dst_y: Int,
                    fb_w: Int, fb_h: Int) -> Bool
   [ requires src_w >= 0 && src_h >= 0;
-    requires fb_w >= 0 && fb_h >= 0;
-    ensures true; ] {
+    requires fb_w >= 0 && fb_h >= 0; ] {
   if (dst_x >= 0 && dst_y >= 0 &&
       dst_x + src_w <= fb_w && dst_y + src_h <= fb_h) {
     return true;
@@ -355,7 +352,7 @@ fn frame_ring_slot_bytes() -> Int {
 // slot (FRAME_RING_MAX_W x FRAME_RING_MAX_H). Gates fb_present's flip:
 // the ring only activates when every slot can hold the active surface.
 fn frame_ring_fits(fb_w: Int, fb_h: Int) -> Bool
-  [ requires fb_w >= 0 && fb_h >= 0; ensures true; ] {
+  [ requires fb_w >= 0 && fb_h >= 0; ] {
   if (fb_w <= 640 && fb_h <= 480) {
     return true;
   } else {

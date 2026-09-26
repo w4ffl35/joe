@@ -11,21 +11,21 @@
 // This module provides the constants and two pure predicates to distinguish read vs write.
 
 fn vblk_req_type_read() -> Int
-  [ requires true; ensures result == 0; ] {
+  [ ensures result == 0; ] {
   return 0;
 }
 
 fn vblk_req_type_write() -> Int
-  [ requires true; ensures result == 1; ] {
+  [ ensures result == 1; ] {
   return 1;
 }
 
 fn vblk_is_read_request(t: Int) -> Bool
-  [ requires true; ensures result == (t == 0); ] {
+  [ ensures result == (t == 0); ] {
   return t == 0;
 }
 
 fn vblk_is_write_request(t: Int) -> Bool
-  [ requires true; ensures result == (t == 1); ] {
+  [ ensures result == (t == 1); ] {
   return t == 1;
 }

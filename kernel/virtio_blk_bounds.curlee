@@ -11,7 +11,7 @@
 // Whether a read of `count` sectors at LBA `sector` fits within a device of
 // `capacity` sectors.
 fn vblk_read_in_bounds(sector: Int, count: Int, capacity: Int) -> Bool
-  [ requires true; ensures result == (sector >= 0 && count > 0 && sector + count <= capacity); ] {
+  [ ensures result == (sector >= 0 && count > 0 && sector + count <= capacity); ] {
   return sector >= 0 && count > 0 && sector + count <= capacity;
 }
 

@@ -863,11 +863,8 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 # --- Source quality checks (checker lives in the Curlee compiler repo) ---
-# See CONTRIBUTING.md. Contracts are left out of the default set until the
-# 22 functions with `requires true` / `ensures true` are given real contracts
-# (the tool cannot ledger a vacuous clause); run them with
-# `make quality QUALITY_CHECKS=contracts`.
-QUALITY_CHECKS ?= magic sizes
+# See CONTRIBUTING.md. `make quality QUALITY_CHECKS=contracts` runs one check.
+QUALITY_CHECKS ?= contracts magic sizes
 QUALITY_ROOT := $(or $(CURLEE_ROOT),$(wildcard ../curlee),$(shell dirname "$$(dirname "$$(dirname "$$(bash scripts/find-curlee.sh 2>/dev/null)")")" 2>/dev/null))
 
 quality:
