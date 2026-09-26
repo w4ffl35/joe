@@ -751,7 +751,13 @@ run: qemu
 # ---------------------------------------------------------------------------
 # Verify (all acceptance gates)
 # ---------------------------------------------------------------------------
-verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run keyboard-run mb2-codegen-run c-boundary kernel
+# The differential gate irq-snn-codegen-run compares generated Curlee C with
+# the private Capsize-Games/nir-c-runtime checkout (NIR_C_RUNTIME_ROOT), which
+# public CI cannot fetch. CI sets SKIP_NIR_GATE=1; a local `make verify` and
+# `make irq-snn-codegen-run` still run it and fail closed without the checkout.
+IRQ_SNN_CODEGEN_GATE := $(if $(SKIP_NIR_GATE),,irq-snn-codegen-run)
+
+verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run $(IRQ_SNN_CODEGEN_GATE) raw-blob-placement-test app-data-test timer-run keyboard-run mb2-codegen-run c-boundary kernel
 	@echo "=== Verification gates ==="
 	@test -s $(KERNEL_ELF) || (echo "FAIL: kernel.elf missing"; exit 1)
 	@objdump -f $(KERNEL_ELF) | grep -q 'start address 0x' && echo "PASS: ELF entry set"

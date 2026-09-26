@@ -35,9 +35,13 @@ jobs:
           cmake --preset linux-debug
           cmake --build --preset linux-debug
 
+      # SKIP_NIR_GATE: the irq-snn differential gate needs the private
+      # Capsize-Games/nir-c-runtime checkout, which public CI cannot fetch;
+      # it still runs in a local `make verify`.
       - name: Static verify gates (check, VM tests, C-boundary, kernel build)
         env:
           CURLEE: ${{ github.workspace }}/curlee/build/linux-debug/curlee
+          SKIP_NIR_GATE: "1"
         run: make verify
 
       - name: Boot smoke (QEMU, primary path)
