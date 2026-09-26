@@ -80,7 +80,7 @@ fn blue(c: Int) -> Int {
 // (x, y) and size is (w, h). Half-open: right/bottom edges exclusive,
 // matching the blitter's loops. Total and verified.
 fn rect_contains(x: Int, y: Int, w: Int, h: Int, px: Int, py: Int) -> Bool
-  [ requires w >= 0 && h >= 0; ensures true; ] {
+  [ requires w >= 0 && h >= 0; ] {
   if (px >= x && px < x + w && py >= y && py < y + h) {
     return true;
   } else {
@@ -92,8 +92,7 @@ fn rect_contains(x: Int, y: Int, w: Int, h: Int, px: Int, py: Int) -> Bool
 // (bx, by, bw, bh). Total and verified.
 fn rect_covers(ax: Int, ay: Int, aw: Int, ah: Int,
                bx: Int, by: Int, bw: Int, bh: Int) -> Bool
-  [ requires aw >= 0 && ah >= 0; requires bw >= 0 && bh >= 0;
-    ensures true; ] {
+  [ requires aw >= 0 && ah >= 0; requires bw >= 0 && bh >= 0; ] {
   if (bx >= ax && by >= ay && bx + bw <= ax + aw && by + bh <= ay + ah) {
     return true;
   } else {

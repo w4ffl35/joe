@@ -13,12 +13,12 @@ fn vblk_desc_addr(base: Int, s: Int) -> Int
 }
 
 fn vblk_avail_idx_addr(base: Int, size: Int) -> Int
-  [ requires true; ensures result == base + size * 16 + 2; ] {
+  [ ensures result == base + size * 16 + 2; ] {
   return base + size * 16 + 2;
 }
 
 fn vblk_avail_ring_addr(base: Int, size: Int) -> Int
-  [ requires true; ensures result == base + size * 16 + 4; ] {
+  [ ensures result == base + size * 16 + 4; ] {
   return base + size * 16 + 4;
 }
 

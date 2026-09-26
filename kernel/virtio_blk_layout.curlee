@@ -19,19 +19,19 @@
 
 // Type field address: the u32 request type at offset 0 of the request buffer.
 fn vblk_req_type_addr(base: Int) -> Int
-  [ requires true; ensures result == base; ] {
+  [ ensures result == base; ] {
   return base;
 }
 
 // Sector field address: the u64 LBA field at offset 8 of the request buffer.
 fn vblk_req_sector_addr(base: Int) -> Int
-  [ requires true; ensures result == base + 8; ] {
+  [ ensures result == base + 8; ] {
   return base + 8;
 }
 
 // Data buffer address: the 512-byte data region at offset 16 of the request
 // buffer.
 fn vblk_req_data_addr(base: Int) -> Int
-  [ requires true; ensures result == base + 16; ] {
+  [ ensures result == base + 16; ] {
   return base + 16;
 }

@@ -141,7 +141,7 @@ CC := cc
 AS := as
 LD := ld
 
-.PHONY: all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run keyboard-run mb2-codegen-run iso iso-fb qemu run verify clean \
+.PHONY: quality hooks all kernel check pack-run canvas-run json-run json-codegen-run net-stack-run net-stack-codegen-run irq-snn-guard-run irq-snn-codegen-run raw-blob-placement-test app-data-test timer-run keyboard-run mb2-codegen-run iso iso-fb qemu run verify clean \
 	qemu-smoke qemu-fb-smoke qemu-loop-smoke qemu-pvh-fb-smoke qemu-net-smoke qemu-llm-smoke qemu-e1000-smoke \
 	qemu-blk-smoke qemu-fb-pixels qemu-app-smoke qemu-pace-smoke qemu-kbd-smoke \
         c-boundary
@@ -861,3 +861,22 @@ verify: check pack-run canvas-run json-run json-codegen-run net-stack-run net-st
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# --- Source quality checks (checker lives in the Curlee compiler repo) ---
+# See CONTRIBUTING.md. `make quality QUALITY_CHECKS=contracts` runs one check.
+QUALITY_CHECKS ?= contracts magic sizes
+QUALITY_ROOT := $(or $(CURLEE_ROOT),$(wildcard ../curlee),$(shell dirname "$$(dirname "$$(dirname "$$(bash scripts/find-curlee.sh 2>/dev/null)")")" 2>/dev/null))
+
+quality:
+	@test -f "$(QUALITY_ROOT)/scripts/curlee_quality/check.py" || { \
+	  echo "error: Curlee checkout with scripts/curlee_quality not found;" \
+	       "set CURLEE_ROOT to a checkout of w4ffl35/curlee (master)" >&2; \
+	  exit 1; }
+	@for c in $(QUALITY_CHECKS); do \
+	  python3 "$(QUALITY_ROOT)/scripts/curlee_quality/check.py" $$c --root . || exit 1; \
+	done
+
+hooks:
+	@test -f "$(QUALITY_ROOT)/scripts/install-hooks.sh" || { \
+	  echo "error: Curlee checkout not found; set CURLEE_ROOT" >&2; exit 1; }
+	sh "$(QUALITY_ROOT)/scripts/install-hooks.sh"

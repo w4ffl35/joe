@@ -24,6 +24,12 @@ jobs:
           repository: w4ffl35/curlee
           path: curlee
 
+      # Python only: reads the compiler's checker script, needs no build.
+      - name: Source quality checks (sizes, magic numbers)
+        env:
+          CURLEE_ROOT: ${{ github.workspace }}/curlee
+        run: make quality
+
       - name: Install build dependencies
         run: |
           sudo apt-get update

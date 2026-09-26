@@ -16,7 +16,7 @@ fn vblk_next_slot(cur: Int) -> Int
 }
 
 fn vblk_ring_size() -> Int
-  [ requires true; ensures result == 256; ] {
+  [ ensures result == 256; ] {
   return 256;
 }
 
