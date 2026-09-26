@@ -54,6 +54,32 @@ qemu-system-x86_64 is required for the boot gates. VirtualBox
 (`make iso`, `scripts/vbox-setup.sh`) is the secondary boot path and is
 optional for most changes.
 
+## Source quality checks
+
+The limits are 150 lines per file, 20 lines per function, 79 characters per
+line, no numeric literal other than 0, 1 and 2 in a function body or
+contract (name it with a `const`), and a contract on every Curlee function.
+The checker is `scripts/curlee_quality/` in the Curlee compiler repository
+and is configured by `quality.toml`. It needs Python 3.11 or later and no
+build.
+
+```bash
+make quality      # magic numbers and sizes, from the Curlee checkout
+make quality QUALITY_CHECKS=contracts   # the contract check
+make hooks        # install the pre-commit and commit-msg hooks
+```
+
+`make quality` uses the checkout in `$CURLEE_ROOT`, or `../curlee`, or the
+one `scripts/find-curlee.sh` finds. CI runs it before building the compiler.
+
+Existing code that is over a limit is recorded in the ledgers under
+`quality/`. A ledger only shrinks: never add to one to get new code past the
+check. When you improve code, rewrite the ledger with
+`python3 <curlee>/scripts/curlee_quality/check.py <check> --write-debt` and
+commit the smaller ledger. The contract check is not in `make quality` yet:
+22 functions have a `requires true` or `ensures true` clause, which the
+tool rejects and cannot record in a ledger.
+
 ## Code style
 
 - `//` line comments only (Curlee has no `/* */`).

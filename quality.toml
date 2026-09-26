@@ -1,0 +1,18 @@
+[scan]
+dirs = ["kernel", "apps", "scripts"]
+suffixes = [".curlee", ".c", ".h", ".py", ".sh"]
+exclude = ["build", ".worktrees", "__pycache__"]
+
+[limits]
+function_lines = 20
+file_lines = 150
+line_chars = 79
+allowed_literals = [0, 1, 2]
+
+[ledgers]
+contracts = "quality/contracts_debt.txt"
+magic = "quality/magic_numbers_debt.txt"
+sizes = "quality/size_debt.txt"
+
+[hooks]
+curlee_root = "../curlee"
